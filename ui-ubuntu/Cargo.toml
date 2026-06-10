@@ -11,6 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 scp-core = { path = "../core" }
-# Build on Linux with GTK4 dev libs installed (see README). gtk4 won't build
-# on macOS, which is why this crate is Linux-only in practice.
+# Targets Linux (apt install libgtk-4-dev); also compiles against Homebrew's
+# gtk4 on macOS, which we use for compile-checking the UI.
 gtk = { package = "gtk4", version = "0.9" }
+# Bridges the blocking worker thread back into the GTK main loop.
+async-channel = "2"
+# Saved-sites persistence.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

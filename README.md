@@ -30,9 +30,10 @@ sharing one transfer core. SwiftUI on macOS, GTK4 on Ubuntu, Rust underneath.
 - **FTP / FTPS** — implemented (FTPS upgrades the control channel via native-tls).
 - **S3** — implemented behind the `s3` cargo feature (rust-s3, blocking).
 
-macOS app extras: a transfer queue with live progress, drag-and-drop between
-the local/remote panes, and saved connection sites (persisted to Application
-Support; passwords entered fresh at connect time).
+Both apps have: dual-pane local/remote browsing with navigation, a protocol
+picker, a transfer queue with live progress, drag-and-drop between panes, and
+saved connection sites (persisted to Application Support on macOS,
+`~/.config/scp-commander/` on Linux; passwords entered fresh at connect time).
 
 Phasing from here: directory synchronize → recursive folder transfers →
 Keychain-stored credentials → remote file editor.
@@ -65,13 +66,18 @@ cd ui-macos && swift run         # builds and launches the SwiftUI app
 comes from `cargo rustc -- --print native-static-libs`). For a release build,
 `cargo build -p scp-core --release` and change `coreLib` to `../target/release`.
 
-### Ubuntu app (build on Linux)
+### Ubuntu app
 ```sh
 sudo apt install libgtk-4-dev build-essential pkg-config libssl-dev libssh2-1-dev
 cargo run -p scp-ubuntu
 ```
-Won't compile on macOS — GTK4 is the Linux-native toolkit (which is the whole
-point of going native per platform).
+The GTK app targets Linux, but it also compiles and runs against Homebrew's
+gtk4 (`brew install gtk4`) on macOS — handy for development; the native-feel
+target remains GNOME/Ubuntu.
+
+The Ubuntu app runs all core calls on a worker thread (GTK widgets are
+main-thread-only): commands go over a std mpsc channel, events come back over
+an async channel drained by `glib::spawn_future_local`.
 
 ## How "native" is achieved
 
