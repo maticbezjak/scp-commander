@@ -15,19 +15,26 @@ enum TransferDirection {
 enum TransferState: Equatable {
     case active
     case done
+    case cancelled
     case failed(String)
 }
 
-/// One transfer in the queue. Observed per-row so progress updates live.
+/// One transfer (or multi-file operation) in the queue. Observed per-row so
+/// progress updates live. `cancelFlag` is checked by the worker-side progress
+/// callback; the Cancel button flips it.
 @MainActor
 final class Transfer: ObservableObject, Identifiable {
     let id = UUID()
     let name: String
     let direction: TransferDirection
+    let cancelFlag = CancelFlag()
 
     @Published var transferred: UInt64 = 0
     @Published var total: UInt64 = 0
     @Published var state: TransferState = .active
+    /// For multi-file operations: the file currently being copied.
+    @Published var currentFile: String?
+    @Published var filesDone: Int = 0
 
     init(name: String, direction: TransferDirection) {
         self.name = name

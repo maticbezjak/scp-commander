@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -12,8 +13,21 @@ struct DraggedFile: Codable, Transferable {
     }
 }
 
+/// Which pane a prompt (rename / new folder / delete) targets.
+enum PaneKind {
+    case local
+    case remote
+}
+
 struct ContentView: View {
     @EnvironmentObject var state: AppState
+
+    // Prompt state
+    @State private var renameTarget: (pane: PaneKind, entry: FileEntry)?
+    @State private var renameText = ""
+    @State private var newFolderPane: PaneKind?
+    @State private var newFolderText = ""
+    @State private var deleteTarget: (pane: PaneKind, entry: FileEntry)?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -33,7 +47,11 @@ struct ContentView: View {
                         onOpen: { state.openLocal($0) },
                         transferLabel: "Upload →",
                         onTransfer: { state.upload($0) },
-                        onDrop: { if $0.pane == "remote" { state.downloadByName($0.name) } }
+                        onDrop: { if $0.pane == "remote" { state.downloadByName($0.name) } },
+                        onRename: { beginRename(.local, $0) },
+                        onDelete: { deleteTarget = (.local, $0) },
+                        onNewFolder: { beginNewFolder(.local) },
+                        onEdit: nil
                     )
                     FilePane(
                         kind: "remote",
@@ -44,7 +62,11 @@ struct ContentView: View {
                         onOpen: { state.openRemote($0) },
                         transferLabel: "← Download",
                         onTransfer: { state.download($0) },
-                        onDrop: { if $0.pane == "local" { state.uploadByName($0.name) } }
+                        onDrop: { if $0.pane == "local" { state.uploadByName($0.name) } },
+                        onRename: { beginRename(.remote, $0) },
+                        onDelete: { deleteTarget = (.remote, $0) },
+                        onNewFolder: { beginNewFolder(.remote) },
+                        onEdit: { state.editRemote($0) }
                     )
                 }
                 TransfersPanel(queue: state.transfers)
@@ -52,7 +74,7 @@ struct ContentView: View {
                 StatusBar()
             }
         }
-        .frame(minWidth: 980, minHeight: 560)
+        .frame(minWidth: 1000, minHeight: 560)
         .alert(
             "Unknown server host key",
             isPresented: Binding(
@@ -78,6 +100,77 @@ struct ContentView: View {
                 the server's actual fingerprint before trusting it.
                 """)
         }
+        .alert(
+            "Rename",
+            isPresented: Binding(
+                get: { renameTarget != nil },
+                set: { if !$0 { renameTarget = nil } }
+            )
+        ) {
+            TextField("New name", text: $renameText)
+            Button("Rename") {
+                if let target = renameTarget {
+                    switch target.pane {
+                    case .local: state.renameLocal(target.entry, to: renameText)
+                    case .remote: state.renameRemote(target.entry, to: renameText)
+                    }
+                }
+                renameTarget = nil
+            }
+            Button("Cancel", role: .cancel) { renameTarget = nil }
+        }
+        .alert(
+            "New folder",
+            isPresented: Binding(
+                get: { newFolderPane != nil },
+                set: { if !$0 { newFolderPane = nil } }
+            )
+        ) {
+            TextField("Folder name", text: $newFolderText)
+            Button("Create") {
+                switch newFolderPane {
+                case .local: state.newLocalFolder(named: newFolderText)
+                case .remote: state.newRemoteFolder(named: newFolderText)
+                case nil: break
+                }
+                newFolderPane = nil
+            }
+            Button("Cancel", role: .cancel) { newFolderPane = nil }
+        }
+        .alert(
+            "Delete \(deleteTarget?.entry.name ?? "")?",
+            isPresented: Binding(
+                get: { deleteTarget != nil },
+                set: { if !$0 { deleteTarget = nil } }
+            )
+        ) {
+            Button("Delete", role: .destructive) {
+                if let target = deleteTarget {
+                    switch target.pane {
+                    case .local: state.deleteLocal(target.entry)
+                    case .remote: state.deleteRemote(target.entry)
+                    }
+                }
+                deleteTarget = nil
+            }
+            Button("Cancel", role: .cancel) { deleteTarget = nil }
+        } message: {
+            if deleteTarget?.entry.isDir == true {
+                Text("The folder and everything inside it will be deleted.")
+            } else {
+                Text("This cannot be undone.")
+            }
+        }
+    }
+
+    private func beginRename(_ pane: PaneKind, _ entry: FileEntry) {
+        renameText = entry.name
+        renameTarget = (pane, entry)
+    }
+
+    private func beginNewFolder(_ pane: PaneKind) {
+        newFolderText = ""
+        newFolderPane = pane
     }
 }
 
@@ -96,7 +189,7 @@ private struct SitesSidebar: View {
                     Image(systemName: "plus")
                 }
                 .buttonStyle(.borderless)
-                .help("Save current connection")
+                .help("Save current connection (password goes to Keychain)")
             }
             .padding(8)
             Divider()
@@ -114,7 +207,7 @@ private struct SitesSidebar: View {
                     .onTapGesture { state.loadSite(site) }
                     .contextMenu {
                         Button("Load") { state.loadSite(site) }
-                        Button("Delete", role: .destructive) { store.remove(site) }
+                        Button("Delete", role: .destructive) { state.removeSite(site) }
                     }
                 }
             }
@@ -130,23 +223,51 @@ private struct ConnectionBar: View {
 
     var body: some View {
         HStack(spacing: 8) {
+            let isS3 = state.proto == .s3
+            let isSftp = state.proto == .sftp
+
             Picker("", selection: $state.proto) {
                 ForEach(Proto.allCases, id: \.self) { Text($0.label).tag($0) }
             }
             .labelsHidden()
             .frame(width: 80)
 
-            let isS3 = state.proto == .s3
-            TextField(isS3 ? "access key" : "user", text: $state.user).frame(width: 110)
+            if isSftp {
+                Picker("", selection: $state.authMode) {
+                    ForEach(AuthMode.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .labelsHidden()
+                .frame(width: 100)
+            }
+
+            TextField(isS3 ? "access key" : "user", text: $state.user).frame(width: 100)
             Text("@").foregroundStyle(.secondary)
             TextField(isS3 ? "endpoint (blank = AWS)" : "host", text: $state.host)
-                .frame(minWidth: 140)
-            TextField("port", text: $state.port).frame(width: 56)
-            SecureField(isS3 ? "secret key" : "password", text: $state.password)
-                .frame(width: 140)
+                .frame(minWidth: 120)
+            TextField("port", text: $state.port).frame(width: 50)
+
+            if isSftp && state.authMode == .keyFile {
+                TextField("key file", text: $state.keyPath).frame(width: 120)
+                Button("…") {
+                    let panel = NSOpenPanel()
+                    panel.canChooseFiles = true
+                    panel.canChooseDirectories = false
+                    panel.directoryURL = FileManager.default
+                        .homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
+                    if panel.runModal() == .OK {
+                        state.keyPath = panel.url?.path ?? ""
+                    }
+                }
+                .help("Choose a private key")
+                SecureField("passphrase", text: $state.password).frame(width: 110)
+            } else if !(isSftp && state.authMode == .agent) {
+                SecureField(isS3 ? "secret key" : "password", text: $state.password)
+                    .frame(width: 120)
+            }
+
             if isS3 {
                 TextField("bucket", text: $state.bucket).frame(width: 100)
-                TextField("region", text: $state.region).frame(width: 90)
+                TextField("region", text: $state.region).frame(width: 80)
             }
 
             Button(action: { state.connect() }) {
@@ -154,6 +275,18 @@ private struct ConnectionBar: View {
             }
             .keyboardShortcut(.return, modifiers: [])
             .disabled(state.busy || (isS3 ? state.bucket.isEmpty : state.host.isEmpty))
+
+            if state.isConnected {
+                Menu {
+                    Button("Local → Remote (upload changes)") { state.sync(download: false) }
+                    Button("Remote → Local (download changes)") { state.sync(download: true) }
+                } label: {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                }
+                .menuStyle(.borderlessButton)
+                .frame(width: 40)
+                .help("Synchronize the current folders")
+            }
 
             if state.busy { ProgressView().scaleEffect(0.6).frame(width: 18, height: 18) }
             Spacer()
@@ -174,6 +307,10 @@ private struct FilePane: View {
     let transferLabel: String
     let onTransfer: (FileEntry) -> Void
     let onDrop: (DraggedFile) -> Void
+    let onRename: (FileEntry) -> Void
+    let onDelete: (FileEntry) -> Void
+    let onNewFolder: () -> Void
+    let onEdit: ((FileEntry) -> Void)?
 
     @State private var selection: FileEntry.ID?
 
@@ -182,6 +319,9 @@ private struct FilePane: View {
             HStack {
                 Text(title).font(.headline)
                 Spacer()
+                Button(action: onNewFolder) { Image(systemName: "folder.badge.plus") }
+                    .help("New folder")
+                    .buttonStyle(.borderless)
                 Button(action: onUp) { Image(systemName: "arrow.up") }
                     .help("Parent directory")
                     .buttonStyle(.borderless)
@@ -200,37 +340,38 @@ private struct FilePane: View {
 
             List(selection: $selection) {
                 ForEach(entries) { entry in
-                    row(for: entry)
+                    EntryRow(entry: entry)
+                        .tag(entry.id)
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) { onOpen(entry) }
+                        .draggable(DraggedFile(pane: kind, name: entry.name))
+                        .contextMenu {
+                            if entry.isDir {
+                                Button("Open") { onOpen(entry) }
+                                Button(transferLabel.replacingOccurrences(
+                                    of: "→", with: "folder →"
+                                ).replacingOccurrences(of: "←", with: "← folder")) {
+                                    onTransfer(entry)
+                                }
+                            } else {
+                                Button(transferLabel) { onTransfer(entry) }
+                                if let onEdit {
+                                    Button("Edit (auto-upload on save)") { onEdit(entry) }
+                                }
+                            }
+                            Divider()
+                            Button("Rename…") { onRename(entry) }
+                            Button("Delete", role: .destructive) { onDelete(entry) }
+                        }
                 }
             }
             .listStyle(.inset(alternatesRowBackgrounds: true))
             .dropDestination(for: DraggedFile.self) { items, _ in
-                for file in items { onDrop(file) }
-                return !items.isEmpty
+                for file in items where file.pane != kind { onDrop(file) }
+                return items.contains { $0.pane != kind }
             }
         }
         .frame(minWidth: 360)
-    }
-
-    @ViewBuilder
-    private func row(for entry: FileEntry) -> some View {
-        let base = EntryRow(entry: entry)
-            .tag(entry.id)
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) { onOpen(entry) }
-            .contextMenu {
-                if entry.isDir {
-                    Button("Open") { onOpen(entry) }
-                } else {
-                    Button(transferLabel) { onTransfer(entry) }
-                }
-            }
-
-        if entry.isDir {
-            base
-        } else {
-            base.draggable(DraggedFile(pane: kind, name: entry.name))
-        }
     }
 }
 
@@ -278,7 +419,7 @@ private struct TransfersPanel: View {
                     }
                     .padding(.horizontal, 8)
                 }
-                .frame(maxHeight: 110)
+                .frame(maxHeight: 120)
             }
         }
     }
@@ -290,10 +431,29 @@ private struct TransferRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: transfer.direction.symbol)
-            Text(transfer.name).lineLimit(1).frame(width: 160, alignment: .leading)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(transfer.name).lineLimit(1)
+                if let current = transfer.currentFile, transfer.state == .active {
+                    Text(current)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
+            }
+            .frame(width: 180, alignment: .leading)
             progress
             Spacer()
             Text(detail).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            if transfer.state == .active {
+                Button {
+                    transfer.cancelFlag.cancel()
+                } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help("Cancel")
+            }
         }
     }
 
@@ -302,12 +462,14 @@ private struct TransferRow: View {
         switch transfer.state {
         case .active:
             if let f = transfer.fraction {
-                ProgressView(value: f).frame(width: 180)
+                ProgressView(value: f).frame(width: 160)
             } else {
                 ProgressView().scaleEffect(0.5).frame(width: 40)
             }
         case .done:
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .cancelled:
+            Image(systemName: "slash.circle").foregroundStyle(.orange)
         case .failed:
             Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
         }
@@ -316,7 +478,10 @@ private struct TransferRow: View {
     private var detail: String {
         switch transfer.state {
         case .failed(let msg): return msg
-        case .done: return humanSize(transfer.total > 0 ? transfer.total : transfer.transferred)
+        case .cancelled: return "cancelled"
+        case .done:
+            let files = transfer.filesDone > 0 ? "\(transfer.filesDone) files · " : ""
+            return files + humanSize(max(transfer.total, transfer.transferred))
         case .active:
             if transfer.total > 0 {
                 return "\(humanSize(transfer.transferred)) / \(humanSize(transfer.total))"

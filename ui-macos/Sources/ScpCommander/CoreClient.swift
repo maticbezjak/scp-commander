@@ -42,10 +42,50 @@ enum HostKeyMode: Int32 {
     case acceptFingerprint = 2
 }
 
+enum AuthMode: Int32, Codable, CaseIterable {
+    case password = 0
+    case keyFile = 1
+    case agent = 2
+
+    var label: String {
+        switch self {
+        case .password: return "Password"
+        case .keyFile: return "Key file"
+        case .agent: return "SSH agent"
+        }
+    }
+}
+
+/// Thread-safe cancellation flag shared between the UI and a worker callback.
+final class CancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    func cancel() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 /// Heap box so a Swift progress closure can ride through C `user_data`.
+/// Returning `false` cancels the transfer.
 private final class ProgressBox {
-    let onProgress: (UInt64, UInt64) -> Void
-    init(_ f: @escaping (UInt64, UInt64) -> Void) { self.onProgress = f }
+    let onProgress: (UInt64, UInt64) -> Bool
+    init(_ f: @escaping (UInt64, UInt64) -> Bool) { self.onProgress = f }
+}
+
+/// Same, for multi-file operations: `(kind, fileName, done, total) -> keepGoing`.
+/// kind 0 = starting fileName, 1 = byte progress, 2 = file finished.
+private final class XferBox {
+    let onEvent: (Int32, String?, UInt64, UInt64) -> Bool
+    init(_ f: @escaping (Int32, String?, UInt64, UInt64) -> Bool) { self.onEvent = f }
 }
 
 /// Thin Swift wrapper over the C ABI in scp_core.h.
@@ -59,8 +99,9 @@ final class CoreClient: @unchecked Sendable {
 
     var isConnected: Bool { session != nil }
 
-    /// Empty strings for bucket/region/fingerprint mean "absent" (the FFI
-    /// treats them as null; Swift can't pass nullable C strings directly).
+    /// Empty strings for bucket/region/fingerprint/keyPath mean "absent" (the
+    /// FFI treats them as null; Swift can't pass nullable C strings directly).
+    /// In `.keyFile` mode, `password` is the key's passphrase.
     func connect(
         proto: Proto,
         host: String,
@@ -70,12 +111,15 @@ final class CoreClient: @unchecked Sendable {
         bucket: String = "",
         region: String = "",
         hostKeyMode: HostKeyMode = .strict,
-        trustedFingerprint: String = ""
+        trustedFingerprint: String = "",
+        authMode: AuthMode = .password,
+        keyPath: String = ""
     ) throws {
         disconnect()
         let handle = scp_connect(
             proto.rawValue, host, port, user, password,
-            bucket, region, hostKeyMode.rawValue, trustedFingerprint)
+            bucket, region, hostKeyMode.rawValue, trustedFingerprint,
+            authMode.rawValue, keyPath)
         guard let handle else { throw Self.lastError() }
         session = handle
     }
@@ -89,7 +133,7 @@ final class CoreClient: @unchecked Sendable {
     }
 
     @discardableResult
-    func download(remote: String, local: String, onProgress: @escaping (UInt64, UInt64) -> Void)
+    func download(remote: String, local: String, onProgress: @escaping (UInt64, UInt64) -> Bool)
         throws -> Int64
     {
         guard let session else { throw CoreError(message: "not connected") }
@@ -102,7 +146,7 @@ final class CoreClient: @unchecked Sendable {
     }
 
     @discardableResult
-    func upload(local: String, remote: String, onProgress: @escaping (UInt64, UInt64) -> Void)
+    func upload(local: String, remote: String, onProgress: @escaping (UInt64, UInt64) -> Bool)
         throws -> Int64
     {
         guard let session else { throw CoreError(message: "not connected") }
@@ -112,6 +156,69 @@ final class CoreClient: @unchecked Sendable {
         let n = scp_upload_cb(session, local, remote, Self.trampoline, ud)
         if n < 0 { throw Self.lastError() }
         return n
+    }
+
+    @discardableResult
+    func downloadDir(
+        remote: String, local: String,
+        onEvent: @escaping (Int32, String?, UInt64, UInt64) -> Bool
+    ) throws -> Int64 {
+        guard let session else { throw CoreError(message: "not connected") }
+        let box = XferBox(onEvent)
+        let ud = Unmanaged.passRetained(box).toOpaque()
+        defer { Unmanaged<XferBox>.fromOpaque(ud).release() }
+        let n = scp_download_dir(session, remote, local, Self.xferTrampoline, ud)
+        if n < 0 { throw Self.lastError() }
+        return n
+    }
+
+    @discardableResult
+    func uploadDir(
+        local: String, remote: String,
+        onEvent: @escaping (Int32, String?, UInt64, UInt64) -> Bool
+    ) throws -> Int64 {
+        guard let session else { throw CoreError(message: "not connected") }
+        let box = XferBox(onEvent)
+        let ud = Unmanaged.passRetained(box).toOpaque()
+        defer { Unmanaged<XferBox>.fromOpaque(ud).release() }
+        let n = scp_upload_dir(session, local, remote, Self.xferTrampoline, ud)
+        if n < 0 { throw Self.lastError() }
+        return n
+    }
+
+    /// Returns the number of files copied.
+    @discardableResult
+    func syncDir(
+        local: String, remote: String, download: Bool,
+        onEvent: @escaping (Int32, String?, UInt64, UInt64) -> Bool
+    ) throws -> Int64 {
+        guard let session else { throw CoreError(message: "not connected") }
+        let box = XferBox(onEvent)
+        let ud = Unmanaged.passRetained(box).toOpaque()
+        defer { Unmanaged<XferBox>.fromOpaque(ud).release() }
+        let n = scp_sync_dir(session, local, remote, download ? 1 : 0, Self.xferTrampoline, ud)
+        if n < 0 { throw Self.lastError() }
+        return n
+    }
+
+    func mkdir(_ path: String) throws {
+        guard let session else { throw CoreError(message: "not connected") }
+        if scp_mkdir(session, path) != 0 { throw Self.lastError() }
+    }
+
+    func removeFile(_ path: String) throws {
+        guard let session else { throw CoreError(message: "not connected") }
+        if scp_remove_file(session, path) != 0 { throw Self.lastError() }
+    }
+
+    func removeDirAll(_ path: String) throws {
+        guard let session else { throw CoreError(message: "not connected") }
+        if scp_remove_dir_all(session, path) != 0 { throw Self.lastError() }
+    }
+
+    func rename(from: String, to: String) throws {
+        guard let session else { throw CoreError(message: "not connected") }
+        if scp_rename(session, from, to) != 0 { throw Self.lastError() }
     }
 
     func disconnect() {
@@ -125,11 +232,19 @@ final class CoreClient: @unchecked Sendable {
 
     // MARK: - Helpers
 
-    /// Non-capturing C trampoline: recovers the Swift closure from `user_data`.
+    /// Non-capturing C trampolines: recover the Swift closure from `user_data`.
+    /// Return 0 to continue, 1 to cancel.
     private static let trampoline: ScpProgressCb = { transferred, total, user in
-        guard let user else { return }
+        guard let user else { return 0 }
         let box = Unmanaged<ProgressBox>.fromOpaque(user).takeUnretainedValue()
-        box.onProgress(transferred, total)
+        return box.onProgress(transferred, total) ? 0 : 1
+    }
+
+    private static let xferTrampoline: ScpXferCb = { kind, file, done, total, user in
+        guard let user else { return 0 }
+        let box = Unmanaged<XferBox>.fromOpaque(user).takeUnretainedValue()
+        let name = file.map { String(cString: $0) }
+        return box.onEvent(kind, name, done, total) ? 0 : 1
     }
 
     private static func lastError() -> CoreError {
