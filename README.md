@@ -41,6 +41,11 @@ Protocols:
 
 Both apps (SwiftUI + GTK4) have:
 
+- WinSCP-style **Login dialog** (sites + session form), **session tabs**
+  (independent connections per tab), and multi-column panes
+  (Name | Size | Type | Changed | Rights) with per-pane toolbars
+- a **Properties dialog** with an rwx checkbox grid (chmod over SFTP/FTP,
+  POSIX permissions locally)
 - dual-pane local/remote browsing, drag-and-drop between panes (files and
   folders, recursive)
 - a transfer queue with live progress and per-transfer **cancel**
