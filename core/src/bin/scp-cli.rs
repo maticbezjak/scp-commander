@@ -59,13 +59,7 @@ fn parse_url(url: &str, password: Option<&str>) -> std::result::Result<ParsedUrl
     };
 
     Ok(ParsedUrl {
-        creds: Credentials {
-            protocol,
-            host,
-            port,
-            username,
-            auth,
-        },
+        creds: Credentials::basic(protocol, host, port, username, auth),
         path,
     })
 }

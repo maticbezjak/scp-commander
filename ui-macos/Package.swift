@@ -24,6 +24,7 @@ let package = Package(
                     "-lz", "-liconv",
                 ]),
                 .linkedFramework("CoreFoundation"),
+                .linkedFramework("Security"),
             ]
         ),
     ]

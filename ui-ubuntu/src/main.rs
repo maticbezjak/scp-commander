@@ -89,13 +89,13 @@ fn build_ui(app: &Application) {
         #[weak] pass_entry,
         #[weak] path_entry,
         move |_| {
-            let creds = Credentials {
-                protocol: Protocol::Sftp,
-                host: host_entry.text().to_string(),
-                port: 22,
-                username: user_entry.text().to_string(),
-                auth: Auth::Password(pass_entry.text().to_string()),
-            };
+            let creds = Credentials::basic(
+                Protocol::Sftp,
+                host_entry.text().to_string(),
+                22,
+                user_entry.text().to_string(),
+                Auth::Password(pass_entry.text().to_string()),
+            );
             match connect(&creds) {
                 Ok(mut t) => {
                     let path = path_entry.text().to_string();

@@ -75,13 +75,13 @@ pub extern "C" fn scp_connect(
     };
     let pass = unsafe { cstr(password) }.unwrap_or("");
 
-    let creds = Credentials {
-        protocol: proto,
-        host: host.to_string(),
+    let creds = Credentials::basic(
+        proto,
+        host.to_string(),
         port,
-        username: user.to_string(),
-        auth: Auth::Password(pass.to_string()),
-    };
+        user.to_string(),
+        Auth::Password(pass.to_string()),
+    );
 
     match transport::connect(&creds) {
         Ok(inner) => Box::into_raw(Box::new(ScpSession { inner })),

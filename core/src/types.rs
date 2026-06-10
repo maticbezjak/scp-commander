@@ -23,6 +23,11 @@ pub enum Auth {
 }
 
 /// Everything needed to open a session.
+///
+/// For SFTP/FTP/FTPS: `host`/`port`/`username`/`auth` are used. For S3,
+/// `username` is the access key, `auth` carries the secret, `bucket` names the
+/// bucket, `region` the region, and `host` (if set) is a custom endpoint for
+/// S3-compatible storage (e.g. MinIO).
 #[derive(Debug, Clone)]
 pub struct Credentials {
     pub protocol: Protocol,
@@ -30,9 +35,26 @@ pub struct Credentials {
     pub port: u16,
     pub username: String,
     pub auth: Auth,
+    /// S3 only: bucket name.
+    pub bucket: Option<String>,
+    /// S3 only: region (e.g. "us-east-1").
+    pub region: Option<String>,
 }
 
 impl Credentials {
+    /// Build credentials for a host-based protocol (SFTP/FTP/FTPS).
+    pub fn basic(protocol: Protocol, host: String, port: u16, username: String, auth: Auth) -> Self {
+        Self {
+            protocol,
+            host,
+            port,
+            username,
+            auth,
+            bucket: None,
+            region: None,
+        }
+    }
+
     /// The conventional default port for a protocol.
     pub fn default_port(protocol: Protocol) -> u16 {
         match protocol {

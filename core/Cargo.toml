@@ -15,14 +15,20 @@ crate-type = ["rlib", "staticlib"]
 [dependencies]
 # SFTP/SCP over SSH. Uses system libssh2 + openssl via pkg-config.
 ssh2 = "0.9"
-# FTP (synchronous API). FTPS will add the `native-tls` feature later.
-suppaftp = "6"
+# FTP / FTPS (synchronous API). native-tls enables the FTPS upgrade.
+suppaftp = { version = "6", features = ["native-tls"] }
 thiserror = "1"
+
+# S3 / S3-compatible object storage. Optional: only built with the `s3` feature.
+# The `blocking` feature gives us synchronous *_blocking methods so the whole
+# core stays sync (no tokio runtime threaded through the trait).
+rust-s3 = { version = "0.37", features = ["blocking"], optional = true }
 
 [features]
 default = []
-# Flip on once the S3 backend is implemented (pulls async deps).
-s3 = []
+# Enables the real S3 backend (pulls rust-s3 + a small async runtime under the
+# blocking shim). Build with: cargo build -p scp-core --features s3
+s3 = ["dep:rust-s3"]
 
 [[bin]]
 name = "scp-cli"
