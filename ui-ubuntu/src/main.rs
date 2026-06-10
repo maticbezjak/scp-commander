@@ -27,7 +27,7 @@ use gtk::{
     SingleSelection, StringList, StringObject,
 };
 
-use scp_core::types::{Auth, Credentials, Entry, Protocol};
+use scp_core::types::{Auth, Credentials, Entry, HostKeyPolicy, Protocol};
 use sites::{Site, SitesStore};
 use worker::{Cmd, Event};
 
@@ -86,6 +86,13 @@ struct App {
     port_entry: GtkEntry,
     user_entry: GtkEntry,
     pass_entry: PasswordEntry,
+    bucket_entry: GtkEntry,
+    region_entry: GtkEntry,
+    // Host key trust prompt
+    hostkey_bar: GtkBox,
+    hostkey_label: Label,
+    pending_connect: RefCell<Option<(Credentials, String)>>,
+    pending_fingerprint: RefCell<Option<String>>,
     // Sites
     sites: RefCell<SitesStore>,
     sites_list: ListBox,
@@ -138,27 +145,52 @@ impl App {
     // -- Remote pane --------------------------------------------------------
 
     fn connect_clicked(&self) {
+        let protocol = proto_from_index(self.proto_dd.selected());
         let host = self.host_entry.text().to_string();
-        if host.is_empty() {
+        let bucket = self.bucket_entry.text().to_string();
+        if protocol == Protocol::S3 {
+            if bucket.is_empty() {
+                self.set_status("S3 needs a bucket name");
+                return;
+            }
+        } else if host.is_empty() {
             self.set_status("Enter a host first");
             return;
         }
-        let protocol = proto_from_index(self.proto_dd.selected());
         let port = self
             .port_entry
             .text()
             .parse::<u16>()
             .unwrap_or_else(|_| Credentials::default_port(protocol));
-        let creds = Credentials::basic(
+        let mut creds = Credentials::basic(
             protocol,
             host,
             port,
             self.user_entry.text().to_string(),
             Auth::Password(self.pass_entry.text().to_string()),
         );
+        if protocol == Protocol::S3 {
+            creds.bucket = Some(bucket);
+            let region = self.region_entry.text().to_string();
+            creds.region = (!region.is_empty()).then_some(region);
+        }
+        self.start_connect(creds);
+    }
+
+    fn start_connect(&self, creds: Credentials) {
+        self.hostkey_bar.set_visible(false);
         let path = self.remote_path.borrow().clone();
+        *self.pending_connect.borrow_mut() = Some((creds.clone(), path.clone()));
         self.set_status("Connecting…");
         let _ = self.cmd.send(Cmd::Connect { creds, path });
+    }
+
+    /// "Trust & Connect" on the host key bar: retry pinned to the approved key.
+    fn trust_host_key(&self) {
+        let Some(fingerprint) = self.pending_fingerprint.borrow_mut().take() else { return };
+        let Some((mut creds, _)) = self.pending_connect.borrow_mut().take() else { return };
+        creds.host_key = HostKeyPolicy::AcceptFingerprint(fingerprint);
+        self.start_connect(creds);
     }
 
     fn open_remote(self: &Rc<Self>, index: u32) {
@@ -344,6 +376,14 @@ impl App {
                 *self.remote_path.borrow_mut() = path.clone();
                 self.set_status(&format!("{path} ({count} items)"));
             }
+            Event::HostKeyUnknown { fingerprint } => {
+                self.hostkey_label.set_text(&format!(
+                    "New server — host key fingerprint: {fingerprint}. Trust it?"
+                ));
+                *self.pending_fingerprint.borrow_mut() = Some(fingerprint);
+                self.hostkey_bar.set_visible(true);
+                self.set_status("Server key not recognized — confirm fingerprint to connect");
+            }
             Event::Progress { id, done, total } => {
                 if let Some(row) = self.transfer_rows.borrow().get(&id) {
                     if total > 0 {
@@ -418,6 +458,13 @@ fn build_ui(app: &Application) {
     let host_entry = GtkEntry::builder().placeholder_text("host").hexpand(true).build();
     let port_entry = GtkEntry::builder().text("22").max_width_chars(5).width_chars(5).build();
     let pass_entry = PasswordEntry::builder().show_peek_icon(true).build();
+    // S3 only — hidden until the picker selects S3.
+    let bucket_entry = GtkEntry::builder().placeholder_text("bucket").visible(false).build();
+    let region_entry = GtkEntry::builder()
+        .placeholder_text("region")
+        .max_width_chars(10)
+        .visible(false)
+        .build();
     let connect_btn = Button::with_label("Connect");
     connect_btn.add_css_class("suggested-action");
 
@@ -436,14 +483,30 @@ fn build_ui(app: &Application) {
     conn_bar.append(&Label::new(Some(":")));
     conn_bar.append(&port_entry);
     conn_bar.append(&pass_entry);
+    conn_bar.append(&bucket_entry);
+    conn_bar.append(&region_entry);
     conn_bar.append(&connect_btn);
 
-    // Default port tracks the protocol picker (until the user edits it).
+    // The picker drives the default port, S3 field visibility, and placeholders.
     proto_dd.connect_selected_notify(glib::clone!(
         #[weak] port_entry,
+        #[weak] bucket_entry,
+        #[weak] region_entry,
+        #[weak] user_entry,
+        #[weak] host_entry,
         move |dd| {
-            let p = Credentials::default_port(proto_from_index(dd.selected()));
+            let selected = dd.selected();
+            let p = Credentials::default_port(proto_from_index(selected));
             port_entry.set_text(&p.to_string());
+            let is_s3 = selected == 3;
+            bucket_entry.set_visible(is_s3);
+            region_entry.set_visible(is_s3);
+            user_entry.set_placeholder_text(Some(if is_s3 { "access key" } else { "user" }));
+            host_entry.set_placeholder_text(Some(if is_s3 {
+                "endpoint (blank = AWS)"
+            } else {
+                "host"
+            }));
         }
     ));
 
@@ -461,6 +524,30 @@ fn build_ui(app: &Application) {
         .build();
     panes.append(&local_widget);
     panes.append(&remote_widget);
+
+    // Host key trust bar (hidden until a strict connect meets a new server) --
+    let hostkey_label = Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .wrap(true)
+        .selectable(true)
+        .build();
+    let trust_btn = Button::with_label("Trust & Connect");
+    trust_btn.add_css_class("destructive-action");
+    let hostkey_cancel_btn = Button::with_label("Cancel");
+    let hostkey_bar = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(6)
+        .margin_end(6)
+        .visible(false)
+        .build();
+    hostkey_bar.add_css_class("card");
+    hostkey_bar.append(&hostkey_label);
+    hostkey_bar.append(&trust_btn);
+    hostkey_bar.append(&hostkey_cancel_btn);
 
     // Transfers panel (hidden until something is queued) ---------------------
     let transfers_box = GtkBox::builder()
@@ -535,6 +622,7 @@ fn build_ui(app: &Application) {
     let content = GtkBox::builder().orientation(Orientation::Vertical).build();
     content.append(&conn_bar);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
+    content.append(&hostkey_bar);
     content.append(&panes);
     content.append(&transfers_panel);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
@@ -562,6 +650,12 @@ fn build_ui(app: &Application) {
         port_entry,
         user_entry,
         pass_entry,
+        bucket_entry,
+        region_entry,
+        hostkey_bar,
+        hostkey_label,
+        pending_connect: RefCell::new(None),
+        pending_fingerprint: RefCell::new(None),
         sites: RefCell::new(SitesStore::load()),
         sites_list,
     });
@@ -577,6 +671,18 @@ fn build_ui(app: &Application) {
     clear_btn.connect_clicked(glib::clone!(
         #[strong] state,
         move |_| state.clear_finished()
+    ));
+    trust_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| state.trust_host_key()
+    ));
+    hostkey_cancel_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| {
+            state.hostkey_bar.set_visible(false);
+            *state.pending_fingerprint.borrow_mut() = None;
+            state.set_status("Connection cancelled");
+        }
     ));
     save_site_btn.connect_clicked(glib::clone!(
         #[strong] state,

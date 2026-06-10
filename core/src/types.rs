@@ -22,6 +22,22 @@ pub enum Auth {
     Anonymous,
 }
 
+/// What to do when an SSH server's host key is not already known.
+///
+/// The intended UI flow: connect with `Strict` (the default); on
+/// [`Error::UnknownHostKey`], show the fingerprint to the user; retry with
+/// `AcceptFingerprint` pinned to exactly what they approved. A key that
+/// contradicts a stored one always fails, regardless of policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostKeyPolicy {
+    /// Fail with [`Error::UnknownHostKey`] when the key isn't in any store.
+    Strict,
+    /// Trust-on-first-use: remember unknown keys without asking (CLI flag).
+    AcceptNew,
+    /// Accept and remember the key only if its SHA256 fingerprint matches.
+    AcceptFingerprint(String),
+}
+
 /// Everything needed to open a session.
 ///
 /// For SFTP/FTP/FTPS: `host`/`port`/`username`/`auth` are used. For S3,
@@ -39,6 +55,8 @@ pub struct Credentials {
     pub bucket: Option<String>,
     /// S3 only: region (e.g. "us-east-1").
     pub region: Option<String>,
+    /// SFTP only: how to treat servers whose host key isn't known yet.
+    pub host_key: HostKeyPolicy,
 }
 
 impl Credentials {
@@ -52,6 +70,7 @@ impl Credentials {
             auth,
             bucket: None,
             region: None,
+            host_key: HostKeyPolicy::Strict,
         }
     }
 
@@ -92,4 +111,11 @@ pub enum Error {
     Protocol(String),
     #[error("not implemented: {0}")]
     NotImplemented(String),
+    #[error("unknown server host key: {fingerprint}")]
+    UnknownHostKey { fingerprint: String },
+    #[error(
+        "HOST KEY MISMATCH — the server's key ({fingerprint}) contradicts the stored one; \
+         possible man-in-the-middle attack"
+    )]
+    HostKeyMismatch { fingerprint: String },
 }

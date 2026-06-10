@@ -9,12 +9,12 @@
 use std::path::Path;
 use std::process::exit;
 
-use scp_core::types::{Auth, Credentials, Protocol};
+use scp_core::types::{Auth, Credentials, Error, HostKeyPolicy, Protocol};
 use scp_core::{connect, Result};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  scp-cli ls  <url> [password]\n  scp-cli get <url> <local> [password]\n  scp-cli put <url> <local> [password]\n\nurl: sftp://user@host[:port]/path  or  ftp://[user@]host[:port]/path"
+        "usage:\n  scp-cli [--accept-new] ls  <url> [password]\n  scp-cli [--accept-new] get <url> <local> [password]\n  scp-cli [--accept-new] put <url> <local> [password]\n\nurl: sftp://user@host[:port]/path  or  ftp://[user@]host[:port]/path\n--accept-new: trust and remember unknown SSH host keys (first connect)"
     );
     exit(2);
 }
@@ -24,7 +24,11 @@ struct ParsedUrl {
     path: String,
 }
 
-fn parse_url(url: &str, password: Option<&str>) -> std::result::Result<ParsedUrl, String> {
+fn parse_url(
+    url: &str,
+    password: Option<&str>,
+    host_key: HostKeyPolicy,
+) -> std::result::Result<ParsedUrl, String> {
     let (scheme, rest) = url.split_once("://").ok_or("missing scheme://")?;
     let protocol = match scheme {
         "sftp" => Protocol::Sftp,
@@ -58,20 +62,25 @@ fn parse_url(url: &str, password: Option<&str>) -> std::result::Result<ParsedUrl
         None => Auth::Password(String::new()),
     };
 
-    Ok(ParsedUrl {
-        creds: Credentials::basic(protocol, host, port, username, auth),
-        path,
-    })
+    let mut creds = Credentials::basic(protocol, host, port, username, auth);
+    creds.host_key = host_key;
+    Ok(ParsedUrl { creds, path })
 }
 
 fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let host_key = if let Some(pos) = args.iter().position(|a| a == "--accept-new") {
+        args.remove(pos);
+        HostKeyPolicy::AcceptNew
+    } else {
+        HostKeyPolicy::Strict
+    };
     let cmd = args.first().map(String::as_str).unwrap_or("");
 
     match cmd {
         "ls" => {
             let url = args.get(1).unwrap_or_else(|| usage());
-            let parsed = parse_url(url, args.get(2).map(String::as_str))
+            let parsed = parse_url(url, args.get(2).map(String::as_str), host_key)
                 .unwrap_or_else(|e| fail(&e));
             let mut t = connect(&parsed.creds)?;
             let mut entries = t.list_dir(&parsed.path)?;
@@ -86,7 +95,7 @@ fn run() -> Result<()> {
         "get" => {
             let url = args.get(1).unwrap_or_else(|| usage());
             let local = args.get(2).unwrap_or_else(|| usage());
-            let parsed = parse_url(url, args.get(3).map(String::as_str))
+            let parsed = parse_url(url, args.get(3).map(String::as_str), host_key)
                 .unwrap_or_else(|e| fail(&e));
             let mut t = connect(&parsed.creds)?;
             let n = t.download(&parsed.path, Path::new(local))?;
@@ -96,7 +105,7 @@ fn run() -> Result<()> {
         "put" => {
             let url = args.get(1).unwrap_or_else(|| usage());
             let local = args.get(2).unwrap_or_else(|| usage());
-            let parsed = parse_url(url, args.get(3).map(String::as_str))
+            let parsed = parse_url(url, args.get(3).map(String::as_str), host_key)
                 .unwrap_or_else(|e| fail(&e));
             let mut t = connect(&parsed.creds)?;
             let n = t.upload(Path::new(local), &parsed.path)?;
@@ -115,6 +124,11 @@ fn fail(msg: &str) -> ! {
 
 fn main() {
     if let Err(e) = run() {
+        if matches!(e, Error::UnknownHostKey { .. }) {
+            eprintln!("error: {e}");
+            eprintln!("hint: verify the fingerprint with the server admin, then re-run with --accept-new to trust it");
+            exit(1);
+        }
         fail(&e.to_string());
     }
 }

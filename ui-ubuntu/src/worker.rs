@@ -22,6 +22,8 @@ pub enum Cmd {
 pub enum Event {
     Connected { path: String, entries: Vec<Entry> },
     Listed { path: String, entries: Vec<Entry> },
+    /// Strict connect hit a server whose key isn't known; UI should prompt.
+    HostKeyUnknown { fingerprint: String },
     Progress { id: u64, done: u64, total: u64 },
     /// `download` distinguishes which pane needs refreshing afterwards.
     Done { id: u64, name: String, bytes: u64, download: bool },
@@ -49,6 +51,9 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                         }
                         Err(e) => send(Event::Error(format!("list failed: {e}"))),
                     },
+                    Err(scp_core::Error::UnknownHostKey { fingerprint }) => {
+                        send(Event::HostKeyUnknown { fingerprint });
+                    }
                     Err(e) => send(Event::Error(format!("connect failed: {e}"))),
                 },
 

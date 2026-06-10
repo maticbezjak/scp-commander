@@ -11,6 +11,12 @@ final class AppState: ObservableObject {
     @Published var port = "22"
     @Published var user = ""
     @Published var password = ""
+    // S3 only
+    @Published var bucket = ""
+    @Published var region = ""
+
+    /// Fingerprint of an unknown server key awaiting the user's trust decision.
+    @Published var hostKeyPrompt: String?
 
     // Panes
     @Published var localPath = FileManager.default.homeDirectoryForCurrentUser.path
@@ -87,19 +93,37 @@ final class AppState: ObservableObject {
 
     // MARK: - Remote (core)
 
-    func connect() {
+    /// Connect with the current form values. After an "unknown host key"
+    /// failure, the UI re-calls this with the fingerprint the user approved.
+    func connect(trustingFingerprint trusted: String? = nil) {
         let p = proto
         let h = host
         let portNum = UInt16(port) ?? Credentials_defaultPort(p)
         let u = user
         let pw = password
+        let bkt = bucket
+        let rgn = region
         let path = remotePath
         runBusy("Connecting…") { [client] in
-            try client.connect(proto: p, host: h, port: portNum, user: u, password: pw)
+            try client.connect(
+                proto: p, host: h, port: portNum, user: u, password: pw,
+                bucket: bkt, region: rgn,
+                hostKeyMode: trusted == nil ? .strict : .acceptFingerprint,
+                trustedFingerprint: trusted ?? "")
             return try client.listDir(path)
         } onSuccess: { [weak self] entries in
             self?.remoteEntries = entries
             self?.status = "Connected — \(path) (\(entries.count) items)"
+        } onFailure: { [weak self] error in
+            guard let self else { return }
+            if let core = error as? CoreError, core.isUnknownHostKey,
+                let fingerprint = core.fingerprint
+            {
+                self.hostKeyPrompt = fingerprint
+                self.status = "Server key not recognized — confirm fingerprint to connect"
+            } else {
+                self.status = "Error: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -206,7 +230,8 @@ final class AppState: ObservableObject {
     private func runBusy<T>(
         _ message: String,
         _ work: @escaping () throws -> T,
-        onSuccess: @escaping (T) -> Void
+        onSuccess: @escaping (T) -> Void,
+        onFailure: ((Error) -> Void)? = nil
     ) {
         busy = true
         status = message
@@ -217,7 +242,12 @@ final class AppState: ObservableObject {
                 self.busy = false
                 switch result {
                 case .success(let value): onSuccess(value)
-                case .failure(let error): self.status = "Error: \(error.localizedDescription)"
+                case .failure(let error):
+                    if let onFailure {
+                        onFailure(error)
+                    } else {
+                        self.status = "Error: \(error.localizedDescription)"
+                    }
                 }
             }
         }

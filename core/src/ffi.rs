@@ -14,20 +14,49 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::Path;
 use std::ptr;
 
+use std::cell::Cell;
+
 use crate::transport::{self, Transport};
-use crate::types::{Auth, Credentials, Protocol};
+use crate::types::{Auth, Credentials, Error, HostKeyPolicy, Protocol};
+
+/// Error codes surfaced via `scp_last_error_code`.
+pub const SCP_ERR_NONE: c_int = 0;
+pub const SCP_ERR_GENERIC: c_int = 1;
+pub const SCP_ERR_UNKNOWN_HOST_KEY: c_int = 2;
+pub const SCP_ERR_HOST_KEY_MISMATCH: c_int = 3;
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    static LAST_CODE: Cell<c_int> = const { Cell::new(SCP_ERR_NONE) };
+    static LAST_FINGERPRINT: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 fn set_error(msg: impl Into<String>) {
     let c = CString::new(msg.into()).unwrap_or_else(|_| CString::new("error").unwrap());
     LAST_ERROR.with(|e| *e.borrow_mut() = Some(c));
+    LAST_CODE.with(|c| c.set(SCP_ERR_GENERIC));
+    LAST_FINGERPRINT.with(|f| *f.borrow_mut() = None);
+}
+
+/// Like `set_error` but preserves the error kind + fingerprint for host-key
+/// failures so the UI can run the trust prompt.
+fn set_error_typed(err: &Error) {
+    set_error(err.to_string());
+    let (code, fp) = match err {
+        Error::UnknownHostKey { fingerprint } => (SCP_ERR_UNKNOWN_HOST_KEY, Some(fingerprint)),
+        Error::HostKeyMismatch { fingerprint } => (SCP_ERR_HOST_KEY_MISMATCH, Some(fingerprint)),
+        _ => (SCP_ERR_GENERIC, None),
+    };
+    LAST_CODE.with(|c| c.set(code));
+    LAST_FINGERPRINT.with(|f| {
+        *f.borrow_mut() = fp.and_then(|s| CString::new(s.as_str()).ok());
+    });
 }
 
 fn clear_error() {
     LAST_ERROR.with(|e| *e.borrow_mut() = None);
+    LAST_CODE.with(|c| c.set(SCP_ERR_NONE));
+    LAST_FINGERPRINT.with(|f| *f.borrow_mut() = None);
 }
 
 /// Opaque session handle handed back to the caller.
@@ -54,7 +83,14 @@ fn protocol_from_int(v: c_int) -> Option<Protocol> {
 }
 
 /// Open a connection. `protocol`: 0=SFTP, 1=FTP, 2=FTPS, 3=S3.
-/// `password` may be null (treated as empty). Returns null on failure.
+///
+/// `password`, `bucket`, `region`, `expected_fingerprint` may be null; empty
+/// strings are treated as absent (Swift can't easily pass nullable strings).
+/// `host_key_mode`: 0 = strict (fail on unknown keys), 1 = accept new keys,
+/// 2 = accept only the key whose SHA256 fingerprint equals
+/// `expected_fingerprint` (from a prior `scp_last_fingerprint`).
+/// Returns null on failure; check `scp_last_error_code` to distinguish
+/// host-key prompts from real errors.
 #[no_mangle]
 pub extern "C" fn scp_connect(
     protocol: c_int,
@@ -62,6 +98,10 @@ pub extern "C" fn scp_connect(
     port: u16,
     username: *const c_char,
     password: *const c_char,
+    bucket: *const c_char,
+    region: *const c_char,
+    host_key_mode: c_int,
+    expected_fingerprint: *const c_char,
 ) -> *mut ScpSession {
     clear_error();
 
@@ -74,22 +114,58 @@ pub extern "C" fn scp_connect(
         return ptr::null_mut();
     };
     let pass = unsafe { cstr(password) }.unwrap_or("");
+    let non_empty = |p: *const c_char| unsafe { cstr(p) }.filter(|s| !s.is_empty());
 
-    let creds = Credentials::basic(
+    let host_key = match host_key_mode {
+        0 => HostKeyPolicy::Strict,
+        1 => HostKeyPolicy::AcceptNew,
+        2 => match non_empty(expected_fingerprint) {
+            Some(fp) => HostKeyPolicy::AcceptFingerprint(fp.to_string()),
+            None => {
+                set_error("host_key_mode 2 requires expected_fingerprint");
+                return ptr::null_mut();
+            }
+        },
+        _ => {
+            set_error("invalid host_key_mode");
+            return ptr::null_mut();
+        }
+    };
+
+    let mut creds = Credentials::basic(
         proto,
         host.to_string(),
         port,
         user.to_string(),
         Auth::Password(pass.to_string()),
     );
+    creds.bucket = non_empty(bucket).map(str::to_string);
+    creds.region = non_empty(region).map(str::to_string);
+    creds.host_key = host_key;
 
     match transport::connect(&creds) {
         Ok(inner) => Box::into_raw(Box::new(ScpSession { inner })),
         Err(e) => {
-            set_error(e.to_string());
+            set_error_typed(&e);
             ptr::null_mut()
         }
     }
+}
+
+/// Code classifying the last error on this thread (see SCP_ERR_* values).
+#[no_mangle]
+pub extern "C" fn scp_last_error_code() -> c_int {
+    LAST_CODE.with(|c| c.get())
+}
+
+/// SHA256 fingerprint attached to the last host-key error on this thread, or
+/// null. Borrowed; do not free.
+#[no_mangle]
+pub extern "C" fn scp_last_fingerprint() -> *const c_char {
+    LAST_FINGERPRINT.with(|f| match &*f.borrow() {
+        Some(s) => s.as_ptr(),
+        None => ptr::null(),
+    })
 }
 
 /// List a remote directory. Returns a JSON array string (caller frees with

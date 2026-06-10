@@ -28,7 +28,18 @@ struct FileEntry: Identifiable, Hashable {
 
 struct CoreError: LocalizedError {
     let message: String
+    var code: Int32 = 1  // SCP_ERR_GENERIC
+    var fingerprint: String?
     var errorDescription: String? { message }
+
+    var isUnknownHostKey: Bool { code == SCP_ERR_UNKNOWN_HOST_KEY }
+    var isHostKeyMismatch: Bool { code == SCP_ERR_HOST_KEY_MISMATCH }
+}
+
+enum HostKeyMode: Int32 {
+    case strict = 0
+    case acceptNew = 1
+    case acceptFingerprint = 2
 }
 
 /// Heap box so a Swift progress closure can ride through C `user_data`.
@@ -48,9 +59,23 @@ final class CoreClient: @unchecked Sendable {
 
     var isConnected: Bool { session != nil }
 
-    func connect(proto: Proto, host: String, port: UInt16, user: String, password: String) throws {
+    /// Empty strings for bucket/region/fingerprint mean "absent" (the FFI
+    /// treats them as null; Swift can't pass nullable C strings directly).
+    func connect(
+        proto: Proto,
+        host: String,
+        port: UInt16,
+        user: String,
+        password: String,
+        bucket: String = "",
+        region: String = "",
+        hostKeyMode: HostKeyMode = .strict,
+        trustedFingerprint: String = ""
+    ) throws {
         disconnect()
-        let handle = scp_connect(proto.rawValue, host, port, user, password)
+        let handle = scp_connect(
+            proto.rawValue, host, port, user, password,
+            bucket, region, hostKeyMode.rawValue, trustedFingerprint)
         guard let handle else { throw Self.lastError() }
         session = handle
     }
@@ -108,10 +133,10 @@ final class CoreClient: @unchecked Sendable {
     }
 
     private static func lastError() -> CoreError {
-        if let p = scp_last_error() {
-            return CoreError(message: String(cString: p))
-        }
-        return CoreError(message: "unknown error")
+        let message = scp_last_error().map { String(cString: $0) } ?? "unknown error"
+        let fingerprint = scp_last_fingerprint().map { String(cString: $0) }
+        return CoreError(
+            message: message, code: scp_last_error_code(), fingerprint: fingerprint)
     }
 
     private struct Wire: Decodable {

@@ -13,4 +13,4 @@ pub mod transport;
 pub mod types;
 
 pub use transport::{connect, Transport};
-pub use types::{Auth, Credentials, Entry, Error, Protocol, Result};
+pub use types::{Auth, Credentials, Entry, Error, HostKeyPolicy, Protocol, Result};

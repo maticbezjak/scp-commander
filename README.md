@@ -26,9 +26,14 @@ sharing one transfer core. SwiftUI on macOS, GTK4 on Ubuntu, Rust underneath.
 
 ## Status
 
-- **SFTP** — implemented (libssh2), with granular transfer progress.
+- **SFTP** — implemented (libssh2), with granular transfer progress and host
+  key verification: keys are checked against `~/.ssh/known_hosts` (read-only)
+  and the app's own store (`~/.config/scp-commander/known_hosts`). Unknown
+  servers trigger a fingerprint trust prompt in the UIs (`--accept-new` in the
+  CLI); a key that contradicts a stored one always fails.
 - **FTP / FTPS** — implemented (FTPS upgrades the control channel via native-tls).
-- **S3** — implemented behind the `s3` cargo feature (rust-s3, blocking).
+- **S3** — implemented behind the `s3` cargo feature (rust-s3, blocking). Both
+  UIs expose bucket/region/endpoint fields when S3 is selected.
 
 Both apps have: dual-pane local/remote browsing with navigation, a protocol
 picker, a transfer queue with live progress, drag-and-drop between panes, and

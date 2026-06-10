@@ -53,6 +53,31 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 980, minHeight: 560)
+        .alert(
+            "Unknown server host key",
+            isPresented: Binding(
+                get: { state.hostKeyPrompt != nil },
+                set: { if !$0 { state.hostKeyPrompt = nil } }
+            )
+        ) {
+            Button("Trust & Connect") {
+                if let fp = state.hostKeyPrompt {
+                    state.hostKeyPrompt = nil
+                    state.connect(trustingFingerprint: fp)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                """
+                This server has not been seen before. Its key fingerprint is:
+
+                \(state.hostKeyPrompt ?? "")
+
+                If you expected a first-time connection, verify this matches \
+                the server's actual fingerprint before trusting it.
+                """)
+        }
     }
 }
 
@@ -111,17 +136,24 @@ private struct ConnectionBar: View {
             .labelsHidden()
             .frame(width: 80)
 
-            TextField("user", text: $state.user).frame(width: 110)
+            let isS3 = state.proto == .s3
+            TextField(isS3 ? "access key" : "user", text: $state.user).frame(width: 110)
             Text("@").foregroundStyle(.secondary)
-            TextField("host", text: $state.host).frame(minWidth: 140)
+            TextField(isS3 ? "endpoint (blank = AWS)" : "host", text: $state.host)
+                .frame(minWidth: 140)
             TextField("port", text: $state.port).frame(width: 56)
-            SecureField("password", text: $state.password).frame(width: 140)
+            SecureField(isS3 ? "secret key" : "password", text: $state.password)
+                .frame(width: 140)
+            if isS3 {
+                TextField("bucket", text: $state.bucket).frame(width: 100)
+                TextField("region", text: $state.region).frame(width: 90)
+            }
 
             Button(action: { state.connect() }) {
                 Text(state.isConnected ? "Reconnect" : "Connect")
             }
             .keyboardShortcut(.return, modifiers: [])
-            .disabled(state.busy || state.host.isEmpty)
+            .disabled(state.busy || (isS3 ? state.bucket.isEmpty : state.host.isEmpty))
 
             if state.busy { ProgressView().scaleEffect(0.6).frame(width: 18, height: 18) }
             Spacer()

@@ -16,12 +16,34 @@ extern "C" {
 
 typedef struct ScpSession ScpSession;
 
-/* protocol: 0=SFTP, 1=FTP, 2=FTPS, 3=S3. Returns NULL on failure. */
+/* Error codes returned by scp_last_error_code. */
+#define SCP_ERR_NONE 0
+#define SCP_ERR_GENERIC 1
+#define SCP_ERR_UNKNOWN_HOST_KEY 2
+#define SCP_ERR_HOST_KEY_MISMATCH 3
+
+/* protocol: 0=SFTP, 1=FTP, 2=FTPS, 3=S3. Returns NULL on failure.
+ *
+ * bucket/region apply to S3 only; empty/NULL means absent. host_key_mode:
+ * 0 = strict (fail with SCP_ERR_UNKNOWN_HOST_KEY on new servers),
+ * 1 = trust-on-first-use, 2 = accept only if the server's SHA256 fingerprint
+ * equals expected_fingerprint (obtained from scp_last_fingerprint after a
+ * strict connect failed). */
 ScpSession *scp_connect(int protocol,
                         const char *host,
                         uint16_t port,
                         const char *username,
-                        const char *password);
+                        const char *password,
+                        const char *bucket,
+                        const char *region,
+                        int host_key_mode,
+                        const char *expected_fingerprint);
+
+/* Classify the last error on this thread (SCP_ERR_*). */
+int scp_last_error_code(void);
+
+/* Fingerprint from the last host-key error, or NULL. Borrowed - do not free. */
+const char *scp_last_fingerprint(void);
 
 /* Returns a JSON array string (free with scp_string_free), or NULL on error. */
 char *scp_list_dir(ScpSession *session, const char *path);
