@@ -2,12 +2,25 @@ import AppKit
 import Foundation
 import SwiftUI
 
-/// Observable state for the whole window: connection fields, both pane
-/// listings, the transfer queue, edit-in-editor sessions, and status.
-/// Blocking core calls run on a serial worker queue off the main thread.
+/// One server session, WinSCP-tab-style. Each tab owns its own connection,
+/// serial worker queue, and cached remote listing; `AppState` publishes the
+/// active tab's view of the world.
+@MainActor
+final class SessionHandle: Identifiable {
+    let id = UUID()
+    let client = CoreClient()
+    let queue = DispatchQueue(label: "net.manto.ScpCommander.session")
+    var remotePath = "/"
+    var remoteEntries: [FileEntry] = []
+    var connected = false
+    var title = "New Session"
+}
+
+/// Observable state for the whole window. Blocking core calls run on the
+/// owning session's serial queue off the main thread.
 @MainActor
 final class AppState: ObservableObject {
-    // Connection form
+    // Connection form (feeds the Login dialog; applies to the active tab)
     @Published var proto: Proto = .sftp
     @Published var host = ""
     @Published var port = "22"
@@ -22,11 +35,17 @@ final class AppState: ObservableObject {
     /// Fingerprint of an unknown server key awaiting the user's trust decision.
     @Published var hostKeyPrompt: String?
 
-    // Panes
+    // Tabs
+    private(set) var sessions: [SessionHandle] = [SessionHandle()]
+    @Published var tabTitles: [String] = ["New Session"]
+    @Published private(set) var activeTab = 0
+
+    // Active tab's view of the panes
     @Published var localPath = FileManager.default.homeDirectoryForCurrentUser.path
     @Published var localEntries: [FileEntry] = []
     @Published var remotePath = "/"
     @Published var remoteEntries: [FileEntry] = []
+    @Published var activeConnected = false
 
     @Published var status = "Not connected"
     @Published var busy = false
@@ -37,27 +56,75 @@ final class AppState: ObservableObject {
     let transfers = TransferQueue()
     let sites = SitesStore()
 
-    private let client = CoreClient()
-    private let queue = DispatchQueue(label: "net.manto.ScpCommander.core")
-
-    // Edit-in-editor sessions: remote file -> local temp copy, re-uploaded on save.
+    // Edit-in-editor sessions: remote file -> local temp copy, re-uploaded on
+    // save through the session that opened it.
     private struct EditSession {
         let remote: String
         let local: URL
         var lastModified: Date
+        let session: SessionHandle
     }
     private var edits: [EditSession] = []
     private var editTimer: Timer?
 
-    var isConnected: Bool { client.isConnected }
+    var active: SessionHandle { sessions[activeTab] }
+    var isConnected: Bool { activeConnected }
 
     init() {
         loadLocal()
     }
 
+    // MARK: - Tabs
+
+    func selectTab(_ index: Int) {
+        guard sessions.indices.contains(index) else { return }
+        activeTab = index
+        publishActive()
+    }
+
+    func newTab() {
+        sessions.append(SessionHandle())
+        tabTitles.append("New Session")
+        activeTab = sessions.count - 1
+        publishActive()
+        showLogin = true
+    }
+
+    func closeTab(_ index: Int) {
+        guard sessions.indices.contains(index) else { return }
+        let session = sessions[index]
+        session.queue.async { [client = session.client] in client.disconnect() }
+        sessions.remove(at: index)
+        tabTitles.remove(at: index)
+        if sessions.isEmpty {
+            sessions = [SessionHandle()]
+            tabTitles = ["New Session"]
+        }
+        activeTab = min(activeTab, sessions.count - 1)
+        publishActive()
+    }
+
+    /// Mirror the active session's cached state into the published fields.
+    private func publishActive() {
+        remotePath = active.remotePath
+        remoteEntries = active.remoteEntries
+        activeConnected = active.connected
+    }
+
+    /// Store a listing on its session; update the UI only for the active tab.
+    private func showRemote(_ session: SessionHandle, path: String, entries: [FileEntry]) {
+        var sorted = entries
+        sortEntries(&sorted)
+        session.remotePath = path
+        session.remoteEntries = sorted
+        if session === active {
+            remotePath = path
+            remoteEntries = sorted
+        }
+    }
+
     // MARK: - Saved sites (WinSCP-style)
 
-    // "Save session as site" dialog state.
     @Published var saveSitePrompt = false
     @Published var saveSiteName = ""
     @Published var saveSitePassword = false
@@ -196,11 +263,31 @@ final class AppState: ObservableObject {
         }
     }
 
+    func chmodLocal(_ entry: FileEntry, mode: UInt32) {
+        let path = pathJoin(localPath, entry.name)
+        do {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)], ofItemAtPath: path)
+            status = "Permissions of \(entry.name) set to \(String(mode, radix: 8))"
+            loadLocal()
+        } catch {
+            status = "Error: \(error.localizedDescription)"
+        }
+    }
+
+    /// Current unix mode of a local entry (for the Properties dialog).
+    func localMode(of entry: FileEntry) -> UInt32? {
+        let path = pathJoin(localPath, entry.name)
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        return (attrs?[.posixPermissions] as? NSNumber).map { UInt32(truncating: $0) & 0o777 }
+    }
+
     // MARK: - Remote: connect & browse
 
-    /// Connect with the current form values. After an "unknown host key"
-    /// failure, the UI re-calls this with the fingerprint the user approved.
+    /// Connect the active tab with the current form values. After an "unknown
+    /// host key" failure, the UI re-calls this with the approved fingerprint.
     func connect(trustingFingerprint trusted: String? = nil) {
+        let session = active
         let p = proto
         let h = host
         let portNum = UInt16(port) ?? Credentials_defaultPort(p)
@@ -210,8 +297,8 @@ final class AppState: ObservableObject {
         let rgn = region
         let auth = authMode
         let key = keyPath
-        let path = remotePath
-        runBusy("Connecting…") { [client] in
+        let path = session.remotePath
+        runBusy(on: session, "Connecting…") { [client = session.client] in
             try client.connect(
                 proto: p, host: h, port: portNum, user: u, password: pw,
                 bucket: bkt, region: rgn,
@@ -221,9 +308,17 @@ final class AppState: ObservableObject {
                 keyPath: key)
             return try client.listDir(path)
         } onSuccess: { [weak self] entries in
-            self?.showRemote(path: path, entries: entries)
-            self?.status = "Connected — \(path) (\(entries.count) items)"
-            self?.showLogin = false
+            guard let self else { return }
+            session.connected = true
+            let target = h.isEmpty ? bkt : h
+            session.title = u.isEmpty ? target : "\(u)@\(target)"
+            if let idx = self.sessions.firstIndex(where: { $0 === session }) {
+                self.tabTitles[idx] = session.title
+            }
+            self.showRemote(session, path: path, entries: entries)
+            if session === self.active { self.activeConnected = true }
+            self.status = "Connected — \(path) (\(entries.count) items)"
+            self.showLogin = false
         } onFailure: { [weak self] error in
             guard let self else { return }
             if let core = error as? CoreError, core.isUnknownHostKey,
@@ -250,84 +345,62 @@ final class AppState: ObservableObject {
     }
 
     func listRemote(_ path: String) {
-        guard isConnected else { return }
-        runBusy("Listing \(path)…") { [client] in
+        let session = active
+        guard session.connected else { return }
+        runBusy(on: session, "Listing \(path)…") { [client = session.client] in
             try client.listDir(path)
         } onSuccess: { [weak self] entries in
-            self?.showRemote(path: path, entries: entries)
+            self?.showRemote(session, path: path, entries: entries)
             self?.status = "\(path) (\(entries.count) items)"
         }
-    }
-
-    private func showRemote(path: String, entries: [FileEntry]) {
-        var sorted = entries
-        sortEntries(&sorted)
-        remotePath = path
-        remoteEntries = sorted
     }
 
     func refreshRemote() {
         listRemote(remotePath)
     }
 
+    /// Refresh a specific session's current directory (post-transfer).
+    private func refreshSession(_ session: SessionHandle) {
+        guard session.connected else { return }
+        let path = session.remotePath
+        runBusy(on: session, "Listing \(path)…") { [client = session.client] in
+            try client.listDir(path)
+        } onSuccess: { [weak self] entries in
+            self?.showRemote(session, path: path, entries: entries)
+        }
+    }
+
     // MARK: - Remote: file management
 
     func newRemoteFolder(named name: String) {
-        guard !name.isEmpty, isConnected else { return }
-        let path = pathJoinPosix(remotePath, name)
-        runBusy("Creating \(name)…") { [client] in
+        let session = active
+        guard !name.isEmpty, session.connected else { return }
+        let path = pathJoinPosix(session.remotePath, name)
+        runBusy(on: session, "Creating \(name)…") { [client = session.client] in
             try client.mkdir(path)
         } onSuccess: { [weak self] _ in
-            self?.refreshRemote()
+            self?.refreshSession(session)
         }
     }
 
     func renameRemote(_ entry: FileEntry, to newName: String) {
-        guard !newName.isEmpty, newName != entry.name, isConnected else { return }
-        let from = pathJoinPosix(remotePath, entry.name)
-        let to = pathJoinPosix(remotePath, newName)
-        runBusy("Renaming…") { [client] in
+        let session = active
+        guard !newName.isEmpty, newName != entry.name, session.connected else { return }
+        let from = pathJoinPosix(session.remotePath, entry.name)
+        let to = pathJoinPosix(session.remotePath, newName)
+        runBusy(on: session, "Renaming…") { [client = session.client] in
             try client.rename(from: from, to: to)
         } onSuccess: { [weak self] _ in
-            self?.refreshRemote()
+            self?.refreshSession(session)
         }
-    }
-
-    func chmodRemote(_ entry: FileEntry, mode: UInt32) {
-        guard isConnected else { return }
-        let path = pathJoinPosix(remotePath, entry.name)
-        runBusy("Changing permissions…") { [client] in
-            try client.chmod(path, mode: mode)
-        } onSuccess: { [weak self] _ in
-            self?.status = "Permissions of \(entry.name) set to \(String(mode, radix: 8))"
-            self?.refreshRemote()
-        }
-    }
-
-    func chmodLocal(_ entry: FileEntry, mode: UInt32) {
-        let path = pathJoin(localPath, entry.name)
-        do {
-            try FileManager.default.setAttributes(
-                [.posixPermissions: NSNumber(value: mode)], ofItemAtPath: path)
-            status = "Permissions of \(entry.name) set to \(String(mode, radix: 8))"
-            loadLocal()
-        } catch {
-            status = "Error: \(error.localizedDescription)"
-        }
-    }
-
-    /// Current unix mode of a local entry (for the Properties dialog).
-    func localMode(of entry: FileEntry) -> UInt32? {
-        let path = pathJoin(localPath, entry.name)
-        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
-        return (attrs?[.posixPermissions] as? NSNumber).map { UInt32(truncating: $0) & 0o777 }
     }
 
     func deleteRemote(_ entry: FileEntry) {
-        guard isConnected else { return }
-        let path = pathJoinPosix(remotePath, entry.name)
+        let session = active
+        guard session.connected else { return }
+        let path = pathJoinPosix(session.remotePath, entry.name)
         let isDir = entry.isDir
-        runBusy("Deleting \(entry.name)…") { [client] in
+        runBusy(on: session, "Deleting \(entry.name)…") { [client = session.client] in
             if isDir {
                 try client.removeDirAll(path)
             } else {
@@ -335,20 +408,34 @@ final class AppState: ObservableObject {
             }
         } onSuccess: { [weak self] _ in
             self?.status = "Deleted \(entry.name)"
-            self?.refreshRemote()
+            self?.refreshSession(session)
+        }
+    }
+
+    func chmodRemote(_ entry: FileEntry, mode: UInt32) {
+        let session = active
+        guard session.connected else { return }
+        let path = pathJoinPosix(session.remotePath, entry.name)
+        runBusy(on: session, "Changing permissions…") { [client = session.client] in
+            try client.chmod(path, mode: mode)
+        } onSuccess: { [weak self] _ in
+            self?.status = "Permissions of \(entry.name) set to \(String(mode, radix: 8))"
+            self?.refreshSession(session)
         }
     }
 
     // MARK: - Transfers
 
     func download(_ entry: FileEntry) {
-        guard isConnected else { return }
+        let session = active
+        guard session.connected else { return }
         if entry.isDir {
             downloadFolder(entry)
             return
         }
         transferFile(
-            remote: pathJoinPosix(remotePath, entry.name),
+            on: session,
+            remote: pathJoinPosix(session.remotePath, entry.name),
             local: pathJoin(localPath, entry.name),
             name: entry.name,
             size: entry.size,
@@ -357,7 +444,8 @@ final class AppState: ObservableObject {
     }
 
     func upload(_ entry: FileEntry) {
-        guard isConnected else {
+        let session = active
+        guard session.connected else {
             status = "Connect first to upload"
             return
         }
@@ -366,16 +454,18 @@ final class AppState: ObservableObject {
             return
         }
         transferFile(
-            remote: pathJoinPosix(remotePath, entry.name),
+            on: session,
+            remote: pathJoinPosix(session.remotePath, entry.name),
             local: pathJoin(localPath, entry.name),
             name: entry.name,
             size: entry.size,
             direction: .upload
-        ) { [weak self] in self?.refreshRemote() }
+        ) { [weak self] in self?.refreshSession(session) }
     }
 
     /// Single-file transfer with a progress row; `onDone` runs after success.
     private func transferFile(
+        on session: SessionHandle,
         remote: String, local: String, name: String, size: UInt64,
         direction: TransferDirection, onDone: @escaping () -> Void
     ) {
@@ -384,7 +474,7 @@ final class AppState: ObservableObject {
         transfers.add(transfer)
         let flag = transfer.cancelFlag
 
-        queue.async { [weak self, client] in
+        session.queue.async { [weak self, client = session.client] in
             let progress: (UInt64, UInt64) -> Bool = { done, total in
                 DispatchQueue.main.async {
                     transfer.transferred = done
@@ -415,36 +505,41 @@ final class AppState: ObservableObject {
     }
 
     func downloadFolder(_ entry: FileEntry) {
-        guard isConnected, entry.isDir else { return }
+        let session = active
+        guard session.connected, entry.isDir else { return }
         runFolderOp(
+            on: session,
             name: entry.name, direction: .download,
-            remote: pathJoinPosix(remotePath, entry.name),
+            remote: pathJoinPosix(session.remotePath, entry.name),
             local: pathJoin(localPath, entry.name)
         ) { [weak self] in self?.loadLocal() }
     }
 
     func uploadFolder(_ entry: FileEntry) {
-        guard isConnected, entry.isDir else { return }
+        let session = active
+        guard session.connected, entry.isDir else { return }
         runFolderOp(
+            on: session,
             name: entry.name, direction: .upload,
-            remote: pathJoinPosix(remotePath, entry.name),
+            remote: pathJoinPosix(session.remotePath, entry.name),
             local: pathJoin(localPath, entry.name)
-        ) { [weak self] in self?.refreshRemote() }
+        ) { [weak self] in self?.refreshSession(session) }
     }
 
     func sync(download: Bool) {
-        guard isConnected else {
+        let session = active
+        guard session.connected else {
             status = "Connect first to sync"
             return
         }
         let local = localPath
-        let remote = remotePath
+        let remote = session.remotePath
         let title = download ? "Sync ⬇ \(remote)" : "Sync ⬆ \(remote)"
         let transfer = Transfer(name: title, direction: download ? .download : .upload)
         transfers.add(transfer)
         let flag = transfer.cancelFlag
 
-        queue.async { [weak self, client] in
+        session.queue.async { [weak self, client = session.client] in
             let result = Result {
                 try client.syncDir(
                     local: local, remote: remote, download: download,
@@ -455,7 +550,11 @@ final class AppState: ObservableObject {
                 case .success(let copied):
                     transfer.state = .done
                     self?.status = "Sync done — \(copied) file(s) copied"
-                    if download { self?.loadLocal() } else { self?.refreshRemote() }
+                    if download {
+                        self?.loadLocal()
+                    } else {
+                        self?.refreshSession(session)
+                    }
                 case .failure where flag.isCancelled:
                     transfer.state = .cancelled
                     self?.status = "Sync cancelled"
@@ -469,6 +568,7 @@ final class AppState: ObservableObject {
 
     /// Recursive folder transfer with one queue row updated per file.
     private func runFolderOp(
+        on session: SessionHandle,
         name: String, direction: TransferDirection, remote: String, local: String,
         onDone: @escaping () -> Void
     ) {
@@ -476,7 +576,7 @@ final class AppState: ObservableObject {
         transfers.add(transfer)
         let flag = transfer.cancelFlag
 
-        queue.async { [weak self, client] in
+        session.queue.async { [weak self, client = session.client] in
             let handler = Self.folderEventHandler(transfer: transfer, flag: flag)
             let result = Result {
                 direction == .download
@@ -529,10 +629,11 @@ final class AppState: ObservableObject {
     // MARK: - Edit in editor
 
     /// Download to a temp copy, open it in the default app, and re-upload
-    /// whenever the file is saved (mtime polling).
+    /// whenever the file is saved (mtime polling), via the owning session.
     func editRemote(_ entry: FileEntry) {
-        guard isConnected, !entry.isDir else { return }
-        let remote = pathJoinPosix(remotePath, entry.name)
+        let session = active
+        guard session.connected, !entry.isDir else { return }
+        let remote = pathJoinPosix(session.remotePath, entry.name)
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScpCommander-edit")
             .appendingPathComponent(UUID().uuidString)
@@ -540,6 +641,7 @@ final class AppState: ObservableObject {
         let local = dir.appendingPathComponent(entry.name)
 
         transferFile(
+            on: session,
             remote: remote, local: local.path, name: entry.name, size: entry.size,
             direction: .download
         ) { [weak self] in
@@ -547,7 +649,8 @@ final class AppState: ObservableObject {
             let mtime =
                 (try? FileManager.default.attributesOfItem(atPath: local.path)[.modificationDate]
                     as? Date) ?? Date()
-            self.edits.append(EditSession(remote: remote, local: local, lastModified: mtime))
+            self.edits.append(
+                EditSession(remote: remote, local: local, lastModified: mtime, session: session))
             NSWorkspace.shared.open(local)
             self.status = "Editing \(entry.name) — saves upload automatically"
             self.startEditTimerIfNeeded()
@@ -563,21 +666,23 @@ final class AppState: ObservableObject {
 
     private func pollEdits() {
         for i in edits.indices {
-            let session = edits[i]
+            let editSession = edits[i]
             guard
                 let mtime = (try? FileManager.default.attributesOfItem(
-                    atPath: session.local.path))?[.modificationDate] as? Date,
-                mtime > session.lastModified
+                    atPath: editSession.local.path))?[.modificationDate] as? Date,
+                mtime > editSession.lastModified
             else { continue }
             edits[i].lastModified = mtime
             let size =
-                (try? FileManager.default.attributesOfItem(atPath: session.local.path))?[.size]
-                as? UInt64 ?? 0
+                (try? FileManager.default.attributesOfItem(atPath: editSession.local.path))?[
+                    .size] as? UInt64 ?? 0
+            let session = editSession.session
             transferFile(
-                remote: session.remote, local: session.local.path,
-                name: session.local.lastPathComponent, size: size,
+                on: session,
+                remote: editSession.remote, local: editSession.local.path,
+                name: editSession.local.lastPathComponent, size: size,
                 direction: .upload
-            ) { [weak self] in self?.refreshRemote() }
+            ) { [weak self] in self?.refreshSession(session) }
         }
     }
 
@@ -593,8 +698,10 @@ final class AppState: ObservableObject {
 
     // MARK: - Plumbing
 
-    /// Run a blocking core call off-thread, marshalling result/error back to main.
+    /// Run a blocking core call on a session's queue, marshalling the
+    /// result/error back to the main thread.
     private func runBusy<T>(
+        on session: SessionHandle,
         _ message: String,
         _ work: @escaping () throws -> T,
         onSuccess: @escaping (T) -> Void,
@@ -602,7 +709,7 @@ final class AppState: ObservableObject {
     ) {
         busy = true
         status = message
-        queue.async {
+        session.queue.async {
             let result = Result(catching: work)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }

@@ -80,21 +80,34 @@ struct EditWatch {
     remote: String,
     local: PathBuf,
     last_mtime: SystemTime,
+    /// Command channel of the session that opened the file.
+    cmd: mpsc::Sender<Cmd>,
+}
+
+/// One server session, WinSCP-tab-style: its own worker thread, connection,
+/// and cached remote listing. The remote pane shows the active session.
+struct Session {
+    cmd: mpsc::Sender<Cmd>,
+    remote_path: RefCell<String>,
+    connected: Cell<bool>,
+    cache: RefCell<Vec<Entry>>,
+    title: RefCell<String>,
 }
 
 /// Late-bound hook the row factories use to open the context menu.
 type MenuHook = Rc<RefCell<Option<Box<dyn Fn(u32, f64, f64)>>>>;
 
 struct App {
-    cmd: mpsc::Sender<Cmd>,
     window: ApplicationWindow,
     /// WinSCP-style Login dialog (modal; hidden on successful connect).
     login_window: gtk::Window,
+    // Session tabs
+    sessions: RefCell<Vec<Rc<Session>>>,
+    active_tab: Cell<usize>,
+    tabs_box: GtkBox,
     local: Pane,
     remote: Pane,
     local_path: RefCell<PathBuf>,
-    remote_path: RefCell<String>,
-    connected: RefCell<bool>,
     status: Label,
     // Transfers panel
     transfers_box: GtkBox,
@@ -131,6 +144,99 @@ struct App {
 impl App {
     fn set_status(&self, text: &str) {
         self.status.set_text(text);
+    }
+
+    /// The active tab's session.
+    fn session(&self) -> Rc<Session> {
+        self.sessions.borrow()[self.active_tab.get()].clone()
+    }
+
+    // -- Tabs ----------------------------------------------------------------
+
+    fn select_tab(self: &Rc<Self>, index: usize) {
+        if index >= self.sessions.borrow().len() {
+            return;
+        }
+        self.active_tab.set(index);
+        let session = self.session();
+        let path = session.remote_path.borrow().clone();
+        let cache = session.cache.borrow().clone();
+        self.remote.show(&cache, &path);
+        let title = session.title.borrow().clone();
+        self.window.set_title(Some(&if session.connected.get() {
+            format!("{title} — SCP Commander")
+        } else {
+            "SCP Commander".to_string()
+        }));
+        self.refresh_tabs();
+    }
+
+    fn new_tab(self: &Rc<Self>) {
+        let session = create_session(self);
+        self.sessions.borrow_mut().push(session);
+        let last = self.sessions.borrow().len() - 1;
+        self.select_tab(last);
+        self.login_window.present();
+    }
+
+    fn close_tab(self: &Rc<Self>, index: usize) {
+        {
+            let mut sessions = self.sessions.borrow_mut();
+            if index >= sessions.len() {
+                return;
+            }
+            // Dropping the sender ends the worker thread, which disconnects.
+            sessions.remove(index);
+            if sessions.is_empty() {
+                drop(sessions);
+                let fresh = create_session(self);
+                self.sessions.borrow_mut().push(fresh);
+            }
+        }
+        let count = self.sessions.borrow().len();
+        self.select_tab(self.active_tab.get().min(count - 1));
+    }
+
+    /// Rebuild the WinSCP-style tab strip.
+    fn refresh_tabs(self: &Rc<Self>) {
+        while let Some(child) = self.tabs_box.first_child() {
+            self.tabs_box.remove(&child);
+        }
+        let count = self.sessions.borrow().len();
+        for index in 0..count {
+            let title = self.sessions.borrow()[index].title.borrow().clone();
+            let tab = GtkBox::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(0)
+                .build();
+            let label_btn = Button::with_label(&title);
+            label_btn.add_css_class("flat");
+            if index == self.active_tab.get() {
+                label_btn.add_css_class("suggested-action");
+            }
+            label_btn.connect_clicked(glib::clone!(
+                #[strong(rename_to = state)] self,
+                move |_| state.select_tab(index)
+            ));
+            let close = Button::from_icon_name("window-close-symbolic");
+            close.add_css_class("flat");
+            close.set_tooltip_text(Some("Close tab"));
+            close.connect_clicked(glib::clone!(
+                #[strong(rename_to = state)] self,
+                move |_| state.close_tab(index)
+            ));
+            tab.append(&label_btn);
+            tab.append(&close);
+            self.tabs_box.append(&tab);
+        }
+        let plus = Button::from_icon_name("list-add-symbolic");
+        plus.add_css_class("flat");
+        plus.set_tooltip_text(Some("New tab"));
+        plus.connect_clicked(glib::clone!(
+            #[strong(rename_to = state)] self,
+            move |_| state.new_tab()
+        ));
+        self.tabs_box.append(&plus);
     }
 
     fn selected_auth(&self) -> u32 {
@@ -244,10 +350,10 @@ impl App {
 
     fn start_connect(&self, creds: Credentials) {
         self.hostkey_bar.set_visible(false);
-        let path = self.remote_path.borrow().clone();
+        let path = self.session().remote_path.borrow().clone();
         *self.pending_connect.borrow_mut() = Some((creds.clone(), path.clone()));
         self.set_status("Connecting…");
-        let _ = self.cmd.send(Cmd::Connect { creds, path });
+        let _ = self.session().cmd.send(Cmd::Connect { creds, path });
     }
 
     /// "Trust & Connect" on the host key bar: retry pinned to the approved key.
@@ -261,39 +367,39 @@ impl App {
     fn open_remote(self: &Rc<Self>, index: u32) {
         let Some(entry) = self.remote.entry_at(index) else { return };
         if entry.is_dir {
-            let path = join_posix(&self.remote_path.borrow(), &entry.name);
-            let _ = self.cmd.send(Cmd::List { path });
+            let path = join_posix(&self.session().remote_path.borrow(), &entry.name);
+            let _ = self.session().cmd.send(Cmd::List { path });
         } else {
             self.download(&entry);
         }
     }
 
     fn remote_up(&self) {
-        if !*self.connected.borrow() {
+        if !self.session().connected.get() {
             return;
         }
-        let parent = parent_posix(&self.remote_path.borrow());
-        let _ = self.cmd.send(Cmd::List { path: parent });
+        let parent = parent_posix(&self.session().remote_path.borrow());
+        let _ = self.session().cmd.send(Cmd::List { path: parent });
     }
 
     fn refresh_remote(&self) {
-        if *self.connected.borrow() {
-            let path = self.remote_path.borrow().clone();
-            let _ = self.cmd.send(Cmd::List { path });
+        if self.session().connected.get() {
+            let path = self.session().remote_path.borrow().clone();
+            let _ = self.session().cmd.send(Cmd::List { path });
         }
     }
 
     // -- Transfers ----------------------------------------------------------
 
     fn download(self: &Rc<Self>, entry: &Entry) {
-        if !*self.connected.borrow() {
+        if !self.session().connected.get() {
             return;
         }
-        let remote = join_posix(&self.remote_path.borrow(), &entry.name);
+        let remote = join_posix(&self.session().remote_path.borrow(), &entry.name);
         let local = self.local_path.borrow().join(&entry.name);
         if entry.is_dir {
             let (id, cancel) = self.add_transfer(&format!("{}/", entry.name), true, 0);
-            let _ = self.cmd.send(Cmd::DownloadDir {
+            let _ = self.session().cmd.send(Cmd::DownloadDir {
                 id,
                 name: entry.name.clone(),
                 remote,
@@ -302,7 +408,7 @@ impl App {
             });
         } else {
             let (id, cancel) = self.add_transfer(&entry.name, true, entry.size);
-            let _ = self.cmd.send(Cmd::Download {
+            let _ = self.session().cmd.send(Cmd::Download {
                 id,
                 name: entry.name.clone(),
                 remote,
@@ -313,15 +419,15 @@ impl App {
     }
 
     fn upload(self: &Rc<Self>, entry: &Entry) {
-        if !*self.connected.borrow() {
+        if !self.session().connected.get() {
             self.set_status("Connect first to upload");
             return;
         }
         let local = self.local_path.borrow().join(&entry.name);
-        let remote = join_posix(&self.remote_path.borrow(), &entry.name);
+        let remote = join_posix(&self.session().remote_path.borrow(), &entry.name);
         if entry.is_dir {
             let (id, cancel) = self.add_transfer(&format!("{}/", entry.name), false, 0);
-            let _ = self.cmd.send(Cmd::UploadDir {
+            let _ = self.session().cmd.send(Cmd::UploadDir {
                 id,
                 name: entry.name.clone(),
                 local,
@@ -330,7 +436,7 @@ impl App {
             });
         } else {
             let (id, cancel) = self.add_transfer(&entry.name, false, entry.size);
-            let _ = self.cmd.send(Cmd::Upload {
+            let _ = self.session().cmd.send(Cmd::Upload {
                 id,
                 name: entry.name.clone(),
                 local,
@@ -341,15 +447,15 @@ impl App {
     }
 
     fn sync(self: &Rc<Self>, download: bool) {
-        if !*self.connected.borrow() {
+        if !self.session().connected.get() {
             self.set_status("Connect first to sync");
             return;
         }
         let local = self.local_path.borrow().clone();
-        let remote = self.remote_path.borrow().clone();
+        let remote = self.session().remote_path.borrow().clone();
         let title = format!("Sync {} {}", if download { "⬇" } else { "⬆" }, remote);
         let (id, cancel) = self.add_transfer(&title, download, 0);
-        let _ = self.cmd.send(Cmd::Sync { id, download, local, remote, cancel });
+        let _ = self.session().cmd.send(Cmd::Sync { id, download, local, remote, cancel });
     }
 
     fn add_transfer(&self, name: &str, download: bool, total: u64) -> (u64, Arc<AtomicBool>) {
@@ -499,8 +605,8 @@ impl App {
                         Err(e) => state.set_status(&format!("Error: {e}")),
                     }
                 } else {
-                    let base = state.remote_path.borrow().clone();
-                    let _ = state.cmd.send(Cmd::Rename {
+                    let base = state.session().remote_path.borrow().clone();
+                    let _ = state.session().cmd.send(Cmd::Rename {
                         from: join_posix(&base, &old_name),
                         to: join_posix(&base, &new_name),
                     });
@@ -542,8 +648,8 @@ impl App {
                         Err(e) => state.set_status(&format!("Error: {e}")),
                     }
                 } else {
-                    let path = join_posix(&state.remote_path.borrow(), &entry.name);
-                    let _ = state.cmd.send(Cmd::Delete { path, is_dir: entry.is_dir });
+                    let path = join_posix(&state.session().remote_path.borrow(), &entry.name);
+                    let _ = state.session().cmd.send(Cmd::Delete { path, is_dir: entry.is_dir });
                 }
             },
         );
@@ -556,10 +662,10 @@ impl App {
             self.set_status("Only files can be edited");
             return;
         }
-        if !*self.connected.borrow() {
+        if !self.session().connected.get() {
             return;
         }
-        let remote = join_posix(&self.remote_path.borrow(), &entry.name);
+        let remote = join_posix(&self.session().remote_path.borrow(), &entry.name);
         let dir = glib::tmp_dir()
             .join("scp-commander-edit")
             .join(format!("{}", self.next_id.borrow()));
@@ -572,7 +678,7 @@ impl App {
         self.edit_pending
             .borrow_mut()
             .insert(id, (remote.clone(), local.clone()));
-        let _ = self.cmd.send(Cmd::Download {
+        let _ = self.session().cmd.send(Cmd::Download {
             id,
             name: entry.name.clone(),
             remote,
@@ -602,7 +708,7 @@ impl App {
         let location = if local_pane {
             self.local_path.borrow().to_string_lossy().into_owned()
         } else {
-            self.remote_path.borrow().clone()
+            self.session().remote_path.borrow().clone()
         };
         // S3 has no permission model; everything else can try chmod.
         let can_chmod = local_pane || proto_from_index(self.proto_dd.selected()) != Protocol::S3;
@@ -637,8 +743,8 @@ impl App {
                         }
                     }
                 } else {
-                    let path = join_posix(&state.remote_path.borrow(), &entry.name);
-                    let _ = state.cmd.send(Cmd::Chmod { path, mode });
+                    let path = join_posix(&state.session().remote_path.borrow(), &entry.name);
+                    let _ = state.session().cmd.send(Cmd::Chmod { path, mode });
                 }
             },
         );
@@ -657,8 +763,8 @@ impl App {
                     Err(e) => state.set_status(&format!("Error: {e}")),
                 }
             } else {
-                let path = join_posix(&state.remote_path.borrow(), &name);
-                let _ = state.cmd.send(Cmd::Mkdir { path });
+                let path = join_posix(&state.session().remote_path.borrow(), &name);
+                let _ = state.session().cmd.send(Cmd::Mkdir { path });
             }
         });
     }
@@ -666,7 +772,7 @@ impl App {
     // -- Edit watches ---------------------------------------------------------
 
     fn poll_edits(self: &Rc<Self>) {
-        let changed: Vec<(String, PathBuf)> = {
+        let changed: Vec<(String, PathBuf, mpsc::Sender<Cmd>)> = {
             let mut edits = self.edits.borrow_mut();
             let mut out = Vec::new();
             for watch in edits.iter_mut() {
@@ -674,19 +780,19 @@ impl App {
                 let Ok(mtime) = meta.modified() else { continue };
                 if mtime > watch.last_mtime {
                     watch.last_mtime = mtime;
-                    out.push((watch.remote.clone(), watch.local.clone()));
+                    out.push((watch.remote.clone(), watch.local.clone(), watch.cmd.clone()));
                 }
             }
             out
         };
-        for (remote, local) in changed {
+        for (remote, local, cmd) in changed {
             let name = local
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
             let (id, cancel) = self.add_transfer(&name, false, size);
-            let _ = self.cmd.send(Cmd::Upload { id, name, local, remote, cancel });
+            let _ = cmd.send(Cmd::Upload { id, name, local, remote, cancel });
         }
     }
 
@@ -837,20 +943,21 @@ impl App {
 
     // -- Worker events ------------------------------------------------------
 
-    fn handle_event(self: &Rc<Self>, event: Event) {
+    /// Handle an event from `session`'s worker. Pane/status updates only
+    /// apply when that session is the active tab; caches always update.
+    fn handle_event(self: &Rc<Self>, session: &Rc<Session>, event: Event) {
+        let is_active = Rc::ptr_eq(session, &self.session());
         match event {
             Event::Connected { path, entries } | Event::Listed { path, entries } => {
-                let first_connect = !*self.connected.borrow();
-                *self.connected.borrow_mut() = true;
+                let first_connect = !session.connected.get();
+                session.connected.set(true);
                 let mut entries = entries;
                 sort_entries(&mut entries);
                 let count = entries.len();
-                self.remote.show(&entries, &path);
-                *self.remote_path.borrow_mut() = path.clone();
-                self.set_status(&format!("{path} ({count} items)"));
-                if first_connect || self.login_window.is_visible() {
-                    self.login_window.set_visible(false);
-                    let session = self
+                *session.remote_path.borrow_mut() = path.clone();
+                *session.cache.borrow_mut() = entries.clone();
+                if first_connect {
+                    let title = self
                         .pending_connect
                         .borrow()
                         .as_ref()
@@ -867,8 +974,19 @@ impl App {
                             }
                         })
                         .unwrap_or_default();
-                    self.window
-                        .set_title(Some(&format!("{session} — SCP Commander")));
+                    *session.title.borrow_mut() = title;
+                    self.refresh_tabs();
+                }
+                if is_active {
+                    self.remote.show(&entries, &path);
+                    self.set_status(&format!("{path} ({count} items)"));
+                    if first_connect || self.login_window.is_visible() {
+                        self.login_window.set_visible(false);
+                        self.window.set_title(Some(&format!(
+                            "{} — SCP Commander",
+                            session.title.borrow()
+                        )));
+                    }
                 }
             }
             Event::HostKeyUnknown { fingerprint } => {
@@ -938,6 +1056,7 @@ impl App {
                         remote,
                         local,
                         last_mtime: mtime,
+                        cmd: session.cmd.clone(),
                     });
                     return;
                 }
@@ -948,8 +1067,10 @@ impl App {
                 ));
                 if download {
                     self.load_local();
-                } else {
-                    self.refresh_remote();
+                } else if session.connected.get() {
+                    // Refresh the owning session's listing, whichever tab it is.
+                    let path = session.remote_path.borrow().clone();
+                    let _ = session.cmd.send(Cmd::List { path });
                 }
             }
             Event::Cancelled { id, name } => {
@@ -962,7 +1083,10 @@ impl App {
             }
             Event::OpOk { message } => {
                 self.set_status(&message);
-                self.refresh_remote();
+                if session.connected.get() {
+                    let path = session.remote_path.borrow().clone();
+                    let _ = session.cmd.send(Cmd::List { path });
+                }
             }
             Event::Error(message) => self.set_status(&format!("Error: {message}")),
         }
@@ -987,10 +1111,31 @@ impl Pane {
 // ---------------------------------------------------------------------------
 // UI assembly
 
-fn build_ui(app: &Application) {
+/// Spawn a session: its own worker thread plus a main-loop pump feeding
+/// events (tagged with the session) into the shared handler.
+fn create_session(state: &Rc<App>) -> Rc<Session> {
     let (event_tx, event_rx) = async_channel::unbounded::<Event>();
     let cmd = worker::spawn(event_tx);
+    let session = Rc::new(Session {
+        cmd,
+        remote_path: RefCell::new("/".to_string()),
+        connected: Cell::new(false),
+        cache: RefCell::new(Vec::new()),
+        title: RefCell::new("New Session".to_string()),
+    });
+    glib::spawn_future_local({
+        let state = state.clone();
+        let session = session.clone();
+        async move {
+            while let Ok(event) = event_rx.recv().await {
+                state.handle_event(&session, event);
+            }
+        }
+    });
+    session
+}
 
+fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("SCP Commander")
@@ -1285,8 +1430,19 @@ fn build_ui(app: &Application) {
     login_window.set_default_widget(Some(&login_btn));
 
     // Root layout ---------------------------------------------------------------
+    let tabs_box = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(2)
+        .margin_start(6)
+        .margin_end(6)
+        .margin_top(2)
+        .margin_bottom(2)
+        .build();
+
     let content = GtkBox::builder().orientation(Orientation::Vertical).build();
     content.append(&main_toolbar);
+    content.append(&gtk::Separator::new(Orientation::Horizontal));
+    content.append(&tabs_box);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
     content.append(&panes);
     content.append(&transfers_panel);
@@ -1296,14 +1452,14 @@ fn build_ui(app: &Application) {
     let root = content;
 
     let state = Rc::new(App {
-        cmd,
         window: window.clone(),
         login_window: login_window.clone(),
+        sessions: RefCell::new(Vec::new()),
+        active_tab: Cell::new(0),
+        tabs_box,
         local: local_pane,
         remote: remote_pane,
         local_path: RefCell::new(glib::home_dir()),
-        remote_path: RefCell::new("/".to_string()),
-        connected: RefCell::new(false),
         status,
         transfers_box,
         transfers_panel,
@@ -1330,6 +1486,11 @@ fn build_ui(app: &Application) {
         sites: RefCell::new(SitesStore::load()),
         sites_list,
     });
+
+    // First session tab.
+    let first = create_session(&state);
+    state.sessions.borrow_mut().push(first);
+    state.refresh_tabs();
 
     update_form();
     state.load_local();
@@ -1564,16 +1725,6 @@ fn build_ui(app: &Application) {
             }
         ),
     );
-
-    // Worker event pump --------------------------------------------------------------
-    glib::spawn_future_local(glib::clone!(
-        #[strong] state,
-        async move {
-            while let Ok(event) = event_rx.recv().await {
-                state.handle_event(event);
-            }
-        }
-    ));
 
     window.set_child(Some(&root));
     window.present();

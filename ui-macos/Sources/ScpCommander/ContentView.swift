@@ -36,6 +36,8 @@ struct ContentView: View {
         VStack(spacing: 0) {
             TopBar()
             Divider()
+            TabStrip()
+            Divider()
             HSplitView {
                 FilePane(
                     kind: "local",
@@ -170,6 +172,54 @@ struct ContentView: View {
     private func beginNewFolder(_ pane: PaneKind) {
         newFolderText = ""
         newFolderPane = pane
+    }
+}
+
+/// WinSCP-style session tab strip: one tab per server session.
+private struct TabStrip: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(Array(state.tabTitles.enumerated()), id: \.offset) { index, title in
+                let isActive = index == state.activeTab
+                HStack(spacing: 4) {
+                    Image(systemName: "network")
+                        .font(.caption)
+                        .foregroundStyle(isActive ? Color.accentColor : .secondary)
+                    Text(title)
+                        .font(.callout)
+                        .lineLimit(1)
+                    Button {
+                        state.closeTab(index)
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Close tab")
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(isActive ? Color.accentColor.opacity(0.15) : Color.clear)
+                )
+                .contentShape(Rectangle())
+                .onTapGesture { state.selectTab(index) }
+            }
+            Button {
+                state.newTab()
+            } label: {
+                Image(systemName: "plus")
+            }
+            .buttonStyle(.borderless)
+            .help("New tab")
+            Spacer()
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
     }
 }
 
