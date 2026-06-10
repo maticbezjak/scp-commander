@@ -26,6 +26,7 @@ struct FileEntry: Identifiable, Hashable {
     var size: UInt64
     var mtime: Date? = nil
     var perms: String?
+    var isSymlink: Bool = false
 
     /// WinSCP-style "Type" column, from the system's type database.
     var typeDescription: String {
@@ -251,6 +252,28 @@ final class CoreClient: @unchecked Sendable {
         if scp_chmod(session, path, mode) != 0 { throw Self.lastError() }
     }
 
+    /// Resume a download from `offset` (appends to the local partial file).
+    @discardableResult
+    func downloadResume(
+        remote: String, local: String, offset: UInt64,
+        onProgress: @escaping (UInt64, UInt64) -> Bool
+    ) throws -> Int64 {
+        guard let session else { throw CoreError(message: "not connected") }
+        let box = ProgressBox(onProgress)
+        let ud = Unmanaged.passRetained(box).toOpaque()
+        defer { Unmanaged<ProgressBox>.fromOpaque(ud).release() }
+        let n = scp_download_resume_cb(session, remote, local, offset, Self.trampoline, ud)
+        if n < 0 { throw Self.lastError() }
+        return n
+    }
+
+    /// Liveness probe / NAT keepalive; failures are fine (the core
+    /// auto-reconnects on the next real operation).
+    func keepalive() {
+        guard let session else { return }
+        _ = scp_keepalive(session)
+    }
+
     func disconnect() {
         if let session {
             scp_disconnect_free(session)
@@ -290,6 +313,7 @@ final class CoreClient: @unchecked Sendable {
         let size: UInt64
         let mtime: Int64?
         let perms: String?
+        let is_symlink: Bool?
     }
 
     private static func decode(_ json: String) throws -> [FileEntry] {
@@ -299,7 +323,8 @@ final class CoreClient: @unchecked Sendable {
             FileEntry(
                 name: $0.name, isDir: $0.is_dir, size: $0.size,
                 mtime: $0.mtime.map { Date(timeIntervalSince1970: TimeInterval($0)) },
-                perms: $0.perms)
+                perms: $0.perms,
+                isSymlink: $0.is_symlink ?? false)
         }
     }
 }

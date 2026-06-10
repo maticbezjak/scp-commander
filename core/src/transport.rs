@@ -46,6 +46,27 @@ pub trait Transport: Send {
         ))
     }
 
+    /// Resume a download from `offset` bytes, appending to the local file.
+    /// Progress reports overall position (offset included). The default
+    /// refuses; SFTP and FTP support it.
+    fn download_resume(
+        &mut self,
+        _remote: &str,
+        _local: &Path,
+        _offset: u64,
+        _progress: Progress,
+    ) -> Result<u64> {
+        Err(Error::NotImplemented(
+            "resume is not supported on this protocol".into(),
+        ))
+    }
+
+    /// Liveness probe / keepalive. Errors when the connection is dead.
+    /// Also keeps NAT mappings warm when called periodically while idle.
+    fn keepalive(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Download without progress reporting.
     fn download(&mut self, remote: &str, local: &Path) -> Result<u64> {
         self.download_progress(remote, local, &mut |_, _| true)
@@ -61,11 +82,106 @@ pub trait Transport: Send {
 }
 
 /// Open a connection using the given credentials, dispatching on protocol.
+/// The returned transport transparently reconnects once when the session
+/// turns out to be dead (network blip, NAT timeout) and retries the failed
+/// operation.
 pub fn connect(creds: &Credentials) -> Result<Box<dyn Transport>> {
+    let inner = connect_raw(creds)?;
+    Ok(Box::new(AutoReconnect {
+        inner,
+        creds: creds.clone(),
+    }))
+}
+
+fn connect_raw(creds: &Credentials) -> Result<Box<dyn Transport>> {
     match creds.protocol {
         Protocol::Sftp => Ok(Box::new(SftpTransport::connect(creds)?)),
         Protocol::Ftp | Protocol::Ftps => Ok(Box::new(FtpTransport::connect(creds)?)),
         Protocol::S3 => Ok(Box::new(S3Transport::connect(creds)?)),
+    }
+}
+
+/// Wrapper that revives dead sessions: when an operation fails AND a liveness
+/// probe also fails, it reconnects with the stored credentials and retries
+/// the operation once. Failures on a live session surface unchanged, so
+/// ordinary errors (file not found, permission denied) never trigger churn.
+struct AutoReconnect {
+    inner: Box<dyn Transport>,
+    creds: Credentials,
+}
+
+impl AutoReconnect {
+    fn retryable(e: &Error) -> bool {
+        matches!(e, Error::Io(_) | Error::Connect(_) | Error::Protocol(_))
+    }
+
+    fn run<T>(&mut self, mut op: impl FnMut(&mut dyn Transport) -> Result<T>) -> Result<T> {
+        match op(self.inner.as_mut()) {
+            Err(e) if Self::retryable(&e) => {
+                if self.inner.keepalive().is_ok() {
+                    return Err(e); // session alive — genuine failure
+                }
+                let mut fresh = connect_raw(&self.creds)?;
+                let result = op(fresh.as_mut());
+                self.inner = fresh;
+                result
+            }
+            other => other,
+        }
+    }
+}
+
+impl Transport for AutoReconnect {
+    fn list_dir(&mut self, path: &str) -> Result<Vec<Entry>> {
+        self.run(|t| t.list_dir(path))
+    }
+
+    fn download_progress(&mut self, remote: &str, local: &Path, progress: Progress)
+        -> Result<u64>
+    {
+        self.run(|t| t.download_progress(remote, local, &mut *progress))
+    }
+
+    fn upload_progress(&mut self, local: &Path, remote: &str, progress: Progress) -> Result<u64> {
+        self.run(|t| t.upload_progress(local, remote, &mut *progress))
+    }
+
+    fn download_resume(
+        &mut self,
+        remote: &str,
+        local: &Path,
+        offset: u64,
+        progress: Progress,
+    ) -> Result<u64> {
+        self.run(|t| t.download_resume(remote, local, offset, &mut *progress))
+    }
+
+    fn mkdir(&mut self, path: &str) -> Result<()> {
+        self.run(|t| t.mkdir(path))
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<()> {
+        self.run(|t| t.remove_file(path))
+    }
+
+    fn remove_dir(&mut self, path: &str) -> Result<()> {
+        self.run(|t| t.remove_dir(path))
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        self.run(|t| t.rename(from, to))
+    }
+
+    fn set_permissions(&mut self, path: &str, mode: u32) -> Result<()> {
+        self.run(|t| t.set_permissions(path, mode))
+    }
+
+    fn keepalive(&mut self) -> Result<()> {
+        self.inner.keepalive()
+    }
+
+    fn disconnect(&mut self) {
+        self.inner.disconnect();
     }
 }
 

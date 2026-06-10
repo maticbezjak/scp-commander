@@ -53,6 +53,9 @@ impl SftpTransport {
             return Err(Error::Auth("authentication rejected".into()));
         }
 
+        // Let libssh2 piggyback keepalives on blocking calls too.
+        session.set_keepalive(true, 30);
+
         let sftp = session.sftp().map_err(|e| Error::Protocol(e.to_string()))?;
         Ok(Self { session, sftp })
     }
@@ -71,12 +74,24 @@ impl Transport for SftpTransport {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| p.to_string_lossy().into_owned());
+            // readdir lstats: symlinks report as links, not their targets.
+            // Follow them so a link to a directory navigates like one.
+            let is_symlink = stat.file_type().is_symlink();
+            let (is_dir, size) = if is_symlink {
+                match self.sftp.stat(&p) {
+                    Ok(target) => (target.is_dir(), target.size.unwrap_or(0)),
+                    Err(_) => (false, 0), // dangling link
+                }
+            } else {
+                (stat.is_dir(), stat.size.unwrap_or(0))
+            };
             out.push(Entry {
                 name,
-                is_dir: stat.is_dir(),
-                size: stat.size.unwrap_or(0),
+                is_dir,
+                size,
                 mtime: stat.mtime.map(|m| m as i64),
                 perms: stat.perm.map(perm_string),
+                is_symlink,
             });
         }
         Ok(out)
@@ -87,9 +102,36 @@ impl Transport for SftpTransport {
             .sftp
             .open(Path::new(remote))
             .map_err(|e| Error::Protocol(e.to_string()))?;
-        let total = remote_file.stat().ok().and_then(|s| s.size).unwrap_or(0);
+        let stat = remote_file.stat().ok();
+        let total = stat.as_ref().and_then(|s| s.size).unwrap_or(0);
         let mut local_file = File::create(local)?;
-        copy_with_progress(&mut remote_file, &mut local_file, total, progress)
+        let n = copy_with_progress(&mut remote_file, &mut local_file, total, progress)?;
+        preserve_mtime(&local_file, stat.and_then(|s| s.mtime));
+        Ok(n)
+    }
+
+    fn download_resume(
+        &mut self,
+        remote: &str,
+        local: &Path,
+        offset: u64,
+        progress: Progress,
+    ) -> Result<u64> {
+        use std::io::Seek;
+        let mut remote_file = self
+            .sftp
+            .open(Path::new(remote))
+            .map_err(|e| Error::Protocol(e.to_string()))?;
+        let stat = remote_file.stat().ok();
+        let total = stat.as_ref().and_then(|s| s.size).unwrap_or(0);
+        remote_file
+            .seek(std::io::SeekFrom::Start(offset))
+            .map_err(|e| Error::Protocol(e.to_string()))?;
+        let mut local_file = File::options().append(true).open(local)?;
+        let mut report = |done: u64, total: u64| progress(offset + done, total);
+        let n = copy_with_progress(&mut remote_file, &mut local_file, total, &mut report)?;
+        preserve_mtime(&local_file, stat.and_then(|s| s.mtime));
+        Ok(offset + n)
     }
 
     fn upload_progress(&mut self, local: &Path, remote: &str, progress: Progress) -> Result<u64> {
@@ -140,10 +182,26 @@ impl Transport for SftpTransport {
             .map_err(|e| Error::Protocol(e.to_string()))
     }
 
+    fn keepalive(&mut self) -> Result<()> {
+        self.session
+            .keepalive_send()
+            .map(|_| ())
+            .map_err(|e| Error::Protocol(e.to_string()))
+    }
+
     fn disconnect(&mut self) {
         let _ = self
             .session
             .disconnect(None, "bye", None);
+    }
+}
+
+/// Stamp the downloaded file with the server's modification time, so sync
+/// comparisons and humans see the original date. Best-effort.
+fn preserve_mtime(file: &File, mtime: Option<u64>) {
+    if let Some(m) = mtime {
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(m);
+        let _ = file.set_modified(when);
     }
 }
 

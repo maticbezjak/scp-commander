@@ -18,6 +18,8 @@ ssh2 = "0.9"
 # FTP / FTPS (synchronous API). native-tls enables the FTPS upgrade.
 suppaftp = { version = "6", features = ["native-tls"] }
 thiserror = "1"
+# Timestamp type returned by suppaftp MDTM (already a transitive dep).
+chrono = "0.4"
 
 # S3 / S3-compatible object storage. Optional: only built with the `s3` feature.
 # The `blocking` feature gives us synchronous *_blocking methods so the whole

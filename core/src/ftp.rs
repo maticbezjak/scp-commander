@@ -91,6 +91,7 @@ impl Transport for FtpTransport {
                     size: f.size() as u64,
                     mtime: None,
                     perms: None,
+                    is_symlink: f.is_symlink(),
                 });
             }
         }
@@ -99,8 +100,9 @@ impl Transport for FtpTransport {
 
     fn download_progress(&mut self, remote: &str, local: &Path, progress: Progress) -> Result<u64> {
         let total = with_conn!(self, c => c.size(remote).ok()).unwrap_or(0) as u64;
+        let mtime = with_conn!(self, c => c.mdtm(remote).ok());
         let mut local_file = File::create(local)?;
-        with_conn!(self, c => {
+        let n = with_conn!(self, c => {
             let mut stream = c
                 .retr_as_stream(remote)
                 .map_err(|e| Error::Protocol(e.to_string()))?;
@@ -116,7 +118,42 @@ impl Transport for FtpTransport {
                     Err(e)
                 }
             }
-        })
+        })?;
+        preserve_ftp_mtime(&local_file, mtime);
+        Ok(n)
+    }
+
+    fn download_resume(
+        &mut self,
+        remote: &str,
+        local: &Path,
+        offset: u64,
+        progress: Progress,
+    ) -> Result<u64> {
+        let total = with_conn!(self, c => c.size(remote).ok()).unwrap_or(0) as u64;
+        let mtime = with_conn!(self, c => c.mdtm(remote).ok());
+        let mut local_file = File::options().append(true).open(local)?;
+        let mut report = |done: u64, total: u64| progress(offset + done, total);
+        let n = with_conn!(self, c => {
+            c.resume_transfer(offset as usize)
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            let mut stream = c
+                .retr_as_stream(remote)
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            match copy_with_progress(&mut stream, &mut local_file, total, &mut report) {
+                Ok(n) => {
+                    c.finalize_retr_stream(stream)
+                        .map_err(|e| Error::Protocol(e.to_string()))?;
+                    Ok(n)
+                }
+                Err(e) => {
+                    let _ = c.finalize_retr_stream(stream);
+                    Err(e)
+                }
+            }
+        })?;
+        preserve_ftp_mtime(&local_file, mtime);
+        Ok(offset + n)
     }
 
     fn upload_progress(&mut self, local: &Path, remote: &str, progress: Progress) -> Result<u64> {
@@ -166,7 +203,22 @@ impl Transport for FtpTransport {
             .map_err(|e| Error::Protocol(e.to_string())))
     }
 
+    fn keepalive(&mut self) -> Result<()> {
+        with_conn!(self, c => c.noop().map_err(|e| Error::Protocol(e.to_string())))
+    }
+
     fn disconnect(&mut self) {
         let _ = with_conn!(self, c => c.quit());
+    }
+}
+
+/// Stamp the downloaded file with the server's MDTM timestamp. Best-effort.
+fn preserve_ftp_mtime(file: &File, mtime: Option<chrono::NaiveDateTime>) {
+    if let Some(dt) = mtime {
+        let secs = dt.and_utc().timestamp();
+        if secs > 0 {
+            let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
+            let _ = file.set_modified(when);
+        }
     }
 }

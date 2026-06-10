@@ -94,6 +94,16 @@ int scp_rename(ScpSession *session, const char *from, const char *to);
 /* mode is the unix permission bits, e.g. 0644. SFTP and FTP (SITE CHMOD). */
 int scp_chmod(ScpSession *session, const char *path, uint32_t mode);
 
+/* Resume a download from `offset` bytes, appending to the local file.
+ * Progress reports overall position. Returns total bytes, or -1 on error. */
+int64_t scp_download_resume_cb(ScpSession *session, const char *remote,
+                               const char *local, uint64_t offset,
+                               ScpProgressCb cb, void *user_data);
+
+/* Liveness probe / NAT keepalive. 0 = alive, -1 = session appears dead
+ * (the next operation will transparently reconnect and retry once). */
+int scp_keepalive(ScpSession *session);
+
 /* Closes the session and frees the handle. Safe to pass NULL. */
 void scp_disconnect_free(ScpSession *session);
 

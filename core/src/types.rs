@@ -88,15 +88,18 @@ impl Credentials {
 }
 
 /// A single directory entry (file or folder) in a remote or local listing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Entry {
     pub name: String,
+    /// True for directories — including symlinks that point at directories,
+    /// so they navigate correctly.
     pub is_dir: bool,
     pub size: u64,
     /// Modification time as a unix epoch (seconds), if the server reported it.
     pub mtime: Option<i64>,
     /// Unix-style permission string, e.g. "rwxr-xr-x", when available.
     pub perms: Option<String>,
+    pub is_symlink: bool,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

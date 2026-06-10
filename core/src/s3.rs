@@ -167,6 +167,7 @@ mod imp {
                             size: 0,
                             mtime: None,
                             perms: None,
+                            is_symlink: false,
                         });
                     }
                 }
@@ -185,6 +186,7 @@ mod imp {
                         size: obj.size,
                         mtime: None,
                         perms: None,
+                        is_symlink: false,
                     });
                 }
             }

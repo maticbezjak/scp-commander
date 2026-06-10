@@ -70,8 +70,21 @@ final class AppState: ObservableObject {
     var active: SessionHandle { sessions[activeTab] }
     var isConnected: Bool { activeConnected }
 
+    private var keepaliveTimer: Timer?
+
     init() {
         loadLocal()
+        // NAT keepalive every 30s for every connected tab; a session that
+        // died anyway is revived by the core on the next operation.
+        keepaliveTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) {
+            [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                for session in self.sessions where session.connected {
+                    session.queue.async { [client = session.client] in client.keepalive() }
+                }
+            }
+        }
     }
 
     // MARK: - Tabs
@@ -228,7 +241,9 @@ final class AppState: ObservableObject {
     // MARK: - Local filesystem
 
     func loadLocal() {
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
+        let keys: Set<URLResourceKey> = [
+            .isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .isSymbolicLinkKey,
+        ]
         let url = URL(fileURLWithPath: localPath)
         let contents =
             (try? FileManager.default.contentsOfDirectory(
@@ -240,7 +255,8 @@ final class AppState: ObservableObject {
                 isDir: rv?.isDirectory ?? false,
                 size: UInt64(rv?.fileSize ?? 0),
                 mtime: rv?.contentModificationDate,
-                perms: nil)
+                perms: nil,
+                isSymlink: rv?.isSymbolicLink ?? false)
         }
         sortEntries(&entries)
         localEntries = entries
@@ -495,15 +511,28 @@ final class AppState: ObservableObject {
     }
 
     /// Single-file transfer with a progress row; `onDone` runs after success.
+    /// Interrupted downloads resume automatically when a smaller partial file
+    /// is already present locally.
     private func transferFile(
         on session: SessionHandle,
         remote: String, local: String, name: String, size: UInt64,
         direction: TransferDirection, onDone: @escaping () -> Void
     ) {
+        var resumeOffset: UInt64 = 0
+        if direction == .download, size > 0,
+            let attrs = try? FileManager.default.attributesOfItem(atPath: local),
+            let existing = (attrs[.size] as? NSNumber)?.uint64Value,
+            existing > 0, existing < size
+        {
+            resumeOffset = existing
+        }
+
         let transfer = Transfer(name: name, direction: direction)
         transfer.total = size
+        transfer.transferred = resumeOffset
         transfers.add(transfer)
         let flag = transfer.cancelFlag
+        let offset = resumeOffset
 
         session.queue.async { [weak self, client = session.client] in
             let progress: (UInt64, UInt64) -> Bool = { done, total in
@@ -514,9 +543,14 @@ final class AppState: ObservableObject {
                 return !flag.isCancelled
             }
             let result = Result {
-                direction == .download
-                    ? try client.download(remote: remote, local: local, onProgress: progress)
-                    : try client.upload(local: local, remote: remote, onProgress: progress)
+                if direction == .download {
+                    if offset > 0 {
+                        return try client.downloadResume(
+                            remote: remote, local: local, offset: offset, onProgress: progress)
+                    }
+                    return try client.download(remote: remote, local: local, onProgress: progress)
+                }
+                return try client.upload(local: local, remote: remote, onProgress: progress)
             }
             DispatchQueue.main.async {
                 switch result {

@@ -267,6 +267,7 @@ impl App {
                             size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
                             mtime,
                             perms: None,
+                            is_symlink: e.path().symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false),
                         }
                     })
                     .collect()
@@ -407,12 +408,19 @@ impl App {
                 cancel,
             });
         } else {
+            // Resume when a smaller partial file is already present locally.
+            let resume = std::fs::metadata(&local)
+                .map(|m| m.len())
+                .ok()
+                .filter(|len| *len > 0 && *len < entry.size)
+                .unwrap_or(0);
             let (id, cancel) = self.add_transfer(&entry.name, true, entry.size);
             let _ = self.session().cmd.send(Cmd::Download {
                 id,
                 name: entry.name.clone(),
                 remote,
                 local,
+                resume,
                 cancel,
             });
         }
@@ -683,6 +691,7 @@ impl App {
             name: entry.name.clone(),
             remote,
             local,
+            resume: 0,
             cancel,
         });
     }
@@ -1984,7 +1993,9 @@ fn make_pane(
         let label = row.last_child().and_downcast::<Label>().unwrap();
         if let Some(obj) = item.item().and_downcast::<glib::BoxedAnyObject>() {
             let entry = obj.borrow::<Entry>();
-            icon.set_icon_name(Some(if entry.is_dir {
+            icon.set_icon_name(Some(if entry.is_symlink {
+                "emblem-symbolic-link"
+            } else if entry.is_dir {
                 "folder-symbolic"
             } else {
                 "text-x-generic-symbolic"

@@ -262,6 +262,7 @@ mod tests {
                             size: 0,
                             mtime: None,
                             perms: None,
+                            is_symlink: false,
                         });
                     }
                 }
@@ -275,6 +276,7 @@ mod tests {
                             size: v.len() as u64,
                             mtime: None,
                             perms: None,
+                            is_symlink: false,
                         });
                     }
                 }

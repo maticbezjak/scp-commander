@@ -19,7 +19,15 @@ use scp_core::{connect, Transport};
 pub enum Cmd {
     Connect { creds: Credentials, path: String },
     List { path: String },
-    Download { id: u64, name: String, remote: String, local: PathBuf, cancel: Arc<AtomicBool> },
+    Download {
+        id: u64,
+        name: String,
+        remote: String,
+        local: PathBuf,
+        /// Resume from this byte offset (0 = fresh download).
+        resume: u64,
+        cancel: Arc<AtomicBool>,
+    },
     Upload { id: u64, name: String, local: PathBuf, remote: String, cancel: Arc<AtomicBool> },
     DownloadDir { id: u64, name: String, remote: String, local: PathBuf, cancel: Arc<AtomicBool> },
     UploadDir { id: u64, name: String, local: PathBuf, remote: String, cancel: Arc<AtomicBool> },
@@ -59,7 +67,20 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
             let _ = events.send_blocking(ev);
         };
 
-        for cmd in rx {
+        loop {
+            // Idle keepalive: ping every 30s so NAT mappings stay warm and a
+            // dead session is detected (the AutoReconnect wrapper revives it
+            // on the next real operation).
+            let cmd = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(cmd) => cmd,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(t) = session.as_mut() {
+                        let _ = t.keepalive();
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             match cmd {
                 Cmd::Connect { creds, path } => match connect(&creds) {
                     Ok(mut t) => match t.list_dir(&path) {
@@ -82,9 +103,13 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                     });
                 }
 
-                Cmd::Download { id, name, remote, local, cancel } => {
+                Cmd::Download { id, name, remote, local, resume, cancel } => {
                     transfer(&mut session, &send, id, name, cancel, true, |t, progress| {
-                        t.download_progress(&remote, &local, progress)
+                        if resume > 0 {
+                            t.download_resume(&remote, &local, resume, progress)
+                        } else {
+                            t.download_progress(&remote, &local, progress)
+                        }
                     });
                 }
 

@@ -491,6 +491,63 @@ pub extern "C" fn scp_remove_dir_all(session: *mut ScpSession, path: *const c_ch
     simple_op(session, path, |t, p| crate::ops::remove_dir_all(t, p))
 }
 
+/// Resume a download from `offset` bytes (appends to the local file).
+/// Returns total bytes (offset included), or -1 on error.
+#[no_mangle]
+pub extern "C" fn scp_download_resume_cb(
+    session: *mut ScpSession,
+    remote: *const c_char,
+    local: *const c_char,
+    offset: u64,
+    cb: Option<ProgressCb>,
+    user_data: *mut c_void,
+) -> i64 {
+    clear_error();
+    let (Some(session), Some(remote), Some(local)) = (
+        unsafe { session.as_mut() },
+        unsafe { cstr(remote) },
+        unsafe { cstr(local) },
+    ) else {
+        set_error("invalid arguments to scp_download_resume_cb");
+        return -1;
+    };
+    let user = UserData(user_data);
+    let mut report = |t: u64, total: u64| -> bool {
+        match cb {
+            Some(cb) => cb(t, total, user.0) == 0,
+            None => true,
+        }
+    };
+    match session
+        .inner
+        .download_resume(remote, Path::new(local), offset, &mut report)
+    {
+        Ok(n) => n as i64,
+        Err(e) => {
+            set_error_typed(&e);
+            -1
+        }
+    }
+}
+
+/// Liveness probe / NAT keepalive. Returns 0 if the session answered,
+/// -1 if it appears dead.
+#[no_mangle]
+pub extern "C" fn scp_keepalive(session: *mut ScpSession) -> c_int {
+    clear_error();
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        set_error("null session");
+        return -1;
+    };
+    match session.inner.keepalive() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error_typed(&e);
+            -1
+        }
+    }
+}
+
 /// Change unix permissions (mode, e.g. 0644 octal). Returns 0, or -1 on error.
 #[no_mangle]
 pub extern "C" fn scp_chmod(session: *mut ScpSession, path: *const c_char, mode: u32) -> c_int {
@@ -597,6 +654,8 @@ fn entries_to_json(entries: &[crate::types::Entry]) -> String {
             Some(p) => json_str(&mut s, p),
             None => s.push_str("null"),
         }
+        s.push_str(",\"is_symlink\":");
+        s.push_str(if e.is_symlink { "true" } else { "false" });
         s.push('}');
     }
     s.push(']');

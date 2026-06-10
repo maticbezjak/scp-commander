@@ -677,7 +677,9 @@ private struct FilePane: View {
     private func row(for entry: FileEntry) -> some View {
         HStack(spacing: 0) {
             HStack(spacing: 6) {
-                Image(systemName: entry.isDir ? "folder.fill" : "doc")
+                Image(systemName: entry.isSymlink
+                    ? "arrow.right.circle"
+                    : entry.isDir ? "folder.fill" : "doc")
                     .foregroundStyle(entry.isDir ? Color.accentColor : Color.secondary)
                     .frame(width: 16)
                 Text(entry.name).lineLimit(1)
