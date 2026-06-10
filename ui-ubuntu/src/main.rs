@@ -117,6 +117,7 @@ struct App {
     // Context menus
     local_menu_index: Cell<u32>,
     remote_menu_index: Cell<u32>,
+    sites_menu_index: Cell<usize>,
     // Edit-in-editor
     edit_pending: RefCell<HashMap<u64, (String, PathBuf)>>,
     edits: RefCell<Vec<EditWatch>>,
@@ -603,37 +604,63 @@ impl App {
         }
     }
 
-    // -- Sites --------------------------------------------------------------
+    // -- Sites (WinSCP-style) -------------------------------------------------
 
-    fn save_current_site(&self) {
+    fn site_account(site: &Site) -> String {
+        secrets::account(
+            PROTO_LABELS[site.proto as usize % 4],
+            &site.user,
+            &site.host,
+            &site.port,
+        )
+    }
+
+    /// "Save session as site" dialog: name (Folder/Name groups) plus an
+    /// explicit opt-in for password storage, like WinSCP.
+    fn begin_save_site(self: &Rc<Self>) {
         let host = self.host_entry.text().to_string();
         let user = self.user_entry.text().to_string();
-        let name = if host.is_empty() {
+        let default_name = if host.is_empty() {
             "New site".to_string()
         } else if user.is_empty() {
-            host.clone()
+            host
         } else {
             format!("{user}@{host}")
         };
-        let proto_idx = self.proto_dd.selected();
-        let port = self.port_entry.text().to_string();
-        self.sites.borrow_mut().add(Site {
-            name: name.clone(),
-            proto: proto_idx,
-            host: host.clone(),
-            port: port.clone(),
-            user: user.clone(),
-        });
+        let can_save_password =
+            self.selected_auth() == 0 && !self.pass_entry.text().is_empty();
+        let state = self.clone();
+        save_site_dialog(
+            &self.window,
+            &default_name,
+            can_save_password,
+            move |name, save_password| state.perform_save_site(&name, save_password),
+        );
+    }
+
+    fn perform_save_site(&self, name: &str, save_password: bool) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let is_sftp = proto_from_index(self.proto_dd.selected()) == Protocol::Sftp;
+        let site = Site {
+            name: name.to_string(),
+            proto: self.proto_dd.selected(),
+            host: self.host_entry.text().to_string(),
+            port: self.port_entry.text().to_string(),
+            user: self.user_entry.text().to_string(),
+            auth: if is_sftp { self.auth_dd.selected() } else { 0 },
+            key_path: self.key_entry.text().to_string(),
+            bucket: self.bucket_entry.text().to_string(),
+            region: self.region_entry.text().to_string(),
+        };
+        let account = Self::site_account(&site);
+        self.sites.borrow_mut().add(site);
         self.refresh_sites_list();
 
         let password = self.pass_entry.text().to_string();
-        if !password.is_empty() && self.selected_auth() == 0 {
-            let account = secrets::account(
-                PROTO_LABELS[proto_idx as usize % 4],
-                &user,
-                &host,
-                &port,
-            );
+        if save_password && !password.is_empty() {
             match secrets::save(&account, &password) {
                 Ok(()) => self.set_status(&format!("Saved site “{name}” (password in keyring)")),
                 Err(e) => self.set_status(&format!("Saved site “{name}” (keyring: {e})")),
@@ -643,35 +670,60 @@ impl App {
         }
     }
 
+    /// Edit: fill the connection form from a site (single click in the list).
     fn load_site(&self, index: usize) {
         let Some(site) = self.sites.borrow().sites.get(index).cloned() else { return };
+        // Order matters: proto first (it resets the default port), then port.
         self.proto_dd.set_selected(site.proto);
+        self.auth_dd.set_selected(site.auth);
         self.host_entry.set_text(&site.host);
         self.port_entry.set_text(&site.port);
         self.user_entry.set_text(&site.user);
-        let account = secrets::account(
-            PROTO_LABELS[site.proto as usize % 4],
-            &site.user,
-            &site.host,
-            &site.port,
-        );
-        if let Some(password) = secrets::load(&account) {
-            self.pass_entry.set_text(&password);
-            self.set_status(&format!("Loaded “{}” — password from keyring", site.name));
-        } else {
+        self.key_entry.set_text(&site.key_path);
+        self.bucket_entry.set_text(&site.bucket);
+        self.region_entry.set_text(&site.region);
+        if site.auth == 0 {
+            if let Some(password) = secrets::load(&Self::site_account(&site)) {
+                self.pass_entry.set_text(&password);
+                self.set_status(&format!("Loaded “{}” — password from keyring", site.name));
+                return;
+            }
             self.pass_entry.set_text("");
             self.set_status(&format!("Loaded “{}” — enter password and Connect", site.name));
+        } else {
+            self.pass_entry.set_text("");
+            self.set_status(&format!("Loaded “{}”", site.name));
         }
+    }
+
+    /// Login: load the site and connect immediately (double click / menu).
+    fn login_site(&self, index: usize) {
+        let Some(site) = self.sites.borrow().sites.get(index).cloned() else { return };
+        self.load_site(index);
+        let needs_password =
+            site.auth == 0 && self.pass_entry.text().is_empty() && site.proto != 1;
+        if needs_password {
+            self.set_status(&format!(
+                "“{}” has no stored password — enter it and Connect",
+                site.name
+            ));
+            return;
+        }
+        self.connect_clicked();
+    }
+
+    fn rename_site(self: &Rc<Self>, index: usize) {
+        let Some(site) = self.sites.borrow().sites.get(index).cloned() else { return };
+        let state = self.clone();
+        prompt(&self.window, "Rename site (Folder/Name groups)", &site.name, move |new_name| {
+            state.sites.borrow_mut().rename(index, &new_name);
+            state.refresh_sites_list();
+        });
     }
 
     fn delete_site(&self, index: usize) {
         if let Some(site) = self.sites.borrow().sites.get(index).cloned() {
-            secrets::delete(&secrets::account(
-                PROTO_LABELS[site.proto as usize % 4],
-                &site.user,
-                &site.host,
-                &site.port,
-            ));
+            secrets::delete(&Self::site_account(&site));
         }
         self.sites.borrow_mut().remove(index);
         self.refresh_sites_list();
@@ -685,7 +737,7 @@ impl App {
             let label = Label::builder()
                 .label(format!(
                     "{}\n{}",
-                    site.name,
+                    site.display_name(),
                     PROTO_LABELS[site.proto as usize % PROTO_LABELS.len()]
                 ))
                 .xalign(0.0)
@@ -1020,7 +1072,11 @@ fn build_ui(app: &Application) {
         .build();
 
     // Sites sidebar ------------------------------------------------------------
-    let sites_list = ListBox::builder().selection_mode(SelectionMode::None).build();
+    // WinSCP behavior: single click selects/edits, double click logs in.
+    let sites_list = ListBox::builder()
+        .selection_mode(SelectionMode::Single)
+        .activate_on_single_click(false)
+        .build();
     sites_list.add_css_class("navigation-sidebar");
     let sites_header = GtkBox::builder()
         .orientation(Orientation::Horizontal)
@@ -1087,6 +1143,7 @@ fn build_ui(app: &Application) {
         pending_fingerprint: RefCell::new(None),
         local_menu_index: Cell::new(0),
         remote_menu_index: Cell::new(0),
+        sites_menu_index: Cell::new(0),
         edit_pending: RefCell::new(HashMap::new()),
         edits: RefCell::new(Vec::new()),
         sites: RefCell::new(SitesStore::load()),
@@ -1132,19 +1189,100 @@ fn build_ui(app: &Application) {
     ));
     save_site_btn.connect_clicked(glib::clone!(
         #[strong] state,
-        move |_| state.save_current_site()
+        move |_| state.begin_save_site()
+    ));
+    // Single click: edit (fill the form). Double click / Enter: login.
+    state.sites_list.connect_row_selected(glib::clone!(
+        #[strong] state,
+        move |_, row| {
+            if let Some(row) = row {
+                state.load_site(row.index().max(0) as usize);
+            }
+        }
     ));
     state.sites_list.connect_row_activated(glib::clone!(
         #[strong] state,
-        move |_, row| state.load_site(row.index().max(0) as usize)
+        move |_, row| state.login_site(row.index().max(0) as usize)
     ));
+
+    // Folder headers, WinSCP-style ("Work/web1" gets a "Work" header).
+    state.sites_list.set_header_func(glib::clone!(
+        #[strong] state,
+        move |row, before| {
+            let sites = &state.sites.borrow().sites;
+            let folder = sites
+                .get(row.index().max(0) as usize)
+                .and_then(|s| s.folder().map(str::to_string));
+            let prev_folder = before
+                .and_then(|b| sites.get(b.index().max(0) as usize))
+                .and_then(|s| s.folder().map(str::to_string));
+            if folder.is_some() && folder != prev_folder {
+                let label = Label::builder()
+                    .label(folder.as_deref().unwrap_or_default())
+                    .xalign(0.0)
+                    .margin_start(6)
+                    .margin_top(6)
+                    .build();
+                label.add_css_class("heading");
+                label.add_css_class("dim-label");
+                row.set_header(Some(&label));
+            } else {
+                row.set_header(gtk::Widget::NONE);
+            }
+        }
+    ));
+
+    // Right-click context menu: Login / Edit / Rename / Delete.
+    let sites_menu_box = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(2)
+        .build();
+    let sites_popover = Popover::builder().child(&sites_menu_box).has_arrow(false).build();
+    sites_popover.set_parent(&state.sites_list);
+    let add_site_item = |label: &str, destructive: bool, action: Box<dyn Fn(usize)>| {
+        let btn = Button::with_label(label);
+        btn.add_css_class("flat");
+        if destructive {
+            btn.add_css_class("destructive-action");
+        }
+        if let Some(child) = btn.child().and_downcast::<Label>() {
+            child.set_xalign(0.0);
+        }
+        let pop = sites_popover.clone();
+        let s = state.clone();
+        btn.connect_clicked(move |_| {
+            pop.popdown();
+            action(s.sites_menu_index.get());
+        });
+        sites_menu_box.append(&btn);
+    };
+    {
+        let s = state.clone();
+        add_site_item("Login", false, Box::new(move |i| s.login_site(i)));
+    }
+    {
+        let s = state.clone();
+        add_site_item("Edit", false, Box::new(move |i| s.load_site(i)));
+    }
+    {
+        let s = state.clone();
+        add_site_item("Rename…", false, Box::new(move |i| s.rename_site(i)));
+    }
+    {
+        let s = state.clone();
+        add_site_item("Delete", true, Box::new(move |i| s.delete_site(i)));
+    }
     let sites_click = gtk::GestureClick::builder().button(3).build();
     sites_click.connect_pressed(glib::clone!(
         #[strong] state,
-        move |gesture, _, _, y| {
+        #[strong] sites_popover,
+        move |gesture, _, x, y| {
             let list = gesture.widget().and_downcast::<ListBox>();
             if let Some(row) = list.and_then(|l| l.row_at_y(y as i32)) {
-                state.delete_site(row.index().max(0) as usize);
+                state.sites_menu_index.set(row.index().max(0) as usize);
+                sites_popover
+                    .set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                sites_popover.popup();
             }
         }
     ));
@@ -1413,6 +1551,78 @@ fn setup_context_menu(state: &Rc<App>, view: &ColumnView, hook: &MenuHook, local
         popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         popover.popup();
     }));
+}
+
+/// WinSCP's "Save session as site" dialog: site name (Folder/Name groups)
+/// plus an explicit opt-in checkbox for password storage.
+fn save_site_dialog(
+    parent: &ApplicationWindow,
+    default_name: &str,
+    can_save_password: bool,
+    on_ok: impl Fn(String, bool) + 'static,
+) {
+    let win = gtk::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Save session as site")
+        .default_width(340)
+        .resizable(false)
+        .build();
+    let entry = GtkEntry::builder()
+        .text(default_name)
+        .activates_default(true)
+        .build();
+    let hint = Label::builder()
+        .label("Use Folder/Name to group sites into a folder")
+        .xalign(0.0)
+        .build();
+    hint.add_css_class("dim-label");
+    hint.add_css_class("caption");
+    let save_pw = gtk::CheckButton::with_label("Save password in keyring");
+    save_pw.set_sensitive(can_save_password);
+
+    let ok = Button::with_label("Save");
+    ok.add_css_class("suggested-action");
+    let cancel = Button::with_label("Cancel");
+    let buttons = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    buttons.append(&cancel);
+    buttons.append(&ok);
+
+    let content = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(10)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    content.append(&entry);
+    content.append(&hint);
+    content.append(&save_pw);
+    content.append(&buttons);
+    win.set_child(Some(&content));
+    win.set_default_widget(Some(&ok));
+
+    let on_ok = Rc::new(on_ok);
+    {
+        let win = win.clone();
+        let entry = entry.clone();
+        let save_pw = save_pw.clone();
+        let on_ok = on_ok.clone();
+        ok.connect_clicked(move |_| {
+            on_ok(entry.text().to_string(), save_pw.is_active());
+            win.close();
+        });
+    }
+    {
+        let win = win.clone();
+        cancel.connect_clicked(move |_| win.close());
+    }
+    win.present();
 }
 
 /// Small modal text prompt; calls `on_ok` with the entered string.

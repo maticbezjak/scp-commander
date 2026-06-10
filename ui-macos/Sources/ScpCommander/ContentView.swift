@@ -75,6 +75,9 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 1000, minHeight: 560)
+        .sheet(isPresented: $state.saveSitePrompt) {
+            SaveSiteSheet().environmentObject(state)
+        }
         .alert(
             "Unknown server host key",
             isPresented: Binding(
@@ -180,39 +183,106 @@ private struct SitesSidebar: View {
     @EnvironmentObject var state: AppState
     @ObservedObject var store: SitesStore
 
+    @State private var renameTarget: Site?
+    @State private var renameText = ""
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text("Sites").font(.headline)
                 Spacer()
-                Button(action: { state.saveCurrentSite() }) {
+                Button(action: { state.beginSaveSite() }) {
                     Image(systemName: "plus")
                 }
                 .buttonStyle(.borderless)
-                .help("Save current connection (password goes to Keychain)")
+                .help("Save current session as a site (use Folder/Name to group)")
             }
             .padding(8)
             Divider()
 
             List {
-                ForEach(store.sites) { site in
-                    HStack(spacing: 6) {
-                        Image(systemName: "bookmark.fill").foregroundStyle(.tint)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(site.name).lineLimit(1)
-                            Text(site.proto.label).font(.caption2).foregroundStyle(.secondary)
+                ForEach(store.folders, id: \.self) { folder in
+                    Section {
+                        ForEach(store.sites(in: folder)) { site in
+                            row(for: site)
                         }
-                    }
-                    .contentShape(Rectangle())
-                    .onTapGesture { state.loadSite(site) }
-                    .contextMenu {
-                        Button("Load") { state.loadSite(site) }
-                        Button("Delete", role: .destructive) { state.removeSite(site) }
+                    } header: {
+                        if let folder {
+                            Label(folder, systemImage: "folder")
+                        }
                     }
                 }
             }
             .listStyle(.sidebar)
         }
+        .alert(
+            "Rename site",
+            isPresented: Binding(
+                get: { renameTarget != nil },
+                set: { if !$0 { renameTarget = nil } }
+            )
+        ) {
+            TextField("Name", text: $renameText)
+            Button("Rename") {
+                if let site = renameTarget { state.renameSite(site, to: renameText) }
+                renameTarget = nil
+            }
+            Button("Cancel", role: .cancel) { renameTarget = nil }
+        } message: {
+            Text("Use Folder/Name to group sites into a folder.")
+        }
+    }
+
+    /// WinSCP behavior: single click edits (fills the form), double click
+    /// logs in, right click for the full menu.
+    private func row(for site: Site) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "bookmark.fill").foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(site.displayName).lineLimit(1)
+                Text(site.proto.label).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { state.login(site) }
+        .onTapGesture(count: 1) { state.loadSite(site) }
+        .contextMenu {
+            Button("Login") { state.login(site) }
+            Button("Edit") { state.loadSite(site) }
+            Divider()
+            Button("Rename…") {
+                renameText = site.name
+                renameTarget = site
+            }
+            Button("Delete", role: .destructive) { state.removeSite(site) }
+        }
+    }
+}
+
+/// WinSCP's "Save session as site" dialog: name (Folder/Name groups) and an
+/// explicit opt-in for password storage.
+private struct SaveSiteSheet: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Save session as site").font(.headline)
+            TextField("Site name (Folder/Name to group)", text: $state.saveSiteName)
+                .frame(width: 280)
+            if state.proto != .sftp || state.authMode == .password {
+                Toggle("Save password in Keychain", isOn: $state.saveSitePassword)
+                    .disabled(state.password.isEmpty)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { state.saveSitePrompt = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") { state.confirmSaveSite() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(state.saveSiteName.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(16)
     }
 }
 

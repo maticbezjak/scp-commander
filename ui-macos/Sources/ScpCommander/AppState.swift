@@ -52,41 +52,75 @@ final class AppState: ObservableObject {
         loadLocal()
     }
 
-    // MARK: - Saved sites
+    // MARK: - Saved sites (WinSCP-style)
 
-    func saveCurrentSite() {
-        let name = host.isEmpty ? "New site" : "\(user.isEmpty ? "" : "\(user)@")\(host)"
-        sites.add(Site(name: name, proto: proto, host: host, port: port, user: user))
-        if !password.isEmpty && authMode == .password {
-            Keychain.save(
-                account: Keychain.account(proto: proto, user: user, host: host, port: port),
-                password: password)
+    // "Save session as site" dialog state.
+    @Published var saveSitePrompt = false
+    @Published var saveSiteName = ""
+    @Published var saveSitePassword = false
+
+    /// Open the save dialog, defaulting the name like WinSCP (user@host).
+    /// Use "Folder/Name" as the site name to group sites into folders.
+    func beginSaveSite() {
+        saveSiteName = host.isEmpty ? "New site" : "\(user.isEmpty ? "" : "\(user)@")\(host)"
+        saveSitePassword = false
+        saveSitePrompt = true
+    }
+
+    func confirmSaveSite() {
+        let name = saveSiteName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        let site = Site(
+            name: name, proto: proto, host: host, port: port, user: user,
+            authMode: proto == .sftp ? authMode : .password,
+            keyPath: keyPath, bucket: bucket, region: region)
+        sites.add(site)
+        if saveSitePassword && !password.isEmpty && site.authMode == .password {
+            Keychain.save(account: site.keychainAccount, password: password)
             status = "Saved site “\(name)” (password in Keychain)"
         } else {
             status = "Saved site “\(name)”"
         }
+        saveSitePrompt = false
     }
 
+    /// Edit: fill the connection form from a site (single click in the list).
     func loadSite(_ site: Site) {
         proto = site.proto
         host = site.host
         port = site.port
         user = site.user
-        let account = Keychain.account(
-            proto: site.proto, user: site.user, host: site.host, port: site.port)
-        if let stored = Keychain.load(account: account) {
+        authMode = site.authMode
+        keyPath = site.keyPath
+        bucket = site.bucket
+        region = site.region
+        if site.authMode == .password, let stored = Keychain.load(account: site.keychainAccount) {
             password = stored
             status = "Loaded “\(site.name)” — password from Keychain"
         } else {
             password = ""
-            status = "Loaded “\(site.name)” — enter password and Connect"
+            status = site.authMode == .password
+                ? "Loaded “\(site.name)” — enter password and Connect"
+                : "Loaded “\(site.name)”"
         }
     }
 
+    /// Login: load the site and connect immediately (double click / menu).
+    func login(_ site: Site) {
+        loadSite(site)
+        if site.authMode == .password && password.isEmpty && site.proto != .ftp {
+            status = "“\(site.name)” has no stored password — enter it and Connect"
+            return
+        }
+        connect()
+    }
+
+    func renameSite(_ site: Site, to newName: String) {
+        sites.rename(site, to: newName)
+    }
+
     func removeSite(_ site: Site) {
-        Keychain.delete(
-            account: Keychain.account(
-                proto: site.proto, user: site.user, host: site.host, port: site.port))
+        Keychain.delete(account: site.keychainAccount)
         sites.remove(site)
     }
 
