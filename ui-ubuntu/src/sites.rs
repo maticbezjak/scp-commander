@@ -185,6 +185,99 @@ impl SitesStore {
         Ok(count)
     }
 
+    /// Import sessions from a WinSCP.ini file ([Sessions\Name] blocks).
+    /// Session names are URL-encoded and may contain "/" folders, which map
+    /// straight onto our folder grouping. Returns the number imported.
+    pub fn import_winscp_ini(&mut self, ini: &str) -> Result<usize, String> {
+        let mut count = 0;
+        let mut current: Option<WinScpSession> = None;
+        for raw in ini.lines() {
+            let line = raw.trim();
+            if line.starts_with('[') {
+                if let Some(done) = current.take() {
+                    if self.flush_winscp(done) {
+                        count += 1;
+                    }
+                }
+                if let Some(name) = line
+                    .strip_prefix("[Sessions\\")
+                    .and_then(|l| l.strip_suffix(']'))
+                {
+                    // "Default%20Settings" holds defaults, not a real site.
+                    if name != "Default%20Settings" {
+                        current = Some(WinScpSession {
+                            name: url_decode(name),
+                            ..Default::default()
+                        });
+                    }
+                }
+                continue;
+            }
+            let (Some(session), Some((key, value))) = (current.as_mut(), line.split_once('='))
+            else {
+                continue;
+            };
+            match key {
+                "HostName" => session.host = value.to_string(),
+                "PortNumber" => session.port = Some(value.to_string()),
+                "UserName" => session.user = value.to_string(),
+                "FSProtocol" => session.fs_protocol = value.parse().unwrap_or(0),
+                "FtpSecure" => session.ftp_secure = value != "0",
+                "PublicKeyFile" => session.key_path = url_decode(value),
+                _ => {}
+            }
+        }
+        if let Some(done) = current.take() {
+            if self.flush_winscp(done) {
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return Err("no [Sessions\\…] entries found — is this a WinSCP.ini?".into());
+        }
+        Ok(count)
+    }
+
+    fn flush_winscp(&mut self, s: WinScpSession) -> bool {
+        if s.host.is_empty() || s.name.is_empty() {
+            return false;
+        }
+        // WinSCP FSProtocol: 5 = FTP (FtpSecure upgrades to FTPS), 7 = S3,
+        // everything else (0/1/2…) is the SSH family → SFTP here.
+        let proto = match s.fs_protocol {
+            5 => {
+                if s.ftp_secure {
+                    2
+                } else {
+                    1
+                }
+            }
+            7 => 3,
+            _ => 0,
+        };
+        let port = s.port.unwrap_or_else(|| {
+            match proto {
+                1 | 2 => "21",
+                3 => "443",
+                _ => "22",
+            }
+            .to_string()
+        });
+        let auth = if !s.key_path.is_empty() && proto == 0 { 1 } else { 0 };
+        self.add(Site {
+            name: s.name,
+            proto,
+            host: s.host,
+            port,
+            user: s.user,
+            auth,
+            key_path: s.key_path,
+            bucket: String::new(),
+            region: String::new(),
+        });
+        true
+    }
+
     /// Sorted so folder groups sit together: ungrouped sites first, then
     /// folders alphabetically, each group alphabetical by display name.
     fn sort(&mut self) {
@@ -205,6 +298,37 @@ impl SitesStore {
             let _ = fs::write(&self.file, data);
         }
     }
+}
+
+/// Accumulator for one [Sessions\…] block while parsing WinSCP.ini.
+#[derive(Default)]
+struct WinScpSession {
+    name: String,
+    host: String,
+    port: Option<String>,
+    user: String,
+    fs_protocol: u32,
+    ftp_secure: bool,
+    key_path: String,
+}
+
+/// Decode WinSCP's %XX escapes (session names, key paths).
+fn url_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -242,6 +366,29 @@ mod tests {
         assert_eq!(site.host, "example.com");
         assert_eq!(site.folder(), Some("Work"));
         assert_eq!(site.display_name(), "web1");
+    }
+
+    #[test]
+    fn imports_winscp_ini() {
+        let ini = "\
+[Configuration]\nRandomSeedFile=x\n\
+[Sessions\\Default%20Settings]\nHostName=ignored\n\
+[Sessions\\My%20Server]\nHostName=example.com\nUserName=root\nPortNumber=2222\n\
+[Sessions\\Work/web1]\nHostName=web1.example\nUserName=deploy\nFSProtocol=5\nFtpSecure=1\n\
+[Sessions\\Keyed]\nHostName=keyed.example\nUserName=ops\nPublicKeyFile=C:%5Ckeys%5Cid.ppk\n";
+        let mut s = store();
+        assert_eq!(s.import_winscp_ini(ini).unwrap(), 3);
+        let by_name = |n: &str| s.sites.iter().find(|x| x.name == n).unwrap();
+        let server = by_name("My Server");
+        assert_eq!(server.proto, 0);
+        assert_eq!(server.port, "2222");
+        let web1 = by_name("Work/web1");
+        assert_eq!(web1.proto, 2); // FTP + FtpSecure → FTPS
+        assert_eq!(web1.port, "21");
+        assert_eq!(web1.folder(), Some("Work"));
+        let keyed = by_name("Keyed");
+        assert_eq!(keyed.auth, 1);
+        assert_eq!(keyed.key_path, "C:\\keys\\id.ppk");
     }
 
     #[test]

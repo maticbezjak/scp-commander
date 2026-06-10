@@ -223,6 +223,24 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Import sessions from a WinSCP.ini file (passwords are not migrated —
+    /// WinSCP stores them obfuscated; re-enter and re-save them here).
+    func importWinScp() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Import from WinSCP INI"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let count = try sites.importWinScpIni(text)
+            status = "Imported \(count) site(s) from WinSCP (re-enter passwords)"
+        } catch {
+            status = "Import failed: \(error.localizedDescription)"
+        }
+    }
+
     /// Import sites from a JSON export (merges; same-named sites replaced).
     func importSites() {
         let panel = NSOpenPanel()

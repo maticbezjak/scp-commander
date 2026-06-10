@@ -197,6 +197,88 @@ final class SitesStore: ObservableObject {
         return file.sites.count
     }
 
+    /// Import sessions from a WinSCP.ini file ([Sessions\Name] blocks).
+    /// Session names are URL-encoded and may contain "/" folders, which map
+    /// straight onto our folder grouping. Returns the number imported.
+    func importWinScpIni(_ text: String) throws -> Int {
+        struct Pending {
+            var name = ""
+            var host = ""
+            var port: String?
+            var user = ""
+            var fsProtocol = 0
+            var ftpSecure = false
+            var keyPath = ""
+        }
+
+        func decode(_ s: String) -> String {
+            s.removingPercentEncoding ?? s
+        }
+
+        var count = 0
+        var current: Pending?
+
+        func flush() {
+            guard let p = current, !p.host.isEmpty, !p.name.isEmpty else {
+                current = nil
+                return
+            }
+            // WinSCP FSProtocol: 5 = FTP (FtpSecure upgrades to FTPS),
+            // 7 = S3, everything else is the SSH family → SFTP here.
+            let proto: Proto =
+                p.fsProtocol == 5 ? (p.ftpSecure ? .ftps : .ftp) : p.fsProtocol == 7 ? .s3 : .sftp
+            let port =
+                p.port
+                ?? {
+                    switch proto {
+                    case .ftp, .ftps: return "21"
+                    case .s3: return "443"
+                    default: return "22"
+                    }
+                }()
+            let auth: AuthMode = (!p.keyPath.isEmpty && proto == .sftp) ? .keyFile : .password
+            add(
+                Site(
+                    name: p.name, proto: proto, host: p.host, port: port, user: p.user,
+                    authMode: auth, keyPath: p.keyPath))
+            count += 1
+            current = nil
+        }
+
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") {
+                flush()
+                if line.hasPrefix("[Sessions\\"), line.hasSuffix("]") {
+                    let name = String(line.dropFirst("[Sessions\\".count).dropLast())
+                    if name != "Default%20Settings" {
+                        var pending = Pending()
+                        pending.name = decode(name)
+                        current = pending
+                    }
+                }
+                continue
+            }
+            guard current != nil, let eq = line.firstIndex(of: "=") else { continue }
+            let key = String(line[..<eq])
+            let value = String(line[line.index(after: eq)...])
+            switch key {
+            case "HostName": current?.host = value
+            case "PortNumber": current?.port = value
+            case "UserName": current?.user = value
+            case "FSProtocol": current?.fsProtocol = Int(value) ?? 0
+            case "FtpSecure": current?.ftpSecure = value != "0"
+            case "PublicKeyFile": current?.keyPath = decode(value)
+            default: break
+            }
+        }
+        flush()
+        guard count > 0 else {
+            throw CoreError(message: "no [Sessions\\…] entries found — is this a WinSCP.ini?")
+        }
+        return count
+    }
+
     private func sortAndSave() {
         sort()
         save()

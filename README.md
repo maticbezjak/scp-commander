@@ -41,6 +41,13 @@ Protocols:
 
 Both apps (SwiftUI + GTK4) have:
 
+- **keyboard commander**: F5 copy, F6 move, F2 rename, Del, Backspace
+  parent, Tab to switch panes; **multi-select** with batch operations
+- **auto-reconnect** (dead sessions revive transparently, with 30s NAT
+  keepalives), **download resume**, server **mtimes preserved** on download
+- editable path bars, show-hidden toggle, transfer **speed + ETA**
+- **WinSCP.ini import** (Tools menu) alongside the JSON site exchange
+
 - WinSCP-style **Login dialog** (sites + session form), **session tabs**
   (independent connections per tab), and multi-column panes
   (Name | Size | Type | Changed | Rights) with per-pane toolbars
@@ -110,9 +117,16 @@ an async channel drained by `glib::spawn_future_local`.
 ## Packaging
 
 ```sh
-./scripts/package-macos.sh   # dist/ScpCommander.app + zip (run on macOS)
+./scripts/package-macos.sh   # dist/ScpCommander.app (icon included) + zip
 ./scripts/package-deb.sh     # dist/scp-commander_<ver>_<arch>.deb (run on Ubuntu)
+# Flatpak manifest: packaging/flatpak/net.manto.ScpCommander.yml
 ```
+
+## Integration tests
+
+`./scripts/integration-test.sh` spins up SFTP, FTP, and MinIO servers in
+Docker and drives `scp-cli` through the full operation matrix (transfers,
+recursive trees, sync, rename, chmod, deletes) with round-trip diffs.
 
 ## How "native" is achieved
 

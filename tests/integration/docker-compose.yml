@@ -1,0 +1,38 @@
+# Throwaway servers for the integration suite (scripts/integration-test.sh).
+# Credentials are deliberately trivial — these listen on localhost only.
+services:
+  sftp:
+    image: atmoz/sftp
+    command: "demo:demopass:::upload"
+    ports:
+      - "127.0.0.1:2222:22"
+
+  ftp:
+    image: delfer/alpine-ftp-server
+    environment:
+      USERS: "demo|demopass|/ftp/demo"
+      MIN_PORT: "21000"
+      MAX_PORT: "21010"
+    ports:
+      - "127.0.0.1:2121:21"
+      - "127.0.0.1:21000-21010:21000-21010"
+
+  minio:
+    image: minio/minio
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: demo
+      MINIO_ROOT_PASSWORD: demopass123
+    ports:
+      - "127.0.0.1:9000:9000"
+
+  # One-shot bucket creation for the S3 tests.
+  mc:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 demo demopass123; do sleep 1; done;
+      mc mb -p local/test;
+      exit 0"

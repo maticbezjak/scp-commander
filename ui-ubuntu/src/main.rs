@@ -1102,6 +1102,33 @@ impl App {
         });
     }
 
+    /// Import sessions from a WinSCP.ini file.
+    fn import_winscp(self: &Rc<Self>) {
+        let dialog = gtk::FileDialog::new();
+        let state = self.clone();
+        dialog.open(Some(&self.login_window), gio::Cancellable::NONE, move |result| {
+            let Ok(file) = result else { return };
+            let Some(path) = file.path() else { return };
+            let data = match std::fs::read_to_string(&path) {
+                Ok(d) => d,
+                Err(e) => {
+                    state.set_status(&format!("Import failed: {e}"));
+                    return;
+                }
+            };
+            let outcome = state.sites.borrow_mut().import_winscp_ini(&data);
+            match outcome {
+                Ok(count) => {
+                    state.refresh_sites_list();
+                    state.set_status(&format!(
+                        "Imported {count} site(s) from WinSCP (re-enter passwords)"
+                    ));
+                }
+                Err(e) => state.set_status(&format!("Import failed: {e}")),
+            }
+        });
+    }
+
     fn refresh_sites_list(&self) {
         while let Some(row) = self.sites_list.first_child() {
             self.sites_list.remove(&row);
@@ -1664,7 +1691,9 @@ fn build_ui(app: &Application) {
     import_btn.add_css_class("flat");
     let export_btn = Button::with_label("Export sites…");
     export_btn.add_css_class("flat");
-    for b in [&import_btn, &export_btn] {
+    let winscp_btn = Button::with_label("Import from WinSCP INI…");
+    winscp_btn.add_css_class("flat");
+    for b in [&import_btn, &winscp_btn, &export_btn] {
         if let Some(child) = b.child().and_downcast::<Label>() {
             child.set_xalign(0.0);
         }
@@ -1794,6 +1823,14 @@ fn build_ui(app: &Application) {
         move |_| {
             tools_popover.popdown();
             state.export_sites();
+        }
+    ));
+    winscp_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        #[strong] tools_popover,
+        move |_| {
+            tools_popover.popdown();
+            state.import_winscp();
         }
     ));
     sync_up_btn.connect_clicked(glib::clone!(

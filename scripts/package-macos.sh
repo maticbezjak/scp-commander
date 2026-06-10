@@ -20,6 +20,11 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp ui-macos/.build/release/ScpCommander "$APP/Contents/MacOS/ScpCommander"
 
+echo "==> Generating icon"
+swift scripts/make-icon.swift "$DIST/ScpCommander.iconset"
+iconutil -c icns "$DIST/ScpCommander.iconset" -o "$APP/Contents/Resources/ScpCommander.icns"
+rm -rf "$DIST/ScpCommander.iconset"
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -33,12 +38,18 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key><string>${VERSION}</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>CFBundleIconFile</key><string>ScpCommander</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
 PLIST
 
 # Ad-hoc signature so Gatekeeper at least sees a sealed bundle locally.
+# For distribution: sign with a Developer ID cert and notarize:
+#   codesign --force --deep --options runtime --sign "Developer ID Application: …" "$APP"
+#   ditto -c -k --keepParent "$APP" app.zip
+#   xcrun notarytool submit app.zip --keychain-profile <profile> --wait
+#   xcrun stapler staple "$APP"
 codesign --force --deep --sign - "$APP"
 
 echo "==> Zipping"

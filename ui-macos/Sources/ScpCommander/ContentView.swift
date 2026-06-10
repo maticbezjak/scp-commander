@@ -349,6 +349,7 @@ private struct LoginSheet: View {
             HStack {
                 Menu("Tools") {
                     Button("Import sites…") { state.importSites() }
+                    Button("Import from WinSCP INI…") { state.importWinScp() }
                     Button("Export sites…") { state.exportSites() }
                 }
                 .menuStyle(.borderlessButton)
