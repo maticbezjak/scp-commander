@@ -921,6 +921,54 @@ impl App {
         self.refresh_sites_list();
     }
 
+    /// Export all sites to a JSON file (no passwords — those stay in the
+    /// keyring). The format is shared with the macOS app.
+    fn export_sites(self: &Rc<Self>) {
+        let dialog = gtk::FileDialog::new();
+        dialog.set_initial_name(Some("scp-commander-sites.json"));
+        let state = self.clone();
+        dialog.save(Some(&self.login_window), gio::Cancellable::NONE, move |result| {
+            let Ok(file) = result else { return };
+            let Some(path) = file.path() else { return };
+            match state.sites.borrow().export_interchange() {
+                Ok(json) => match std::fs::write(&path, json) {
+                    Ok(()) => state.set_status(&format!(
+                        "Exported {} site(s) to {}",
+                        state.sites.borrow().sites.len(),
+                        path.display()
+                    )),
+                    Err(e) => state.set_status(&format!("Export failed: {e}")),
+                },
+                Err(e) => state.set_status(&format!("Export failed: {e}")),
+            }
+        });
+    }
+
+    /// Import sites from a JSON export (merges; same-named sites replaced).
+    fn import_sites(self: &Rc<Self>) {
+        let dialog = gtk::FileDialog::new();
+        let state = self.clone();
+        dialog.open(Some(&self.login_window), gio::Cancellable::NONE, move |result| {
+            let Ok(file) = result else { return };
+            let Some(path) = file.path() else { return };
+            let data = match std::fs::read_to_string(&path) {
+                Ok(d) => d,
+                Err(e) => {
+                    state.set_status(&format!("Import failed: {e}"));
+                    return;
+                }
+            };
+            let outcome = state.sites.borrow_mut().import_interchange(&data);
+            match outcome {
+                Ok(count) => {
+                    state.refresh_sites_list();
+                    state.set_status(&format!("Imported {count} site(s)"));
+                }
+                Err(e) => state.set_status(&format!("Import failed: {e}")),
+            }
+        });
+    }
+
     fn refresh_sites_list(&self) {
         while let Some(row) = self.sites_list.first_child() {
             self.sites_list.remove(&row);
@@ -1408,6 +1456,27 @@ fn build_ui(app: &Application) {
     login_main.append(&gtk::Separator::new(Orientation::Vertical));
     login_main.append(&form);
 
+    // WinSCP-style Tools dropdown (bottom-left of the Login dialog).
+    let tools_box = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(2)
+        .build();
+    let tools_popover = Popover::builder().child(&tools_box).has_arrow(true).build();
+    let tools_btn = gtk::MenuButton::builder()
+        .label("Tools")
+        .popover(&tools_popover)
+        .build();
+    let import_btn = Button::with_label("Import sites…");
+    import_btn.add_css_class("flat");
+    let export_btn = Button::with_label("Export sites…");
+    export_btn.add_css_class("flat");
+    for b in [&import_btn, &export_btn] {
+        if let Some(child) = b.child().and_downcast::<Label>() {
+            child.set_xalign(0.0);
+        }
+        tools_box.append(b);
+    }
+
     let login_buttons = GtkBox::builder()
         .orientation(Orientation::Horizontal)
         .spacing(8)
@@ -1416,6 +1485,7 @@ fn build_ui(app: &Application) {
         .margin_start(10)
         .margin_end(10)
         .build();
+    login_buttons.append(&tools_btn);
     let login_spacer = GtkBox::builder().hexpand(true).build();
     login_buttons.append(&login_spacer);
     login_buttons.append(&close_btn);
@@ -1512,6 +1582,22 @@ fn build_ui(app: &Application) {
     new_session_btn.connect_clicked(glib::clone!(
         #[strong] login_window,
         move |_| login_window.present()
+    ));
+    import_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        #[strong] tools_popover,
+        move |_| {
+            tools_popover.popdown();
+            state.import_sites();
+        }
+    ));
+    export_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        #[strong] tools_popover,
+        move |_| {
+            tools_popover.popdown();
+            state.export_sites();
+        }
     ));
     sync_up_btn.connect_clicked(glib::clone!(
         #[strong] state,

@@ -67,6 +67,59 @@ struct Site: Codable, Identifiable, Hashable {
     }
 }
 
+// MARK: - Interchange format (shared with the GTK app)
+
+/// Versioned, human-readable export format. Both the macOS and Ubuntu apps
+/// read and write this, so sites can move between machines and platforms.
+/// Passwords are intentionally not part of it — they stay in the Keychain.
+struct SiteExportFile: Codable {
+    var scp_commander_sites = 1
+    var sites: [SiteExport]
+}
+
+struct SiteExport: Codable {
+    var name: String
+    var `protocol`: String  // sftp | ftp | ftps | s3
+    var host: String
+    var port: String
+    var user: String
+    var auth: String  // password | key | agent
+    var key_path: String
+    var bucket: String
+    var region: String
+
+    init(from site: Site) {
+        name = site.name
+        `protocol` = ["sftp", "ftp", "ftps", "s3"][Int(site.proto.rawValue) % 4]
+        host = site.host
+        port = site.port
+        user = site.user
+        auth = ["password", "key", "agent"][Int(site.authMode.rawValue) % 3]
+        key_path = site.keyPath
+        bucket = site.bucket
+        region = site.region
+    }
+
+    var asSite: Site {
+        let proto: Proto =
+            switch `protocol` {
+            case "ftp": .ftp
+            case "ftps": .ftps
+            case "s3": .s3
+            default: .sftp
+            }
+        let mode: AuthMode =
+            switch auth {
+            case "key": .keyFile
+            case "agent": .agent
+            default: .password
+            }
+        return Site(
+            name: name, proto: proto, host: host, port: port, user: user,
+            authMode: mode, keyPath: key_path, bucket: bucket, region: region)
+    }
+}
+
 /// Saved sites, persisted as JSON under Application Support, kept sorted by
 /// name so folder groups stay together.
 @MainActor
@@ -125,6 +178,23 @@ final class SitesStore: ObservableObject {
     func remove(_ site: Site) {
         sites.removeAll { $0.id == site.id }
         sortAndSave()
+    }
+
+    /// Serialize all sites to the cross-platform interchange format.
+    func exportData() throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try encoder.encode(SiteExportFile(sites: sites.map(SiteExport.init)))
+    }
+
+    /// Merge sites from interchange data (same-named sites are replaced).
+    /// Returns the number of sites in the file.
+    func importData(_ data: Data) throws -> Int {
+        let file = try JSONDecoder().decode(SiteExportFile.self, from: data)
+        for exported in file.sites {
+            add(exported.asSite)
+        }
+        return file.sites.count
     }
 
     private func sortAndSave() {

@@ -49,6 +49,74 @@ impl Site {
     }
 }
 
+// --- Interchange format (shared with the macOS app) --------------------------
+
+/// Versioned, human-readable export format. Both the macOS and Ubuntu apps
+/// read and write this, so sites can move between machines and platforms.
+/// Passwords are intentionally not part of it — they stay in the keyring.
+#[derive(Serialize, Deserialize)]
+struct SiteExportFile {
+    scp_commander_sites: u32,
+    sites: Vec<SiteExport>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SiteExport {
+    name: String,
+    protocol: String, // sftp | ftp | ftps | s3
+    host: String,
+    port: String,
+    user: String,
+    auth: String, // password | key | agent
+    #[serde(default)]
+    key_path: String,
+    #[serde(default)]
+    bucket: String,
+    #[serde(default)]
+    region: String,
+}
+
+impl SiteExport {
+    fn from_site(site: &Site) -> Self {
+        Self {
+            name: site.name.clone(),
+            protocol: ["sftp", "ftp", "ftps", "s3"][site.proto as usize % 4].to_string(),
+            host: site.host.clone(),
+            port: site.port.clone(),
+            user: site.user.clone(),
+            auth: ["password", "key", "agent"][site.auth as usize % 3].to_string(),
+            key_path: site.key_path.clone(),
+            bucket: site.bucket.clone(),
+            region: site.region.clone(),
+        }
+    }
+
+    fn into_site(self) -> Site {
+        let proto = match self.protocol.as_str() {
+            "ftp" => 1,
+            "ftps" => 2,
+            "s3" => 3,
+            _ => 0,
+        };
+        let auth = match self.auth.as_str() {
+            "key" => 1,
+            "agent" => 2,
+            _ => 0,
+        };
+        Site {
+            name: self.name,
+            proto,
+            host: self.host,
+            port: self.port,
+            user: self.user,
+            auth,
+            key_path: self.key_path,
+            bucket: self.bucket,
+            region: self.region,
+        }
+    }
+}
+
 pub struct SitesStore {
     pub sites: Vec<Site>,
     file: PathBuf,
@@ -97,6 +165,26 @@ impl SitesStore {
         }
     }
 
+    /// Serialize all sites to the cross-platform interchange format.
+    pub fn export_interchange(&self) -> Result<String, String> {
+        let file = SiteExportFile {
+            scp_commander_sites: 1,
+            sites: self.sites.iter().map(SiteExport::from_site).collect(),
+        };
+        serde_json::to_string_pretty(&file).map_err(|e| e.to_string())
+    }
+
+    /// Merge sites from interchange data (same-named sites are replaced).
+    /// Returns the number of sites in the file.
+    pub fn import_interchange(&mut self, data: &str) -> Result<usize, String> {
+        let file: SiteExportFile = serde_json::from_str(data).map_err(|e| e.to_string())?;
+        let count = file.sites.len();
+        for exported in file.sites {
+            self.add(exported.into_site());
+        }
+        Ok(count)
+    }
+
     /// Sorted so folder groups sit together: ungrouped sites first, then
     /// folders alphabetically, each group alphabetical by display name.
     fn sort(&mut self) {
@@ -116,5 +204,67 @@ impl SitesStore {
         if let Ok(data) = serde_json::to_vec_pretty(&self.sites) {
             let _ = fs::write(&self.file, data);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> SitesStore {
+        SitesStore { sites: Vec::new(), file: PathBuf::from("/dev/null") }
+    }
+
+    /// Exactly what the macOS app writes — the cross-platform contract.
+    #[test]
+    fn imports_macos_export() {
+        let json = r#"{
+            "scp_commander_sites": 1,
+            "sites": [
+                {
+                    "auth": "key",
+                    "bucket": "",
+                    "host": "example.com",
+                    "key_path": "/home/u/.ssh/id_ed25519",
+                    "name": "Work/web1",
+                    "port": "2222",
+                    "protocol": "sftp",
+                    "region": "",
+                    "user": "deploy"
+                }
+            ]
+        }"#;
+        let mut s = store();
+        assert_eq!(s.import_interchange(json).unwrap(), 1);
+        let site = &s.sites[0];
+        assert_eq!(site.proto, 0);
+        assert_eq!(site.auth, 1);
+        assert_eq!(site.host, "example.com");
+        assert_eq!(site.folder(), Some("Work"));
+        assert_eq!(site.display_name(), "web1");
+    }
+
+    #[test]
+    fn export_import_round_trip() {
+        let mut s = store();
+        s.sites.push(Site {
+            name: "S3/backups".into(),
+            proto: 3,
+            host: "minio.local".into(),
+            port: "443".into(),
+            user: "AKIA123".into(),
+            auth: 0,
+            key_path: String::new(),
+            bucket: "backups".into(),
+            region: "us-east-1".into(),
+        });
+        let json = s.export_interchange().unwrap();
+        let mut other = store();
+        assert_eq!(other.import_interchange(&json).unwrap(), 1);
+        assert_eq!(other.sites[0].proto, 3);
+        assert_eq!(other.sites[0].bucket, "backups");
+        // Importing again replaces rather than duplicating.
+        assert_eq!(other.import_interchange(&json).unwrap(), 1);
+        assert_eq!(other.sites.len(), 1);
     }
 }

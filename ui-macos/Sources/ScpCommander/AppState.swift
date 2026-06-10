@@ -189,6 +189,37 @@ final class AppState: ObservableObject {
         sites.rename(site, to: newName)
     }
 
+    /// Export all sites to a JSON file (no passwords — those stay in the
+    /// Keychain). The format is shared with the Ubuntu app.
+    func exportSites() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "scp-commander-sites.json"
+        panel.title = "Export sites"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try sites.exportData().write(to: url, options: .atomic)
+            status = "Exported \(sites.sites.count) site(s) to \(url.lastPathComponent)"
+        } catch {
+            status = "Export failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Import sites from a JSON export (merges; same-named sites replaced).
+    func importSites() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Import sites"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let count = try sites.importData(try Data(contentsOf: url))
+            status = "Imported \(count) site(s) from \(url.lastPathComponent)"
+        } catch {
+            status = "Import failed: \(error.localizedDescription)"
+        }
+    }
+
     func removeSite(_ site: Site) {
         Keychain.delete(account: site.keychainAccount)
         sites.remove(site)

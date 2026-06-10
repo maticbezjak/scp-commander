@@ -274,6 +274,12 @@ private struct LoginSheet: View {
             }
             Divider()
             HStack {
+                Menu("Tools") {
+                    Button("Import sites…") { state.importSites() }
+                    Button("Export sites…") { state.exportSites() }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
                 Button("Save site…") { state.beginSaveSite() }
                     .disabled(state.host.isEmpty && state.bucket.isEmpty)
                 Spacer()
