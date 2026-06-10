@@ -1,0 +1,16 @@
+[package]
+name = "scp-ubuntu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GTK4 native front-end (Ubuntu/Linux) for the file manager"
+
+[[bin]]
+name = "scp-ubuntu"
+path = "src/main.rs"
+
+[dependencies]
+scp-core = { path = "../core" }
+# Build on Linux with GTK4 dev libs installed (see README). gtk4 won't build
+# on macOS, which is why this crate is Linux-only in practice.
+gtk = { package = "gtk4", version = "0.9" }

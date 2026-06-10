@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["core", "ui-ubuntu"]
+# ui-ubuntu needs GTK4 system libs (Linux). Default builds to just the core so
+# `cargo build` works on macOS; build the GTK app explicitly with -p scp-ubuntu.
+default-members = ["core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+lto = true
+codegen-units = 1

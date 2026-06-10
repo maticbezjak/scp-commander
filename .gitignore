@@ -1,0 +1,11 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Swift / SwiftPM
+ui-macos/.build/
+ui-macos/.swiftpm/
+*.xcodeproj
+
+# macOS
+.DS_Store

@@ -1,0 +1,4 @@
+module CScpCore {
+    header "scp_core.h"
+    export *
+}

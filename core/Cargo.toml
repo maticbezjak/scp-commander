@@ -1,0 +1,29 @@
+[package]
+name = "scp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared transfer core (SFTP/FTP/S3) for the cross-platform file manager"
+
+# Two crate types:
+#   rlib      -> linked by the Rust GTK Ubuntu front-end (same workspace)
+#   staticlib -> linked by the macOS SwiftUI front-end via the C FFI in ffi.rs
+[lib]
+name = "scp_core"
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+# SFTP/SCP over SSH. Uses system libssh2 + openssl via pkg-config.
+ssh2 = "0.9"
+# FTP (synchronous API). FTPS will add the `native-tls` feature later.
+suppaftp = "6"
+thiserror = "1"
+
+[features]
+default = []
+# Flip on once the S3 backend is implemented (pulls async deps).
+s3 = []
+
+[[bin]]
+name = "scp-cli"
+path = "src/bin/scp-cli.rs"
