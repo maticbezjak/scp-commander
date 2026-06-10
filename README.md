@@ -19,29 +19,41 @@ sharing one transfer core. SwiftUI on macOS, GTK4 on Ubuntu, Rust underneath.
 
 | Path          | What it is                                                        |
 |---------------|-------------------------------------------------------------------|
-| `core/`       | Shared Rust core: `Transport` trait, SFTP/FTP/S3 backends, C FFI. |
+| `core/`       | Shared Rust core: `Transport` trait, SFTP/FTP/S3 backends, multi-file ops, C FFI. |
 | `core/src/bin/scp-cli.rs` | Headless CLI to exercise the core without any GUI.    |
 | `ui-macos/`   | SwiftUI app (SwiftPM). Links `libscp_core.a` via `scp_core.h`.    |
-| `ui-ubuntu/`  | GTK4 app (Rust). Links `scp-core` directly. Build on Linux only.  |
+| `ui-ubuntu/`  | GTK4 app (Rust). Links `scp-core` directly.                       |
+| `scripts/`    | Packaging: `package-macos.sh` (.app + zip), `package-deb.sh` (.deb). |
 
 ## Status
 
-- **SFTP** — implemented (libssh2), with granular transfer progress and host
-  key verification: keys are checked against `~/.ssh/known_hosts` (read-only)
-  and the app's own store (`~/.config/scp-commander/known_hosts`). Unknown
-  servers trigger a fingerprint trust prompt in the UIs (`--accept-new` in the
-  CLI); a key that contradicts a stored one always fails.
-- **FTP / FTPS** — implemented (FTPS upgrades the control channel via native-tls).
-- **S3** — implemented behind the `s3` cargo feature (rust-s3, blocking). Both
-  UIs expose bucket/region/endpoint fields when S3 is selected.
+Protocols:
 
-Both apps have: dual-pane local/remote browsing with navigation, a protocol
-picker, a transfer queue with live progress, drag-and-drop between panes, and
-saved connection sites (persisted to Application Support on macOS,
-`~/.config/scp-commander/` on Linux; passwords entered fresh at connect time).
+- **SFTP** — libssh2; password / key-file / ssh-agent auth; streaming transfer
+  progress; host key verification (checked against `~/.ssh/known_hosts`
+  read-only and the app's own store `~/.config/scp-commander/known_hosts`;
+  unknown servers trigger a fingerprint trust prompt, mismatches always fail).
+- **FTP / FTPS** — streaming transfers; FTPS upgrades the control channel via
+  native-tls.
+- **S3** — behind the `s3` cargo feature (rust-s3): ranged-GET streaming
+  downloads, multipart streaming uploads (8 MiB memory bound), bucket/region/
+  endpoint fields in both UIs.
 
-Phasing from here: directory synchronize → recursive folder transfers →
-Keychain-stored credentials → remote file editor.
+Both apps (SwiftUI + GTK4) have:
+
+- dual-pane local/remote browsing, drag-and-drop between panes (files and
+  folders, recursive)
+- a transfer queue with live progress and per-transfer **cancel**
+- file management: new folder, rename, delete (recursive on folders), via
+  context menus
+- **one-way directory sync** in either direction (size + mtime comparison)
+- **remote editing**: open a remote file in your editor; saves upload
+  automatically
+- saved sites with passwords in the **macOS Keychain** / **Secret Service**
+  (GNOME Keyring)
+
+The core's multi-file ops (recursive transfers, sync, recursive delete) are
+unit-tested against an in-memory fake transport (`cargo test -p scp-core`).
 
 ## Build & run
 
@@ -57,32 +69,45 @@ brew install libssh2 openssl@3 pkg-config
 ```sh
 cargo build -p scp-core                 # SFTP + FTP/FTPS
 cargo build -p scp-core --features s3   # also build the S3 backend
-./target/debug/scp-cli ls sftp://user@host/path        # prompts via arg: append password
-./target/debug/scp-cli get sftp://user@host/file ./out  yourpassword
+cargo test  -p scp-core                 # unit tests (ops engine, fingerprints)
+
+scp-cli ls    sftp://user@host/path  password
+scp-cli get   -r sftp://user@host/dir ./local-dir  password   # recursive
+scp-cli sync  up sftp://user@host/dir ./local-dir  password   # one-way sync
+scp-cli mkdir sftp://user@host/new-dir  password
+scp-cli --agent ls sftp://user@host/    # ssh-agent auth
+scp-cli --key ~/.ssh/id_ed25519 ls sftp://user@host/  [passphrase]
 ```
 
 ### macOS app
 ```sh
-cargo build -p scp-core          # produces target/debug/libscp_core.a
-cd ui-macos && swift run         # builds and launches the SwiftUI app
+cargo build -p scp-core --features s3   # produces target/debug/libscp_core.a
+cd ui-macos && swift run                # builds and launches the SwiftUI app
 ```
-`Package.swift` links the staticlib from `../target/debug` plus
-`-lssl -lcrypto -lz -liconv` and the `CoreFoundation` framework (the exact list
-comes from `cargo rustc -- --print native-static-libs`). For a release build,
-`cargo build -p scp-core --release` and change `coreLib` to `../target/release`.
+`Package.swift` links the staticlib from `../target/debug` (override with
+`SCP_CORE_LIB=../target/release`) plus `-lssl -lcrypto -lz -liconv` and the
+`CoreFoundation`/`Security` frameworks (the exact list comes from
+`cargo rustc -- --print native-static-libs`).
 
 ### Ubuntu app
 ```sh
 sudo apt install libgtk-4-dev build-essential pkg-config libssl-dev libssh2-1-dev
-cargo run -p scp-ubuntu
+cargo run -p scp-ubuntu --features scp-core/s3
 ```
-The GTK app targets Linux, but it also compiles and runs against Homebrew's
-gtk4 (`brew install gtk4`) on macOS — handy for development; the native-feel
-target remains GNOME/Ubuntu.
+Needs GTK ≥ 4.10 (Ubuntu 24.04+). The GTK app targets Linux, but it also
+compiles and runs against Homebrew's gtk4 (`brew install gtk4`) on macOS —
+handy for development; the native-feel target remains GNOME/Ubuntu.
 
 The Ubuntu app runs all core calls on a worker thread (GTK widgets are
 main-thread-only): commands go over a std mpsc channel, events come back over
 an async channel drained by `glib::spawn_future_local`.
+
+## Packaging
+
+```sh
+./scripts/package-macos.sh   # dist/ScpCommander.app + zip (run on macOS)
+./scripts/package-deb.sh     # dist/scp-commander_<ver>_<arch>.deb (run on Ubuntu)
+```
 
 ## How "native" is achieved
 

@@ -9,3 +9,4 @@ ui-macos/.swiftpm/
 
 # macOS
 .DS_Store
+dist/

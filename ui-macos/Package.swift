@@ -1,13 +1,15 @@
 // swift-tools-version:5.9
+import Foundation
 import PackageDescription
 
 // Links the prebuilt Rust staticlib from ../target/<profile>. Build the core
 // first (`cargo build -p scp-core`), then `swift run` from this directory.
+// Set SCP_CORE_LIB=../target/release for release packaging.
 //
 // The native libs below come from `cargo rustc -- --print native-static-libs`.
 // openssl@3 is Homebrew-provided; the rest ship with the macOS SDK.
 let opensslLib = "/opt/homebrew/opt/openssl@3/lib"
-let coreLib = "../target/debug"
+let coreLib = ProcessInfo.processInfo.environment["SCP_CORE_LIB"] ?? "../target/debug"
 
 let package = Package(
     name: "ScpCommander",

@@ -19,7 +19,7 @@ use std::process::exit;
 
 use scp_core::ops::{self, SyncDirection, XferEvent};
 use scp_core::types::{Auth, Credentials, Error, HostKeyPolicy, Protocol};
-use scp_core::{connect, Result, Transport};
+use scp_core::{connect, Result};
 
 fn usage() -> ! {
     eprintln!(

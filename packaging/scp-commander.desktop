@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SCP Commander
+Comment=Dual-pane SFTP/FTP/S3 file manager
+Exec=scp-commander
+Icon=folder-remote
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=sftp;ftp;s3;scp;file;transfer;
