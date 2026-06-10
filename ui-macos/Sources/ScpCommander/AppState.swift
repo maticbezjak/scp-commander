@@ -50,6 +50,12 @@ final class AppState: ObservableObject {
     @Published var status = "Not connected"
     @Published var busy = false
 
+    // Commander state: focused pane, per-pane multi-selection, dotfile toggle.
+    @Published var focusedPane: PaneKind = .local
+    @Published var localSelection = Set<FileEntry.ID>()
+    @Published var remoteSelection = Set<FileEntry.ID>()
+    @Published var showHidden = false
+
     /// WinSCP-style Login dialog; shown at startup and via "New Session".
     @Published var showLogin = true
 
@@ -536,10 +542,7 @@ final class AppState: ObservableObject {
 
         session.queue.async { [weak self, client = session.client] in
             let progress: (UInt64, UInt64) -> Bool = { done, total in
-                DispatchQueue.main.async {
-                    transfer.transferred = done
-                    if total > 0 { transfer.total = total }
-                }
+                DispatchQueue.main.async { transfer.note(done, total: total) }
                 return !flag.isCancelled
             }
             let result = Result {
@@ -679,8 +682,7 @@ final class AppState: ObservableObject {
                     transfer.total = total
                     transfer.transferred = 0
                 case 1:
-                    transfer.transferred = done
-                    if total > 0 { transfer.total = total }
+                    transfer.note(done, total: total)
                 case 2:
                     transfer.filesDone += 1
                 default:
@@ -748,6 +750,100 @@ final class AppState: ObservableObject {
                 name: editSession.local.lastPathComponent, size: size,
                 direction: .upload
             ) { [weak self] in self?.refreshSession(session) }
+        }
+    }
+
+    // MARK: - Commander helpers (keyboard + batch operations)
+
+    func entries(in pane: PaneKind) -> [FileEntry] {
+        pane == .local ? localEntries : remoteEntries
+    }
+
+    func selectedEntries(in pane: PaneKind) -> [FileEntry] {
+        let ids = pane == .local ? localSelection : remoteSelection
+        return entries(in: pane).filter { ids.contains($0.id) }
+    }
+
+    func navigateLocal(_ path: String) {
+        let expanded = (path as NSString).expandingTildeInPath
+        guard FileManager.default.fileExists(atPath: expanded) else {
+            status = "No such directory: \(path)"
+            loadLocal()
+            return
+        }
+        localPath = expanded
+        loadLocal()
+    }
+
+    func navigateRemote(_ path: String) {
+        guard active.connected else { return }
+        listRemote(path.isEmpty ? "/" : path)
+    }
+
+    /// F5: copy the focused pane's selection to the other side.
+    func transferSelected() {
+        let pane = focusedPane
+        for entry in selectedEntries(in: pane) {
+            if pane == .local { upload(entry) } else { download(entry) }
+        }
+    }
+
+    /// F6: move = transfer, then delete the source on success.
+    func moveSelected() {
+        let pane = focusedPane
+        let session = active
+        guard session.connected else { return }
+        for entry in selectedEntries(in: pane) {
+            if pane == .local {
+                let localFull = (localPath as NSString).appendingPathComponent(entry.name)
+                let finish = { [weak self] in
+                    try? FileManager.default.removeItem(atPath: localFull)
+                    self?.loadLocal()
+                    self?.refreshSession(session)
+                }
+                if entry.isDir {
+                    runFolderOp(
+                        on: session, name: entry.name, direction: .upload,
+                        remote: session.remotePath + (session.remotePath.hasSuffix("/") ? "" : "/")
+                            + entry.name,
+                        local: localFull, onDone: finish)
+                } else {
+                    transferFile(
+                        on: session,
+                        remote: session.remotePath
+                            + (session.remotePath.hasSuffix("/") ? "" : "/") + entry.name,
+                        local: localFull, name: entry.name, size: entry.size,
+                        direction: .upload, onDone: finish)
+                }
+            } else {
+                let downloadEntry = entry
+                let finish = { [weak self] in
+                    self?.loadLocal()
+                    self?.deleteRemote(downloadEntry)
+                }
+                if entry.isDir {
+                    runFolderOp(
+                        on: session, name: entry.name, direction: .download,
+                        remote: session.remotePath
+                            + (session.remotePath.hasSuffix("/") ? "" : "/") + entry.name,
+                        local: (localPath as NSString).appendingPathComponent(entry.name),
+                        onDone: finish)
+                } else {
+                    transferFile(
+                        on: session,
+                        remote: session.remotePath
+                            + (session.remotePath.hasSuffix("/") ? "" : "/") + entry.name,
+                        local: (localPath as NSString).appendingPathComponent(entry.name),
+                        name: entry.name, size: entry.size,
+                        direction: .download, onDone: finish)
+                }
+            }
+        }
+    }
+
+    func deleteEntries(_ entries: [FileEntry], in pane: PaneKind) {
+        for entry in entries {
+            if pane == .local { deleteLocal(entry) } else { deleteRemote(entry) }
         }
     }
 

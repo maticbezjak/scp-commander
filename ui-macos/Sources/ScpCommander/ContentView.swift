@@ -29,8 +29,9 @@ struct ContentView: View {
     @State private var renameText = ""
     @State private var newFolderPane: PaneKind?
     @State private var newFolderText = ""
-    @State private var deleteTarget: (pane: PaneKind, entry: FileEntry)?
+    @State private var deleteTarget: (pane: PaneKind, entries: [FileEntry])?
     @State private var propertiesTarget: (pane: PaneKind, entry: FileEntry)?
+    @State private var keyMonitor: Any?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -45,8 +46,13 @@ struct ContentView: View {
                     path: state.localPath,
                     entries: state.localEntries,
                     showRights: false,
+                    showHidden: state.showHidden,
+                    isFocused: state.focusedPane == .local,
+                    selection: $state.localSelection,
+                    onFocus: { state.focusedPane = .local },
                     onUp: { state.localUp() },
                     onRefresh: { state.loadLocal() },
+                    onNavigate: { state.navigateLocal($0) },
                     onOpen: { state.openLocal($0) },
                     transferLabel: "Upload",
                     onTransfer: { state.upload($0) },
@@ -63,8 +69,13 @@ struct ContentView: View {
                     path: state.remotePath,
                     entries: state.remoteEntries,
                     showRights: true,
+                    showHidden: state.showHidden,
+                    isFocused: state.focusedPane == .remote,
+                    selection: $state.remoteSelection,
+                    onFocus: { state.focusedPane = .remote },
                     onUp: { state.remoteUp() },
                     onRefresh: { state.refreshRemote() },
+                    onNavigate: { state.navigateRemote($0) },
                     onOpen: { state.openRemote($0) },
                     transferLabel: "Download",
                     onTransfer: { state.download($0) },
@@ -85,6 +96,7 @@ struct ContentView: View {
             state.isConnected
                 ? "\(state.user.isEmpty ? "" : "\(state.user)@")\(state.host) — SCP Commander"
                 : "SCP Commander")
+        .onAppear { installKeyMonitor() }
         .sheet(isPresented: $state.showLogin) {
             LoginSheet().environmentObject(state)
         }
@@ -139,7 +151,10 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) { newFolderPane = nil }
         }
         .alert(
-            "Delete \(deleteTarget?.entry.name ?? "")?",
+            deleteTarget.map { t in
+                t.entries.count == 1
+                    ? "Delete \(t.entries[0].name)?" : "Delete \(t.entries.count) items?"
+            } ?? "Delete?",
             isPresented: Binding(
                 get: { deleteTarget != nil },
                 set: { if !$0 { deleteTarget = nil } }
@@ -147,17 +162,14 @@ struct ContentView: View {
         ) {
             Button("Delete", role: .destructive) {
                 if let target = deleteTarget {
-                    switch target.pane {
-                    case .local: state.deleteLocal(target.entry)
-                    case .remote: state.deleteRemote(target.entry)
-                    }
+                    state.deleteEntries(target.entries, in: target.pane)
                 }
                 deleteTarget = nil
             }
             Button("Cancel", role: .cancel) { deleteTarget = nil }
         } message: {
-            if deleteTarget?.entry.isDir == true {
-                Text("The folder and everything inside it will be deleted.")
+            if deleteTarget?.entries.contains(where: \.isDir) == true {
+                Text("Folders and everything inside them will be deleted.")
             } else {
                 Text("This cannot be undone.")
             }
@@ -172,6 +184,58 @@ struct ContentView: View {
     private func beginNewFolder(_ pane: PaneKind) {
         newFolderText = ""
         newFolderPane = pane
+    }
+
+    // MARK: Keyboard commander (F5 copy, F6 move, F2 rename, Del, Tab, ⌫)
+
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            handleKey(event) ? nil : event
+        }
+    }
+
+    /// Returns true when the key was consumed.
+    private func handleKey(_ event: NSEvent) -> Bool {
+        // Don't steal keys from dialogs or while a text field is being edited.
+        if state.showLogin || state.saveSitePrompt || renameTarget != nil
+            || newFolderPane != nil || deleteTarget != nil || propertiesTarget != nil
+        {
+            return false
+        }
+        if NSApp.keyWindow?.firstResponder is NSTextView { return false }
+
+        let pane = state.focusedPane
+        switch event.keyCode {
+        case 48:  // Tab — switch panes
+            state.focusedPane = pane == .local ? .remote : .local
+            return true
+        case 51:  // Backspace — parent directory
+            if pane == .local { state.localUp() } else { state.remoteUp() }
+            return true
+        case 96:  // F5 — copy selection to the other side
+            state.transferSelected()
+            return true
+        case 97:  // F6 — move selection
+            state.moveSelected()
+            return true
+        case 120:  // F2 — rename
+            if let entry = state.selectedEntries(in: pane).first {
+                beginRename(pane, entry)
+            }
+            return true
+        case 117:  // Forward delete
+            let selected = state.selectedEntries(in: pane)
+            if !selected.isEmpty { deleteTarget = (pane, selected) }
+            return true
+        case 36:  // Return — open
+            if let entry = state.selectedEntries(in: pane).first {
+                if pane == .local { state.openLocal(entry) } else { state.openRemote(entry) }
+            }
+            return true
+        default:
+            return false
+        }
     }
 }
 
@@ -235,6 +299,12 @@ private struct TopBar: View {
                 Label("New Session", systemImage: "network")
             }
 
+            Toggle(isOn: $state.showHidden) {
+                Image(systemName: state.showHidden ? "eye" : "eye.slash")
+            }
+            .toggleStyle(.button)
+            .help("Show hidden files")
+
             if state.isConnected {
                 Text("\(state.user.isEmpty ? "" : "\(state.user)@")\(state.host)")
                     .font(.callout)
@@ -252,6 +322,9 @@ private struct TopBar: View {
 
             if state.busy { ProgressView().scaleEffect(0.6).frame(width: 18, height: 18) }
             Spacer()
+            Text("F5 copy · F6 move · F2 rename · Tab panes")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
@@ -510,7 +583,7 @@ private struct SaveSiteSheet: View {
     }
 }
 
-// MARK: - File pane (multi-column, WinSCP-style)
+// MARK: - File pane (multi-column, multi-select, WinSCP-style)
 
 private enum SortKey {
     case name, size, type, mtime
@@ -522,29 +595,43 @@ private struct FilePane: View {
     let path: String
     let entries: [FileEntry]
     let showRights: Bool
+    let showHidden: Bool
+    let isFocused: Bool
+    @Binding var selection: Set<FileEntry.ID>
+    let onFocus: () -> Void
     let onUp: () -> Void
     let onRefresh: () -> Void
+    let onNavigate: (String) -> Void
     let onOpen: (FileEntry) -> Void
     let transferLabel: String
     let onTransfer: (FileEntry) -> Void
     let onDrop: (DraggedFile) -> Void
     let onRename: (FileEntry) -> Void
-    let onDelete: (FileEntry) -> Void
+    let onDelete: ([FileEntry]) -> Void
     let onNewFolder: () -> Void
     let onEdit: ((FileEntry) -> Void)?
     let onProperties: (FileEntry) -> Void
 
-    @State private var selection: FileEntry.ID?
     @State private var sortKey: SortKey = .name
     @State private var ascending = true
+    @State private var pathText = ""
 
-    private var selectedEntry: FileEntry? {
-        entries.first { $0.id == selection }
+    private var visible: [FileEntry] {
+        showHidden ? entries : entries.filter { !$0.name.hasPrefix(".") }
+    }
+
+    private var selectedEntries: [FileEntry] {
+        visible.filter { selection.contains($0.id) }
+    }
+
+    /// The clicked row plus the rest of the selection when it's part of it.
+    private func batchTargets(_ entry: FileEntry) -> [FileEntry] {
+        selection.contains(entry.id) ? selectedEntries : [entry]
     }
 
     /// Directories first (always), then the active column sort.
     private var sorted: [FileEntry] {
-        entries.sorted { a, b in
+        visible.sorted { a, b in
             if a.isDir != b.isDir { return a.isDir }
             let result: Bool
             switch sortKey {
@@ -566,14 +653,15 @@ private struct FilePane: View {
     var body: some View {
         VStack(spacing: 0) {
             paneToolbar
-            Text(path)
+            TextField("path", text: $pathText)
+                .textFieldStyle(.plain)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.head)
-                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 8)
                 .padding(.bottom, 2)
+                .onAppear { pathText = path }
+                .onChange(of: path) { pathText = $0 }
+                .onSubmit { onNavigate(pathText) }
             Divider()
             columnHeader
             Divider()
@@ -589,31 +677,36 @@ private struct FilePane: View {
             }
         }
         .frame(minWidth: 380)
+        .contentShape(Rectangle())
+        .onTapGesture { onFocus() }
     }
 
     /// WinSCP-style per-pane command toolbar.
     private var paneToolbar: some View {
         HStack(spacing: 2) {
-            Text(title).font(.headline).padding(.trailing, 4)
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(isFocused ? Color.accentColor : Color.primary)
+                .padding(.trailing, 4)
             toolButton("arrow.up", "Parent directory", action: onUp)
             toolButton("arrow.clockwise", "Refresh", action: onRefresh)
             Divider().frame(height: 14)
             toolButton(
                 kind == "local" ? "arrow.up.circle" : "arrow.down.circle",
-                transferLabel, disabled: selectedEntry == nil
+                "\(transferLabel) (F5)", disabled: selectedEntries.isEmpty
             ) {
-                if let e = selectedEntry { onTransfer(e) }
+                for entry in selectedEntries { onTransfer(entry) }
             }
             if onEdit != nil {
                 toolButton("pencil", "Edit (auto-upload on save)",
-                    disabled: selectedEntry?.isDir != false
+                    disabled: selectedEntries.first?.isDir != false
                 ) {
-                    if let e = selectedEntry { onEdit?(e) }
+                    if let e = selectedEntries.first { onEdit?(e) }
                 }
             }
             toolButton("folder.badge.plus", "New folder", action: onNewFolder)
-            toolButton("trash", "Delete", disabled: selectedEntry == nil) {
-                if let e = selectedEntry { onDelete(e) }
+            toolButton("trash", "Delete", disabled: selectedEntries.isEmpty) {
+                onDelete(selectedEntries)
             }
             Spacer()
         }
@@ -707,6 +800,7 @@ private struct FilePane: View {
         }
         .tag(entry.id)
         .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture(count: 1).onEnded { onFocus() })
         .onTapGesture(count: 2) { onOpen(entry) }
         .draggable(DraggedFile(pane: kind, name: entry.name))
         .contextMenu {
@@ -714,7 +808,11 @@ private struct FilePane: View {
                 Button("Open") { onOpen(entry) }
                 Button("\(transferLabel) folder") { onTransfer(entry) }
             } else {
-                Button(transferLabel) { onTransfer(entry) }
+                let targets = batchTargets(entry)
+                Button(targets.count > 1 ? "\(transferLabel) \(targets.count) items" : transferLabel)
+                {
+                    for t in targets { onTransfer(t) }
+                }
                 if let onEdit {
                     Button("Edit (auto-upload on save)") { onEdit(entry) }
                 }
@@ -722,10 +820,16 @@ private struct FilePane: View {
             Divider()
             Button("Rename…") { onRename(entry) }
             Button("Properties…") { onProperties(entry) }
-            Button("Delete", role: .destructive) { onDelete(entry) }
+            Button("Delete", role: .destructive) { onDelete(batchTargets(entry)) }
         }
     }
 }
+
+let changedFormatter: DateFormatter = {
+    let df = DateFormatter()
+    df.dateFormat = "dd.MM.yyyy HH:mm"
+    return df
+}()
 
 // MARK: - Properties dialog (WinSCP-style)
 
@@ -834,12 +938,6 @@ struct PropertiesSheet: View {
     }
 }
 
-private let changedFormatter: DateFormatter = {
-    let df = DateFormatter()
-    df.dateFormat = "dd.MM.yyyy HH:mm"
-    return df
-}()
-
 // MARK: - Transfers panel
 
 private struct TransfersPanel: View {
@@ -929,10 +1027,19 @@ private struct TransferRow: View {
             let files = transfer.filesDone > 0 ? "\(transfer.filesDone) files · " : ""
             return files + humanSize(max(transfer.total, transfer.transferred))
         case .active:
+            var parts: [String] = []
             if transfer.total > 0 {
-                return "\(humanSize(transfer.transferred)) / \(humanSize(transfer.total))"
+                parts.append("\(humanSize(transfer.transferred)) / \(humanSize(transfer.total))")
+            } else {
+                parts.append(humanSize(transfer.transferred))
             }
-            return humanSize(transfer.transferred)
+            if transfer.speed > 1 {
+                parts.append("\(humanSize(UInt64(transfer.speed)))/s")
+            }
+            if let eta = transfer.eta {
+                parts.append(eta)
+            }
+            return parts.joined(separator: " · ")
         }
     }
 }

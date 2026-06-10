@@ -30,7 +30,7 @@ use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, ColumnView, ColumnViewColumn,
     DragSource, DropDown, DropTarget, Entry as GtkEntry, Label, ListBox, ListItem, Orientation,
     PasswordEntry, Popover, ProgressBar, ScrolledWindow, SelectionMode, SignalListItemFactory,
-    SingleSelection,
+    MultiSelection,
 };
 
 use scp_core::types::{Auth, Credentials, Entry, HostKeyPolicy, Protocol};
@@ -63,9 +63,9 @@ fn main() -> glib::ExitCode {
 /// One pane's list widgets plus the entries backing the visible rows.
 struct Pane {
     model: gio::ListStore,
-    selection: SingleSelection,
+    selection: MultiSelection,
     entries: Rc<RefCell<Vec<Entry>>>,
-    path_label: Label,
+    path_entry: GtkEntry,
 }
 
 struct TransferRow {
@@ -74,6 +74,9 @@ struct TransferRow {
     cancel_btn: Button,
     finished: bool,
     files_done: u32,
+    last_done: u64,
+    last_at: Option<std::time::Instant>,
+    speed: f64,
 }
 
 struct EditWatch {
@@ -82,6 +85,12 @@ struct EditWatch {
     last_mtime: SystemTime,
     /// Command channel of the session that opened the file.
     cmd: mpsc::Sender<Cmd>,
+}
+
+/// Source side of an F6 move, deleted after the transfer completes.
+enum MoveSource {
+    Local { path: PathBuf, is_dir: bool },
+    Remote { path: String, is_dir: bool },
 }
 
 /// One server session, WinSCP-tab-style: its own worker thread, connection,
@@ -129,6 +138,11 @@ struct App {
     hostkey_label: Label,
     pending_connect: RefCell<Option<(Credentials, String)>>,
     pending_fingerprint: RefCell<Option<String>>,
+    // Commander state
+    show_hidden: Cell<bool>,
+    focused_local: Cell<bool>,
+    /// Transfer id -> source to delete once the move-transfer succeeds.
+    pending_move: RefCell<HashMap<u64, MoveSource>>,
     // Context menus
     local_menu_index: Cell<u32>,
     remote_menu_index: Cell<u32>,
@@ -161,7 +175,7 @@ impl App {
         let session = self.session();
         let path = session.remote_path.borrow().clone();
         let cache = session.cache.borrow().clone();
-        self.remote.show(&cache, &path);
+        self.remote.show(&cache, &path, self.show_hidden.get());
         let title = session.title.borrow().clone();
         self.window.set_title(Some(&if session.connected.get() {
             format!("{title} — SCP Commander")
@@ -274,7 +288,7 @@ impl App {
             })
             .unwrap_or_default();
         sort_entries(&mut entries);
-        self.local.show(&entries, &path.to_string_lossy());
+        self.local.show(&entries, &path.to_string_lossy(), self.show_hidden.get());
     }
 
     fn open_local(self: &Rc<Self>, index: u32) {
@@ -392,9 +406,9 @@ impl App {
 
     // -- Transfers ----------------------------------------------------------
 
-    fn download(self: &Rc<Self>, entry: &Entry) {
+    fn download(self: &Rc<Self>, entry: &Entry) -> Option<u64> {
         if !self.session().connected.get() {
-            return;
+            return None;
         }
         let remote = join_posix(&self.session().remote_path.borrow(), &entry.name);
         let local = self.local_path.borrow().join(&entry.name);
@@ -407,6 +421,7 @@ impl App {
                 local,
                 cancel,
             });
+            return Some(id);
         } else {
             // Resume when a smaller partial file is already present locally.
             let resume = std::fs::metadata(&local)
@@ -423,13 +438,14 @@ impl App {
                 resume,
                 cancel,
             });
+            return Some(id);
         }
     }
 
-    fn upload(self: &Rc<Self>, entry: &Entry) {
+    fn upload(self: &Rc<Self>, entry: &Entry) -> Option<u64> {
         if !self.session().connected.get() {
             self.set_status("Connect first to upload");
-            return;
+            return None;
         }
         let local = self.local_path.borrow().join(&entry.name);
         let remote = join_posix(&self.session().remote_path.borrow(), &entry.name);
@@ -442,6 +458,7 @@ impl App {
                 remote,
                 cancel,
             });
+            return Some(id);
         } else {
             let (id, cancel) = self.add_transfer(&entry.name, false, entry.size);
             let _ = self.session().cmd.send(Cmd::Upload {
@@ -451,6 +468,7 @@ impl App {
                 remote,
                 cancel,
             });
+            return Some(id);
         }
     }
 
@@ -514,6 +532,9 @@ impl App {
                 cancel_btn,
                 finished: false,
                 files_done: 0,
+                last_done: 0,
+                last_at: None,
+                speed: 0.0,
             },
         );
         (id, cancel)
@@ -547,18 +568,32 @@ impl App {
 
     // -- Context menu actions -------------------------------------------------
 
-    /// Point the menu index at the pane's selected row (for toolbar buttons
-    /// that reuse menu actions). Returns false when nothing is selected.
-    fn select_for_menu(&self, local_pane: bool) -> bool {
+    /// All selected row indices in a pane (multi-selection).
+    fn selected_indices(&self, local_pane: bool) -> Vec<u32> {
         let pane = if local_pane { &self.local } else { &self.remote };
-        let idx = pane.selection.selected();
-        if (idx as usize) >= pane.entries.borrow().len() {
+        let bitset = pane.selection.selection();
+        (0..bitset.size()).map(|i| bitset.nth(i as u32)).collect()
+    }
+
+    fn selected_entries(&self, local_pane: bool) -> Vec<Entry> {
+        let pane = if local_pane { &self.local } else { &self.remote };
+        let entries = pane.entries.borrow();
+        self.selected_indices(local_pane)
+            .into_iter()
+            .filter_map(|i| entries.get(i as usize).cloned())
+            .collect()
+    }
+
+    /// Point the menu index at the pane's first selected row (for toolbar
+    /// buttons that reuse menu actions). Returns false when nothing's selected.
+    fn select_for_menu(&self, local_pane: bool) -> bool {
+        let Some(first) = self.selected_indices(local_pane).first().copied() else {
             return false;
-        }
+        };
         if local_pane {
-            self.local_menu_index.set(idx);
+            self.local_menu_index.set(first);
         } else {
-            self.remote_menu_index.set(idx);
+            self.remote_menu_index.set(first);
         }
         true
     }
@@ -572,7 +607,13 @@ impl App {
     }
 
     fn menu_transfer(self: &Rc<Self>, local_pane: bool) {
-        if let Some(entry) = self.menu_entry(local_pane) {
+        let mut targets = self.selected_entries(local_pane);
+        if targets.is_empty() {
+            if let Some(entry) = self.menu_entry(local_pane) {
+                targets.push(entry);
+            }
+        }
+        for entry in targets {
             if local_pane {
                 self.upload(&entry);
             } else {
@@ -624,15 +665,26 @@ impl App {
     }
 
     fn menu_delete(self: &Rc<Self>, local_pane: bool) {
-        let Some(entry) = self.menu_entry(local_pane) else { return };
+        // Batch over the selection; fall back to the clicked row.
+        let mut targets = self.selected_entries(local_pane);
+        if targets.is_empty() {
+            let Some(entry) = self.menu_entry(local_pane) else { return };
+            targets.push(entry);
+        }
+        let message = if targets.len() == 1 {
+            format!("Delete {}?", targets[0].name)
+        } else {
+            format!("Delete {} items?", targets.len())
+        };
+        let detail = if targets.iter().any(|e| e.is_dir) {
+            "Folders and everything inside them will be deleted."
+        } else {
+            "This cannot be undone."
+        };
         let state = self.clone();
         let dialog = gtk::AlertDialog::builder()
-            .message(format!("Delete {}?", entry.name))
-            .detail(if entry.is_dir {
-                "The folder and everything inside it will be deleted."
-            } else {
-                "This cannot be undone."
-            })
+            .message(message)
+            .detail(detail)
             .buttons(["Cancel", "Delete"])
             .cancel_button(0)
             .default_button(0)
@@ -644,20 +696,28 @@ impl App {
                 if result != Ok(1) {
                     return;
                 }
-                if local_pane {
-                    let path = state.local_path.borrow().join(&entry.name);
-                    let outcome = if entry.is_dir {
-                        std::fs::remove_dir_all(&path)
+                for entry in &targets {
+                    if local_pane {
+                        let path = state.local_path.borrow().join(&entry.name);
+                        let outcome = if entry.is_dir {
+                            std::fs::remove_dir_all(&path)
+                        } else {
+                            std::fs::remove_file(&path)
+                        };
+                        if let Err(e) = outcome {
+                            state.set_status(&format!("Error: {e}"));
+                        }
                     } else {
-                        std::fs::remove_file(&path)
-                    };
-                    match outcome {
-                        Ok(()) => state.load_local(),
-                        Err(e) => state.set_status(&format!("Error: {e}")),
+                        let path =
+                            join_posix(&state.session().remote_path.borrow(), &entry.name);
+                        let _ = state
+                            .session()
+                            .cmd
+                            .send(Cmd::Delete { path, is_dir: entry.is_dir });
                     }
-                } else {
-                    let path = join_posix(&state.session().remote_path.borrow(), &entry.name);
-                    let _ = state.session().cmd.send(Cmd::Delete { path, is_dir: entry.is_dir });
+                }
+                if local_pane {
+                    state.load_local();
                 }
             },
         );
@@ -803,6 +863,70 @@ impl App {
             let (id, cancel) = self.add_transfer(&name, false, size);
             let _ = cmd.send(Cmd::Upload { id, name, local, remote, cancel });
         }
+    }
+
+    /// F6: move = transfer the focused pane's selection, then delete sources
+    /// once their transfers succeed.
+    fn move_selected(self: &Rc<Self>) {
+        let local_pane = self.focused_local.get();
+        for entry in self.selected_entries(local_pane) {
+            let id = if local_pane {
+                self.upload(&entry)
+            } else {
+                self.download(&entry)
+            };
+            let Some(id) = id else { continue };
+            let source = if local_pane {
+                MoveSource::Local {
+                    path: self.local_path.borrow().join(&entry.name),
+                    is_dir: entry.is_dir,
+                }
+            } else {
+                MoveSource::Remote {
+                    path: join_posix(&self.session().remote_path.borrow(), &entry.name),
+                    is_dir: entry.is_dir,
+                }
+            };
+            self.pending_move.borrow_mut().insert(id, source);
+        }
+    }
+
+    /// F5: copy the focused pane's selection to the other side.
+    fn transfer_selected(self: &Rc<Self>) {
+        let local_pane = self.focused_local.get();
+        for entry in self.selected_entries(local_pane) {
+            if local_pane {
+                self.upload(&entry);
+            } else {
+                self.download(&entry);
+            }
+        }
+    }
+
+    fn navigate_local(self: &Rc<Self>, text: &str) {
+        let expanded = if let Some(rest) = text.strip_prefix("~") {
+            glib::home_dir().join(rest.trim_start_matches('/'))
+        } else {
+            PathBuf::from(text)
+        };
+        if expanded.is_dir() {
+            *self.local_path.borrow_mut() = expanded;
+            self.load_local();
+        } else {
+            self.set_status(&format!("No such directory: {text}"));
+            self.load_local();
+        }
+    }
+
+    fn navigate_remote(self: &Rc<Self>, text: &str) {
+        if self.session().connected.get() {
+            let path = if text.is_empty() { "/".to_string() } else { text.to_string() };
+            let _ = self.session().cmd.send(Cmd::List { path });
+        }
+    }
+
+    fn set_focus(self: &Rc<Self>, local: bool) {
+        self.focused_local.set(local);
     }
 
     // -- Sites (WinSCP-style) -------------------------------------------------
@@ -1035,7 +1159,7 @@ impl App {
                     self.refresh_tabs();
                 }
                 if is_active {
-                    self.remote.show(&entries, &path);
+                    self.remote.show(&entries, &path, self.show_hidden.get());
                     self.set_status(&format!("{path} ({count} items)"));
                     if first_connect || self.login_window.is_visible() {
                         self.login_window.set_visible(false);
@@ -1055,18 +1179,41 @@ impl App {
                 self.set_status("Server key not recognized — confirm fingerprint to connect");
             }
             Event::Progress { id, done, total } => {
-                if let Some(row) = self.transfer_rows.borrow().get(&id) {
-                    if total > 0 {
+                if let Some(row) = self.transfer_rows.borrow_mut().get_mut(&id) {
+                    // Smoothed speed + ETA, WinSCP-style.
+                    let now = std::time::Instant::now();
+                    if let Some(at) = row.last_at {
+                        let dt = now.duration_since(at).as_secs_f64();
+                        if dt >= 0.5 {
+                            let delta = done.saturating_sub(row.last_done) as f64;
+                            let inst = delta / dt;
+                            row.speed = if row.speed == 0.0 {
+                                inst
+                            } else {
+                                row.speed * 0.7 + inst * 0.3
+                            };
+                            row.last_at = Some(now);
+                            row.last_done = done;
+                        }
+                    } else {
+                        row.last_at = Some(now);
+                        row.last_done = done;
+                    }
+                    let mut text = if total > 0 {
                         row.bar.set_fraction((done as f64 / total as f64).min(1.0));
-                        row.bar.set_text(Some(&format!(
-                            "{} / {}",
-                            human_size(done),
-                            human_size(total)
-                        )));
+                        format!("{} / {}", human_size(done), human_size(total))
                     } else {
                         row.bar.pulse();
-                        row.bar.set_text(Some(&human_size(done)));
+                        human_size(done)
+                    };
+                    if row.speed > 1.0 {
+                        text.push_str(&format!(" · {}/s", human_size(row.speed as u64)));
+                        if total > done {
+                            let secs = ((total - done) as f64 / row.speed) as u64;
+                            text.push_str(&format!(" · {}:{:02}", secs / 60, secs % 60));
+                        }
                     }
+                    row.bar.set_text(Some(&text));
                 }
             }
             Event::FileStart { id, file, total } => {
@@ -1118,6 +1265,26 @@ impl App {
                     return;
                 }
 
+                // F6 move: the copy succeeded — delete the source side.
+                if let Some(source) = self.pending_move.borrow_mut().remove(&id) {
+                    match source {
+                        MoveSource::Local { path, is_dir } => {
+                            let outcome = if is_dir {
+                                std::fs::remove_dir_all(&path)
+                            } else {
+                                std::fs::remove_file(&path)
+                            };
+                            if let Err(e) = outcome {
+                                self.set_status(&format!("Move: could not delete source: {e}"));
+                            }
+                            self.load_local();
+                        }
+                        MoveSource::Remote { path, is_dir } => {
+                            let _ = session.cmd.send(Cmd::Delete { path, is_dir });
+                        }
+                    }
+                }
+
                 self.set_status(&format!(
                     "{} {name}",
                     if download { "Downloaded" } else { "Uploaded" }
@@ -1155,13 +1322,18 @@ impl Pane {
         self.entries.borrow().get(index as usize).cloned()
     }
 
-    fn show(&self, entries: &[Entry], path: &str) {
-        self.path_label.set_text(path);
+    fn show(&self, entries: &[Entry], path: &str, show_hidden: bool) {
+        self.path_entry.set_text(path);
         self.model.remove_all();
-        for e in entries {
+        let visible: Vec<Entry> = entries
+            .iter()
+            .filter(|e| show_hidden || !e.name.starts_with('.'))
+            .cloned()
+            .collect();
+        for e in &visible {
             self.model.append(&glib::BoxedAnyObject::new(e.clone()));
         }
-        *self.entries.borrow_mut() = entries.to_vec();
+        *self.entries.borrow_mut() = visible;
     }
 }
 
@@ -1331,10 +1503,23 @@ fn build_ui(app: &Application) {
         .margin_start(6)
         .margin_end(6)
         .build();
+    let hidden_btn = gtk::ToggleButton::new();
+    hidden_btn.set_icon_name("view-reveal-symbolic");
+    hidden_btn.set_tooltip_text(Some("Show hidden files"));
+    let hint = Label::builder()
+        .label("F5 copy · F6 move · F2 rename · Tab panes")
+        .hexpand(true)
+        .xalign(1.0)
+        .build();
+    hint.add_css_class("dim-label");
+    hint.add_css_class("caption");
+
     main_toolbar.append(&new_session_btn);
     main_toolbar.append(&gtk::Separator::new(Orientation::Vertical));
     main_toolbar.append(&sync_up_btn);
     main_toolbar.append(&sync_down_btn);
+    main_toolbar.append(&hidden_btn);
+    main_toolbar.append(&hint);
 
     // Panes ------------------------------------------------------------------
     let local_hook: MenuHook = Rc::new(RefCell::new(None));
@@ -1557,6 +1742,9 @@ fn build_ui(app: &Application) {
         hostkey_label,
         pending_connect: RefCell::new(None),
         pending_fingerprint: RefCell::new(None),
+        show_hidden: Cell::new(false),
+        focused_local: Cell::new(true),
+        pending_move: RefCell::new(HashMap::new()),
         local_menu_index: Cell::new(0),
         remote_menu_index: Cell::new(0),
         sites_menu_index: Cell::new(0),
@@ -1763,6 +1951,92 @@ fn build_ui(app: &Application) {
     build_pane_toolbar(&state, &local_header, true);
     build_pane_toolbar(&state, &remote_header, false);
 
+    // Editable path bars (type a path, press Enter).
+    state.local.path_entry.connect_activate(glib::clone!(
+        #[strong] state,
+        move |entry| state.navigate_local(&entry.text())
+    ));
+    state.remote.path_entry.connect_activate(glib::clone!(
+        #[strong] state,
+        move |entry| state.navigate_remote(&entry.text())
+    ));
+
+    // Hidden-file toggle re-renders both panes from their full caches.
+    hidden_btn.connect_toggled(glib::clone!(
+        #[strong] state,
+        move |btn| {
+            state.show_hidden.set(btn.is_active());
+            state.load_local();
+            let session = state.session();
+            let path = session.remote_path.borrow().clone();
+            let cache = session.cache.borrow().clone();
+            state.remote.show(&cache, &path, state.show_hidden.get());
+        }
+    ));
+
+    // Click-to-focus for the keyboard commander.
+    for (view, is_local) in [(&local_view, true), (&remote_view, false)] {
+        let focus_click = gtk::GestureClick::new();
+        focus_click.connect_pressed(glib::clone!(
+            #[strong] state,
+            move |_, _, _, _| state.set_focus(is_local)
+        ));
+        view.add_controller(focus_click);
+    }
+
+    // Keyboard commander: F5 copy, F6 move, F2 rename, Del, Backspace, Tab.
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed(glib::clone!(
+        #[strong] state,
+        move |_, key, _, _| {
+            // Don't steal keys while typing in an entry.
+            let editing_text = gtk::prelude::RootExt::focus(&state.window)
+                .is_some_and(|w| {
+                    w.is::<gtk::Text>() || w.is::<GtkEntry>() || w.is::<PasswordEntry>()
+                });
+            if editing_text {
+                return glib::Propagation::Proceed;
+            }
+            let local = state.focused_local.get();
+            match key {
+                gdk::Key::F5 => {
+                    state.transfer_selected();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::F6 => {
+                    state.move_selected();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::F2 => {
+                    if state.select_for_menu(local) {
+                        state.menu_rename(local);
+                    }
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Delete => {
+                    if state.select_for_menu(local) {
+                        state.menu_delete(local);
+                    }
+                    glib::Propagation::Stop
+                }
+                gdk::Key::BackSpace => {
+                    if local {
+                        state.local_up();
+                    } else {
+                        state.remote_up();
+                    }
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Tab => {
+                    state.set_focus(!local);
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        }
+    ));
+    window.add_controller(keys);
+
     // Drag and drop between panes -----------------------------------------------
     add_drag_source(&local_view, "local", &state.local);
     add_drag_source(&remote_view, "remote", &state.remote);
@@ -1771,17 +2045,21 @@ fn build_ui(app: &Application) {
     local_drop.connect_drop(glib::clone!(
         #[strong] state,
         move |_, value, _, _| {
-            if let Some(name) = value
+            if let Some(names) = value
                 .get::<String>()
                 .ok()
                 .and_then(|s| s.strip_prefix("remote:").map(str::to_string))
             {
-                if let Some(entry) =
-                    state.remote.entries.borrow().iter().find(|e| e.name == name).cloned()
-                {
-                    state.download(&entry);
-                    return true;
+                let mut any = false;
+                for name in names.lines() {
+                    if let Some(entry) =
+                        state.remote.entries.borrow().iter().find(|e| e.name == name).cloned()
+                    {
+                        state.download(&entry);
+                        any = true;
+                    }
                 }
+                return any;
             }
             false
         }
@@ -1792,17 +2070,21 @@ fn build_ui(app: &Application) {
     remote_drop.connect_drop(glib::clone!(
         #[strong] state,
         move |_, value, _, _| {
-            if let Some(name) = value
+            if let Some(names) = value
                 .get::<String>()
                 .ok()
                 .and_then(|s| s.strip_prefix("local:").map(str::to_string))
             {
-                if let Some(entry) =
-                    state.local.entries.borrow().iter().find(|e| e.name == name).cloned()
-                {
-                    state.upload(&entry);
-                    return true;
+                let mut any = false;
+                for name in names.lines() {
+                    if let Some(entry) =
+                        state.local.entries.borrow().iter().find(|e| e.name == name).cloned()
+                    {
+                        state.upload(&entry);
+                        any = true;
+                    }
                 }
+                return any;
             }
             false
         }
@@ -1962,7 +2244,7 @@ fn make_pane(
     show_rights: bool,
 ) -> (GtkBox, Pane, ColumnView, GtkBox) {
     let model = gio::ListStore::new::<glib::BoxedAnyObject>();
-    let selection = SingleSelection::new(Some(model.clone()));
+    let selection = MultiSelection::new(Some(model.clone()));
     let view = ColumnView::new(Some(selection.clone()));
     view.add_css_class("data-table");
 
@@ -2067,12 +2349,9 @@ fn make_pane(
     title_label.set_margin_end(8);
     header.append(&title_label);
 
-    let path_label = Label::builder()
-        .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::Start)
-        .build();
-    path_label.add_css_class("dim-label");
-    path_label.add_css_class("caption");
+    // Editable path bar (WinSCP's "open directory"): type a path, press Enter.
+    let path_entry = GtkEntry::builder().hexpand(true).build();
+    path_entry.add_css_class("flat");
 
     let scroller = ScrolledWindow::builder().vexpand(true).child(&view).build();
 
@@ -2081,14 +2360,14 @@ fn make_pane(
         .spacing(2)
         .build();
     pane_box.append(&header);
-    pane_box.append(&path_label);
+    pane_box.append(&path_entry);
     pane_box.append(&scroller);
 
     let pane = Pane {
         model,
         selection,
         entries: Rc::new(RefCell::new(Vec::new())),
-        path_label,
+        path_entry,
     };
     (pane_box, pane, view, header)
 }
@@ -2152,12 +2431,18 @@ fn setup_context_menu(state: &Rc<App>, view: &ColumnView, hook: &MenuHook, local
 
     let s = state.clone();
     *hook.borrow_mut() = Some(Box::new(move |index, x, y| {
+        let pane = if local_pane { &s.local } else { &s.remote };
+        // Right-click selects the row unless it's already in the selection
+        // (so batch actions can target multiple rows).
+        if !pane.selection.is_selected(index) {
+            pane.selection.select_item(index, true);
+        }
         if local_pane {
-            s.local.selection.set_selected(index);
             s.local_menu_index.set(index);
+            s.set_focus(true);
         } else {
-            s.remote.selection.set_selected(index);
             s.remote_menu_index.set(index);
+            s.set_focus(false);
         }
         popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         popover.popup();
@@ -2436,10 +2721,17 @@ fn add_drag_source(view: &ColumnView, kind: &'static str, pane: &Pane) {
     let entries = pane.entries.clone();
     let selection = pane.selection.clone();
     drag.connect_prepare(move |_, _, _| {
-        let index = selection.selected();
-        let entry = entries.borrow().get(index as usize).cloned()?;
+        let bitset = selection.selection();
+        let entries = entries.borrow();
+        let names: Vec<String> = (0..bitset.size())
+            .filter_map(|i| entries.get(bitset.nth(i as u32) as usize))
+            .map(|e| e.name.clone())
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
         Some(gdk::ContentProvider::for_value(
-            &format!("{kind}:{}", entry.name).to_value(),
+            &format!("{kind}:{}", names.join("\n")).to_value(),
         ))
     });
     view.add_controller(drag);

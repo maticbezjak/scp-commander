@@ -35,10 +35,36 @@ final class Transfer: ObservableObject, Identifiable {
     /// For multi-file operations: the file currently being copied.
     @Published var currentFile: String?
     @Published var filesDone: Int = 0
+    /// Smoothed throughput in bytes/second.
+    @Published var speed: Double = 0
+
+    private var lastSampleTime = Date()
+    private var lastSampleBytes: UInt64 = 0
 
     init(name: String, direction: TransferDirection) {
         self.name = name
         self.direction = direction
+    }
+
+    /// Record byte progress and update the smoothed speed estimate.
+    func note(_ done: UInt64, total: UInt64) {
+        transferred = done
+        if total > 0 { self.total = total }
+        let now = Date()
+        let dt = now.timeIntervalSince(lastSampleTime)
+        guard dt >= 0.5 else { return }
+        let delta = done >= lastSampleBytes ? Double(done - lastSampleBytes) : 0
+        let instant = delta / dt
+        speed = speed == 0 ? instant : speed * 0.7 + instant * 0.3
+        lastSampleTime = now
+        lastSampleBytes = done
+    }
+
+    /// "m:ss" estimate to completion, when speed and total are known.
+    var eta: String? {
+        guard state == .active, speed > 1, total > transferred else { return nil }
+        let secs = Int(Double(total - transferred) / speed)
+        return String(format: "%d:%02d", secs / 60, secs % 60)
     }
 
     /// 0…1, or nil when the total size is unknown (shows as indeterminate).
