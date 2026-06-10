@@ -12,8 +12,11 @@ path = "src/main.rs"
 [dependencies]
 scp-core = { path = "../core" }
 # Targets Linux (apt install libgtk-4-dev); also compiles against Homebrew's
-# gtk4 on macOS, which we use for compile-checking the UI.
-gtk = { package = "gtk4", version = "0.9" }
+# gtk4 on macOS, which we use for compile-checking the UI. v4_10 enables
+# FileDialog/AlertDialog (needs GTK >= 4.10 at runtime, i.e. Ubuntu 24.04+).
+gtk = { package = "gtk4", version = "0.9", features = ["v4_10"] }
+# Passwords in GNOME Keyring / KWallet via the Secret Service D-Bus API.
+secret-service = { version = "5", features = ["rt-async-io-crypto-rust"] }
 # Bridges the blocking worker thread back into the GTK main loop.
 async-channel = "2"
 # Saved-sites persistence.
