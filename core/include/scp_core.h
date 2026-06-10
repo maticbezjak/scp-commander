@@ -30,6 +30,16 @@ char *scp_list_dir(ScpSession *session, const char *path);
 int64_t scp_download(ScpSession *session, const char *remote, const char *local);
 int64_t scp_upload(ScpSession *session, const char *local, const char *remote);
 
+/* Progress callback: (transferred, total, user_data). total is 0 if unknown. */
+typedef void (*ScpProgressCb)(uint64_t transferred, uint64_t total, void *user_data);
+
+/* Transfer with progress reporting. cb runs on the calling thread; user_data
+ * is passed back verbatim. Returns bytes transferred, or -1 on error. */
+int64_t scp_download_cb(ScpSession *session, const char *remote, const char *local,
+                        ScpProgressCb cb, void *user_data);
+int64_t scp_upload_cb(ScpSession *session, const char *local, const char *remote,
+                      ScpProgressCb cb, void *user_data);
+
 /* Closes the session and frees the handle. Safe to pass NULL. */
 void scp_disconnect_free(ScpSession *session);
 

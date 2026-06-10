@@ -1,11 +1,11 @@
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 
 use ssh2::Session;
 
-use crate::transport::Transport;
+use crate::transport::{Progress, Transport};
 use crate::types::{Auth, Credentials, Entry, Error, Result};
 
 /// SFTP backend backed by libssh2 (synchronous).
@@ -95,11 +95,52 @@ impl Transport for SftpTransport {
         Ok(n)
     }
 
+    fn download_progress(&mut self, remote: &str, local: &Path, progress: Progress) -> Result<u64> {
+        let mut remote_file = self
+            .sftp
+            .open(Path::new(remote))
+            .map_err(|e| Error::Protocol(e.to_string()))?;
+        let total = remote_file.stat().ok().and_then(|s| s.size).unwrap_or(0);
+        let mut local_file = File::create(local)?;
+        copy_with_progress(&mut remote_file, &mut local_file, total, progress)
+    }
+
+    fn upload_progress(&mut self, local: &Path, remote: &str, progress: Progress) -> Result<u64> {
+        let mut local_file = File::open(local)?;
+        let total = local_file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut remote_file = self
+            .sftp
+            .create(Path::new(remote))
+            .map_err(|e| Error::Protocol(e.to_string()))?;
+        copy_with_progress(&mut local_file, &mut remote_file, total, progress)
+    }
+
     fn disconnect(&mut self) {
         let _ = self
             .session
             .disconnect(None, "bye", None);
     }
+}
+
+/// Copy reader → writer in chunks, reporting `(transferred, total)` after each.
+fn copy_with_progress<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    total: u64,
+    progress: Progress,
+) -> Result<u64> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut done: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        done += n as u64;
+        progress(done, total);
+    }
+    Ok(done)
 }
 
 /// Render a unix mode bitmask as an `rwxr-xr-x`-style string (permission bits only).

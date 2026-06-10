@@ -10,7 +10,7 @@
 //! See `include/scp_core.h` for the matching C header.
 
 use std::cell::RefCell;
-use std::ffi::{c_char, c_int, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::Path;
 use std::ptr;
 
@@ -170,6 +170,86 @@ pub extern "C" fn scp_upload(
         }
     }
 }
+
+/// Progress callback: `(transferred, total, user_data)`. `total` is 0 if unknown.
+pub type ProgressCb = extern "C" fn(u64, u64, *mut c_void);
+
+/// Download with progress reporting. Returns bytes transferred, or -1 on error.
+/// `cb` is invoked on the calling thread; `user_data` is passed back verbatim.
+#[no_mangle]
+pub extern "C" fn scp_download_cb(
+    session: *mut ScpSession,
+    remote: *const c_char,
+    local: *const c_char,
+    cb: Option<ProgressCb>,
+    user_data: *mut c_void,
+) -> i64 {
+    clear_error();
+    let (Some(session), Some(remote), Some(local)) = (
+        unsafe { session.as_mut() },
+        unsafe { cstr(remote) },
+        unsafe { cstr(local) },
+    ) else {
+        set_error("invalid arguments to scp_download_cb");
+        return -1;
+    };
+    let user = UserData(user_data);
+    let mut report = |t: u64, total: u64| {
+        if let Some(cb) = cb {
+            cb(t, total, user.0);
+        }
+    };
+    match session
+        .inner
+        .download_progress(remote, Path::new(local), &mut report)
+    {
+        Ok(n) => n as i64,
+        Err(e) => {
+            set_error(e.to_string());
+            -1
+        }
+    }
+}
+
+/// Upload with progress reporting. Returns bytes transferred, or -1 on error.
+#[no_mangle]
+pub extern "C" fn scp_upload_cb(
+    session: *mut ScpSession,
+    local: *const c_char,
+    remote: *const c_char,
+    cb: Option<ProgressCb>,
+    user_data: *mut c_void,
+) -> i64 {
+    clear_error();
+    let (Some(session), Some(local), Some(remote)) = (
+        unsafe { session.as_mut() },
+        unsafe { cstr(local) },
+        unsafe { cstr(remote) },
+    ) else {
+        set_error("invalid arguments to scp_upload_cb");
+        return -1;
+    };
+    let user = UserData(user_data);
+    let mut report = |t: u64, total: u64| {
+        if let Some(cb) = cb {
+            cb(t, total, user.0);
+        }
+    };
+    match session
+        .inner
+        .upload_progress(Path::new(local), remote, &mut report)
+    {
+        Ok(n) => n as i64,
+        Err(e) => {
+            set_error(e.to_string());
+            -1
+        }
+    }
+}
+
+/// Wrapper so the opaque `user_data` pointer can be moved into the progress
+/// closure without tripping the borrow checker on the raw pointer.
+struct UserData(*mut c_void);
 
 /// Close the session and free the handle. Safe to pass null.
 #[no_mangle]

@@ -26,11 +26,16 @@ sharing one transfer core. SwiftUI on macOS, GTK4 on Ubuntu, Rust underneath.
 
 ## Status
 
-- **SFTP** — implemented (libssh2).
-- **FTP** — implemented (plain). FTPS is stubbed behind the same trait.
-- **S3** — stubbed; slots into the `Transport` trait when implemented.
+- **SFTP** — implemented (libssh2), with granular transfer progress.
+- **FTP / FTPS** — implemented (FTPS upgrades the control channel via native-tls).
+- **S3** — implemented behind the `s3` cargo feature (rust-s3, blocking).
 
-Phasing from here: transfer queue → directory sync → FTPS/S3 → remote editor.
+macOS app extras: a transfer queue with live progress, drag-and-drop between
+the local/remote panes, and saved connection sites (persisted to Application
+Support; passwords entered fresh at connect time).
+
+Phasing from here: directory synchronize → recursive folder transfers →
+Keychain-stored credentials → remote file editor.
 
 ## Build & run
 
@@ -44,7 +49,8 @@ brew install libssh2 openssl@3 pkg-config
 
 ### Core + CLI
 ```sh
-cargo build -p scp-core
+cargo build -p scp-core                 # SFTP + FTP/FTPS
+cargo build -p scp-core --features s3   # also build the S3 backend
 ./target/debug/scp-cli ls sftp://user@host/path        # prompts via arg: append password
 ./target/debug/scp-cli get sftp://user@host/file ./out  yourpassword
 ```

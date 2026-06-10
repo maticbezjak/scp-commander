@@ -21,6 +21,9 @@ final class AppState: ObservableObject {
     @Published var status = "Not connected"
     @Published var busy = false
 
+    let transfers = TransferQueue()
+    let sites = SitesStore()
+
     private let client = CoreClient()
     private let queue = DispatchQueue(label: "net.manto.ScpCommander.core")
 
@@ -28,6 +31,23 @@ final class AppState: ObservableObject {
 
     init() {
         loadLocal()
+    }
+
+    // MARK: - Saved sites
+
+    func saveCurrentSite() {
+        let name = host.isEmpty ? "New site" : "\(user.isEmpty ? "" : "\(user)@")\(host)"
+        sites.add(Site(name: name, proto: proto, host: host, port: port, user: user))
+        status = "Saved site “\(name)”"
+    }
+
+    func loadSite(_ site: Site) {
+        proto = site.proto
+        host = site.host
+        port = site.port
+        user = site.user
+        password = ""  // entered fresh each connect
+        status = "Loaded “\(site.name)” — enter password and Connect"
     }
 
     // MARK: - Local filesystem
@@ -108,31 +128,76 @@ final class AppState: ObservableObject {
     }
 
     func download(_ entry: FileEntry) {
-        guard isConnected else { return }
+        guard isConnected, !entry.isDir else { return }
         let remote = pathJoinPosix(remotePath, entry.name)
         let local = pathJoin(localPath, entry.name)
-        runBusy("Downloading \(entry.name)…") { [client] in
-            let n = try client.download(remote: remote, local: local)
-            return n
-        } onSuccess: { [weak self] (n: Int64) in
-            self?.status = "Downloaded \(entry.name) (\(n) bytes)"
-            self?.loadLocal()
+        let transfer = Transfer(name: entry.name, direction: .download)
+        transfer.total = entry.size
+        transfers.add(transfer)
+
+        queue.async { [weak self, client] in
+            do {
+                _ = try client.download(remote: remote, local: local) { done, total in
+                    DispatchQueue.main.async {
+                        transfer.transferred = done
+                        if total > 0 { transfer.total = total }
+                    }
+                }
+                DispatchQueue.main.async {
+                    transfer.state = .done
+                    self?.status = "Downloaded \(entry.name)"
+                    self?.loadLocal()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    transfer.state = .failed(error.localizedDescription)
+                    self?.status = "Error: \(error.localizedDescription)"
+                }
+            }
         }
     }
 
     func upload(_ entry: FileEntry) {
+        guard !entry.isDir else { return }
         guard isConnected else {
             status = "Connect first to upload"
             return
         }
         let local = pathJoin(localPath, entry.name)
         let remote = pathJoinPosix(remotePath, entry.name)
-        runBusy("Uploading \(entry.name)…") { [client] in
-            try client.upload(local: local, remote: remote)
-        } onSuccess: { [weak self] (n: Int64) in
-            self?.status = "Uploaded \(entry.name) (\(n) bytes)"
-            self?.listRemote(self?.remotePath ?? "/")
+        let transfer = Transfer(name: entry.name, direction: .upload)
+        transfer.total = entry.size
+        transfers.add(transfer)
+
+        queue.async { [weak self, client] in
+            do {
+                _ = try client.upload(local: local, remote: remote) { done, total in
+                    DispatchQueue.main.async {
+                        transfer.transferred = done
+                        if total > 0 { transfer.total = total }
+                    }
+                }
+                DispatchQueue.main.async {
+                    transfer.state = .done
+                    self?.status = "Uploaded \(entry.name)"
+                    if let self { self.listRemote(self.remotePath) }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    transfer.state = .failed(error.localizedDescription)
+                    self?.status = "Error: \(error.localizedDescription)"
+                }
+            }
         }
+    }
+
+    // Drag-and-drop entry points (look the entry up by name in its pane).
+    func uploadByName(_ name: String) {
+        if let e = localEntries.first(where: { $0.name == name }) { upload(e) }
+    }
+
+    func downloadByName(_ name: String) {
+        if let e = remoteEntries.first(where: { $0.name == name }) { download(e) }
     }
 
     // MARK: - Plumbing
