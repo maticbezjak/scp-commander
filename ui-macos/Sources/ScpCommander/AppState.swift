@@ -293,6 +293,36 @@ final class AppState: ObservableObject {
         }
     }
 
+    func chmodRemote(_ entry: FileEntry, mode: UInt32) {
+        guard isConnected else { return }
+        let path = pathJoinPosix(remotePath, entry.name)
+        runBusy("Changing permissions…") { [client] in
+            try client.chmod(path, mode: mode)
+        } onSuccess: { [weak self] _ in
+            self?.status = "Permissions of \(entry.name) set to \(String(mode, radix: 8))"
+            self?.refreshRemote()
+        }
+    }
+
+    func chmodLocal(_ entry: FileEntry, mode: UInt32) {
+        let path = pathJoin(localPath, entry.name)
+        do {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)], ofItemAtPath: path)
+            status = "Permissions of \(entry.name) set to \(String(mode, radix: 8))"
+            loadLocal()
+        } catch {
+            status = "Error: \(error.localizedDescription)"
+        }
+    }
+
+    /// Current unix mode of a local entry (for the Properties dialog).
+    func localMode(of entry: FileEntry) -> UInt32? {
+        let path = pathJoin(localPath, entry.name)
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        return (attrs?[.posixPermissions] as? NSNumber).map { UInt32(truncating: $0) & 0o777 }
+    }
+
     func deleteRemote(_ entry: FileEntry) {
         guard isConnected else { return }
         let path = pathJoinPosix(remotePath, entry.name)

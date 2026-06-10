@@ -156,6 +156,16 @@ impl Transport for FtpTransport {
         with_conn!(self, c => c.rename(from, to).map_err(|e| Error::Protocol(e.to_string())))
     }
 
+    fn set_permissions(&mut self, path: &str, mode: u32) -> Result<()> {
+        // Not in the FTP RFCs, but the SITE CHMOD extension is near-universal
+        // on unix servers.
+        let cmd = format!("SITE CHMOD {:o} {}", mode & 0o7777, path);
+        with_conn!(self, c => c
+            .site(&cmd)
+            .map(|_| ())
+            .map_err(|e| Error::Protocol(e.to_string())))
+    }
+
     fn disconnect(&mut self) {
         let _ = with_conn!(self, c => c.quit());
     }

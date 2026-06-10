@@ -203,6 +203,19 @@ fn run() -> Result<()> {
             println!("created {}", parsed.path);
             t.disconnect();
         }
+        "chmod" => {
+            let mode = args
+                .get(1)
+                .and_then(|m| u32::from_str_radix(m, 8).ok())
+                .unwrap_or_else(|| usage());
+            let url = args.get(2).unwrap_or_else(|| usage());
+            let parsed = parse_url(url, args.get(3).map(String::as_str), &flags)
+                .unwrap_or_else(|e| fail(&e));
+            let mut t = connect(&parsed.creds)?;
+            t.set_permissions(&parsed.path, mode)?;
+            println!("chmod {mode:o} {}", parsed.path);
+            t.disconnect();
+        }
         "sync" => {
             let dir = match args.get(1).map(String::as_str) {
                 Some("up") => SyncDirection::Upload,

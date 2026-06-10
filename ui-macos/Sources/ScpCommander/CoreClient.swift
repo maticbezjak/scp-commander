@@ -1,5 +1,6 @@
 import CScpCore
 import Foundation
+import UniformTypeIdentifiers
 
 enum Proto: Int32, Codable, CaseIterable {
     case sftp = 0
@@ -25,6 +26,29 @@ struct FileEntry: Identifiable, Hashable {
     var size: UInt64
     var mtime: Date? = nil
     var perms: String?
+
+    /// WinSCP-style "Type" column, from the system's type database.
+    var typeDescription: String {
+        if isDir { return "File folder" }
+        let ext = (name as NSString).pathExtension
+        if ext.isEmpty { return "File" }
+        if let ut = UTType(filenameExtension: ext.lowercased()),
+            let desc = ut.localizedDescription
+        {
+            return desc
+        }
+        return "\(ext.uppercased()) file"
+    }
+
+    /// Parse "rwxr-xr-x" into permission bits (0o755), if present.
+    var mode: UInt32? {
+        guard let perms, perms.count == 9 else { return nil }
+        var mode: UInt32 = 0
+        for (i, c) in perms.enumerated() {
+            if c != "-" { mode |= 1 << (8 - i) }
+        }
+        return mode
+    }
 }
 
 struct CoreError: LocalizedError {
@@ -220,6 +244,11 @@ final class CoreClient: @unchecked Sendable {
     func rename(from: String, to: String) throws {
         guard let session else { throw CoreError(message: "not connected") }
         if scp_rename(session, from, to) != 0 { throw Self.lastError() }
+    }
+
+    func chmod(_ path: String, mode: UInt32) throws {
+        guard let session else { throw CoreError(message: "not connected") }
+        if scp_chmod(session, path, mode) != 0 { throw Self.lastError() }
     }
 
     func disconnect() {

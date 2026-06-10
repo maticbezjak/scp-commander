@@ -38,6 +38,14 @@ pub trait Transport: Send {
     /// Rename/move a remote file or directory.
     fn rename(&mut self, from: &str, to: &str) -> Result<()>;
 
+    /// Change unix permissions (e.g. 0o644). Not every protocol supports
+    /// this; the default refuses.
+    fn set_permissions(&mut self, _path: &str, _mode: u32) -> Result<()> {
+        Err(Error::NotImplemented(
+            "permissions are not supported on this protocol".into(),
+        ))
+    }
+
     /// Download without progress reporting.
     fn download(&mut self, remote: &str, local: &Path) -> Result<u64> {
         self.download_progress(remote, local, &mut |_, _| true)

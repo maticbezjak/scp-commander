@@ -30,6 +30,7 @@ struct ContentView: View {
     @State private var newFolderPane: PaneKind?
     @State private var newFolderText = ""
     @State private var deleteTarget: (pane: PaneKind, entry: FileEntry)?
+    @State private var propertiesTarget: (pane: PaneKind, entry: FileEntry)?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -51,7 +52,8 @@ struct ContentView: View {
                     onRename: { beginRename(.local, $0) },
                     onDelete: { deleteTarget = (.local, $0) },
                     onNewFolder: { beginNewFolder(.local) },
-                    onEdit: nil
+                    onEdit: nil,
+                    onProperties: { propertiesTarget = (.local, $0) }
                 )
                 FilePane(
                     kind: "remote",
@@ -68,7 +70,8 @@ struct ContentView: View {
                     onRename: { beginRename(.remote, $0) },
                     onDelete: { deleteTarget = (.remote, $0) },
                     onNewFolder: { beginNewFolder(.remote) },
-                    onEdit: { state.editRemote($0) }
+                    onEdit: { state.editRemote($0) },
+                    onProperties: { propertiesTarget = (.remote, $0) }
                 )
             }
             TransfersPanel(queue: state.transfers)
@@ -82,6 +85,19 @@ struct ContentView: View {
                 : "SCP Commander")
         .sheet(isPresented: $state.showLogin) {
             LoginSheet().environmentObject(state)
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { propertiesTarget != nil },
+                set: { if !$0 { propertiesTarget = nil } }
+            )
+        ) {
+            if let target = propertiesTarget {
+                PropertiesSheet(pane: target.pane, entry: target.entry) {
+                    propertiesTarget = nil
+                }
+                .environmentObject(state)
+            }
         }
         .alert(
             "Rename",
@@ -441,7 +457,7 @@ private struct SaveSiteSheet: View {
 // MARK: - File pane (multi-column, WinSCP-style)
 
 private enum SortKey {
-    case name, size, mtime
+    case name, size, type, mtime
 }
 
 private struct FilePane: View {
@@ -460,6 +476,7 @@ private struct FilePane: View {
     let onDelete: (FileEntry) -> Void
     let onNewFolder: () -> Void
     let onEdit: ((FileEntry) -> Void)?
+    let onProperties: (FileEntry) -> Void
 
     @State private var selection: FileEntry.ID?
     @State private var sortKey: SortKey = .name
@@ -479,6 +496,10 @@ private struct FilePane: View {
                 result = a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
             case .size:
                 result = a.size < b.size
+            case .type:
+                result =
+                    a.typeDescription.localizedCaseInsensitiveCompare(b.typeDescription)
+                    == .orderedAscending
             case .mtime:
                 result = (a.mtime ?? .distantPast) < (b.mtime ?? .distantPast)
             }
@@ -561,6 +582,8 @@ private struct FilePane: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             headerCell("Size", key: .size, alignment: .trailing)
                 .frame(width: 76, alignment: .trailing)
+            headerCell("Type", key: .type, alignment: .leading)
+                .frame(width: 110, alignment: .leading)
             headerCell("Changed", key: .mtime, alignment: .leading)
                 .frame(width: 118, alignment: .leading)
             if showRights {
@@ -608,6 +631,11 @@ private struct FilePane: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 76, alignment: .trailing)
+            Text(entry.typeDescription)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(width: 110, alignment: .leading)
             Text(entry.mtime.map { changedFormatter.string(from: $0) } ?? "")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
@@ -635,7 +663,115 @@ private struct FilePane: View {
             }
             Divider()
             Button("Rename…") { onRename(entry) }
+            Button("Properties…") { onProperties(entry) }
             Button("Delete", role: .destructive) { onDelete(entry) }
+        }
+    }
+}
+
+// MARK: - Properties dialog (WinSCP-style)
+
+struct PropertiesSheet: View {
+    @EnvironmentObject var state: AppState
+    let pane: PaneKind
+    let entry: FileEntry
+    let onClose: () -> Void
+
+    @State private var bits: [Bool] = Array(repeating: false, count: 9)
+    @State private var loadedMode = false
+
+    private var mode: UInt32 {
+        bits.enumerated().reduce(0) { acc, item in
+            item.element ? acc | (1 << (8 - item.offset)) : acc
+        }
+    }
+
+    private var canChangeRights: Bool {
+        pane == .local || state.proto != .s3
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: entry.isDir ? "folder.fill" : "doc")
+                    .font(.title2)
+                    .foregroundStyle(entry.isDir ? Color.accentColor : Color.secondary)
+                Text(entry.name).font(.headline)
+            }
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
+                GridRow {
+                    Text("Location:").foregroundStyle(.secondary)
+                    Text(pane == .local ? state.localPath : state.remotePath)
+                        .lineLimit(1).truncationMode(.head)
+                }
+                GridRow {
+                    Text("Type:").foregroundStyle(.secondary)
+                    Text(entry.typeDescription)
+                }
+                if !entry.isDir {
+                    GridRow {
+                        Text("Size:").foregroundStyle(.secondary)
+                        Text("\(entry.size) bytes")
+                    }
+                }
+                if let mtime = entry.mtime {
+                    GridRow {
+                        Text("Changed:").foregroundStyle(.secondary)
+                        Text(changedFormatter.string(from: mtime))
+                    }
+                }
+            }
+
+            if canChangeRights {
+                Divider()
+                Text("Rights").font(.subheadline.bold())
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 4) {
+                    GridRow {
+                        Text("")
+                        Text("Read").font(.caption).foregroundStyle(.secondary)
+                        Text("Write").font(.caption).foregroundStyle(.secondary)
+                        Text("Execute").font(.caption).foregroundStyle(.secondary)
+                    }
+                    ForEach(0..<3, id: \.self) { group in
+                        GridRow {
+                            Text(["Owner", "Group", "Others"][group])
+                                .font(.caption)
+                            ForEach(0..<3, id: \.self) { bit in
+                                Toggle("", isOn: $bits[group * 3 + bit]).labelsHidden()
+                            }
+                        }
+                    }
+                }
+                Text("Octal: \(String(format: "%03o", mode))")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Spacer()
+                Button("Close") { onClose() }.keyboardShortcut(.cancelAction)
+                if canChangeRights {
+                    Button("Apply") {
+                        switch pane {
+                        case .local: state.chmodLocal(entry, mode: mode)
+                        case .remote: state.chmodRemote(entry, mode: mode)
+                        }
+                        onClose()
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+        }
+        .padding(16)
+        .frame(width: 360)
+        .onAppear {
+            guard !loadedMode else { return }
+            loadedMode = true
+            let current: UInt32? =
+                pane == .local ? state.localMode(of: entry) : entry.mode
+            if let current {
+                for i in 0..<9 { bits[i] = current & (1 << (8 - i)) != 0 }
+            }
         }
     }
 }

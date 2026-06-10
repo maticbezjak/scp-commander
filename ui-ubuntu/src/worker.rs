@@ -27,6 +27,7 @@ pub enum Cmd {
     Mkdir { path: String },
     Delete { path: String, is_dir: bool },
     Rename { from: String, to: String },
+    Chmod { path: String, mode: u32 },
 }
 
 pub enum Event {
@@ -138,6 +139,17 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                     with_session(&mut session, &send, |t| match t.rename(&from, &to) {
                         Ok(()) => send(Event::OpOk { message: format!("Renamed to {to}") }),
                         Err(e) => send(Event::Error(e.to_string())),
+                    });
+                }
+
+                Cmd::Chmod { path, mode } => {
+                    with_session(&mut session, &send, |t| {
+                        match t.set_permissions(&path, mode) {
+                            Ok(()) => send(Event::OpOk {
+                                message: format!("Permissions set to {mode:o}"),
+                            }),
+                            Err(e) => send(Event::Error(e.to_string())),
+                        }
                     });
                 }
             }

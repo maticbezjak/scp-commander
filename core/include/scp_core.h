@@ -91,6 +91,8 @@ int scp_mkdir(ScpSession *session, const char *path);
 int scp_remove_file(ScpSession *session, const char *path);
 int scp_remove_dir_all(ScpSession *session, const char *path);
 int scp_rename(ScpSession *session, const char *from, const char *to);
+/* mode is the unix permission bits, e.g. 0644. SFTP and FTP (SITE CHMOD). */
+int scp_chmod(ScpSession *session, const char *path, uint32_t mode);
 
 /* Closes the session and frees the handle. Safe to pass NULL. */
 void scp_disconnect_free(ScpSession *session);

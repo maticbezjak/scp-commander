@@ -126,6 +126,20 @@ impl Transport for SftpTransport {
             .map_err(|e| Error::Protocol(e.to_string()))
     }
 
+    fn set_permissions(&mut self, path: &str, mode: u32) -> Result<()> {
+        let stat = ssh2::FileStat {
+            size: None,
+            uid: None,
+            gid: None,
+            perm: Some(mode),
+            atime: None,
+            mtime: None,
+        };
+        self.sftp
+            .setstat(Path::new(path), stat)
+            .map_err(|e| Error::Protocol(e.to_string()))
+    }
+
     fn disconnect(&mut self) {
         let _ = self
             .session

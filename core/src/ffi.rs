@@ -491,6 +491,12 @@ pub extern "C" fn scp_remove_dir_all(session: *mut ScpSession, path: *const c_ch
     simple_op(session, path, |t, p| crate::ops::remove_dir_all(t, p))
 }
 
+/// Change unix permissions (mode, e.g. 0644 octal). Returns 0, or -1 on error.
+#[no_mangle]
+pub extern "C" fn scp_chmod(session: *mut ScpSession, path: *const c_char, mode: u32) -> c_int {
+    simple_op(session, path, |t, p| t.set_permissions(p, mode))
+}
+
 /// Rename/move a remote file or directory. Returns 0, or -1 on error.
 #[no_mangle]
 pub extern "C" fn scp_rename(

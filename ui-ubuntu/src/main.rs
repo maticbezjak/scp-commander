@@ -581,6 +581,69 @@ impl App {
         });
     }
 
+    fn menu_properties(self: &Rc<Self>, local_pane: bool) {
+        let Some(entry) = self.menu_entry(local_pane) else { return };
+        // Current mode: remote from the listing, local from the filesystem.
+        let current_mode = if local_pane {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(self.local_path.borrow().join(&entry.name))
+                    .map(|m| m.permissions().mode() & 0o777)
+                    .ok()
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        } else {
+            entry.perms.as_deref().and_then(parse_mode)
+        };
+        let location = if local_pane {
+            self.local_path.borrow().to_string_lossy().into_owned()
+        } else {
+            self.remote_path.borrow().clone()
+        };
+        // S3 has no permission model; everything else can try chmod.
+        let can_chmod = local_pane || proto_from_index(self.proto_dd.selected()) != Protocol::S3;
+
+        let state = self.clone();
+        let entry_for_apply = entry.clone();
+        properties_dialog(
+            &self.window,
+            &entry,
+            &location,
+            current_mode,
+            can_chmod,
+            move |mode| {
+                let entry = &entry_for_apply;
+                if local_pane {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let path = state.local_path.borrow().join(&entry.name);
+                        match std::fs::set_permissions(
+                            &path,
+                            std::fs::Permissions::from_mode(mode),
+                        ) {
+                            Ok(()) => {
+                                state.set_status(&format!(
+                                    "Permissions of {} set to {mode:o}",
+                                    entry.name
+                                ));
+                                state.load_local();
+                            }
+                            Err(e) => state.set_status(&format!("Error: {e}")),
+                        }
+                    }
+                } else {
+                    let path = join_posix(&state.remote_path.borrow(), &entry.name);
+                    let _ = state.cmd.send(Cmd::Chmod { path, mode });
+                }
+            },
+        );
+    }
+
     fn new_folder(self: &Rc<Self>, local_pane: bool) {
         let state = self.clone();
         prompt(&self.window, "New folder", "", move |name| {
@@ -1706,6 +1769,16 @@ fn make_pane(
     size_col.set_fixed_width(85);
     view.append_column(&size_col);
 
+    let type_col = text_column(
+        "Type",
+        0.0,
+        &view,
+        hook,
+        Rc::new(|e: &Entry| type_description(e)),
+    );
+    type_col.set_fixed_width(130);
+    view.append_column(&type_col);
+
     let changed_col = text_column(
         "Changed",
         0.0,
@@ -1822,6 +1895,10 @@ fn setup_context_menu(state: &Rc<App>, view: &ColumnView, hook: &MenuHook, local
     }
     {
         let s = state.clone();
+        add_item("Properties…", false, Box::new(move || s.menu_properties(local_pane)));
+    }
+    {
+        let s = state.clone();
         add_item("Delete", true, Box::new(move || s.menu_delete(local_pane)));
     }
 
@@ -1911,6 +1988,143 @@ fn save_site_dialog(
     win.present();
 }
 
+/// WinSCP-style Properties dialog: file info plus an rwx checkbox grid.
+fn properties_dialog(
+    parent: &ApplicationWindow,
+    entry: &Entry,
+    location: &str,
+    current_mode: Option<u32>,
+    can_chmod: bool,
+    on_apply: impl Fn(u32) + 'static,
+) {
+    let win = gtk::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title(format!("{} Properties", entry.name))
+        .default_width(360)
+        .resizable(false)
+        .build();
+
+    let info = gtk::Grid::builder().row_spacing(6).column_spacing(12).build();
+    let info_label = |text: &str| {
+        let l = Label::builder().label(text).xalign(0.0).build();
+        l.add_css_class("dim-label");
+        l
+    };
+    let value_label = |text: &str| {
+        let l = Label::builder().label(text).xalign(0.0).build();
+        l.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        l.set_max_width_chars(34);
+        l
+    };
+    let mut row = 0;
+    info.attach(&info_label("Location:"), 0, row, 1, 1);
+    info.attach(&value_label(location), 1, row, 1, 1);
+    row += 1;
+    info.attach(&info_label("Type:"), 0, row, 1, 1);
+    info.attach(&value_label(&type_description(entry)), 1, row, 1, 1);
+    row += 1;
+    if !entry.is_dir {
+        info.attach(&info_label("Size:"), 0, row, 1, 1);
+        info.attach(&value_label(&format!("{} bytes", entry.size)), 1, row, 1, 1);
+        row += 1;
+    }
+    if let Some(changed) = entry
+        .mtime
+        .and_then(|m| glib::DateTime::from_unix_local(m).ok())
+        .and_then(|dt| dt.format("%d.%m.%Y %H:%M").ok())
+    {
+        info.attach(&info_label("Changed:"), 0, row, 1, 1);
+        info.attach(&value_label(&changed), 1, row, 1, 1);
+    }
+
+    let content = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(10)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(14)
+        .margin_end(14)
+        .build();
+    content.append(&info);
+
+    let mut checks: Vec<gtk::CheckButton> = Vec::new();
+    let octal = Label::builder().xalign(0.0).build();
+    octal.add_css_class("dim-label");
+    octal.add_css_class("caption");
+    if can_chmod {
+        content.append(&gtk::Separator::new(Orientation::Horizontal));
+        let rights_title = Label::builder().label("Rights").xalign(0.0).build();
+        rights_title.add_css_class("heading");
+        content.append(&rights_title);
+
+        let grid = gtk::Grid::builder().row_spacing(4).column_spacing(14).build();
+        for (col, name) in ["Read", "Write", "Execute"].iter().enumerate() {
+            grid.attach(&info_label(name), col as i32 + 1, 0, 1, 1);
+        }
+        let mode = current_mode.unwrap_or(0);
+        for (group, name) in ["Owner", "Group", "Others"].iter().enumerate() {
+            grid.attach(&info_label(name), 0, group as i32 + 1, 1, 1);
+            for bit in 0..3 {
+                let check = gtk::CheckButton::new();
+                let index = group * 3 + bit;
+                check.set_active(mode & (1 << (8 - index)) != 0);
+                grid.attach(&check, bit as i32 + 1, group as i32 + 1, 1, 1);
+                checks.push(check);
+            }
+        }
+        content.append(&grid);
+        content.append(&octal);
+
+        // Keep the octal readout in sync with the checkboxes.
+        let update_octal = {
+            let checks = checks.clone();
+            let octal = octal.clone();
+            Rc::new(move || {
+                let mode = checks.iter().enumerate().fold(0u32, |acc, (i, c)| {
+                    if c.is_active() { acc | (1 << (8 - i)) } else { acc }
+                });
+                octal.set_text(&format!("Octal: {mode:03o}"));
+            })
+        };
+        update_octal();
+        for check in &checks {
+            let hook = update_octal.clone();
+            check.connect_toggled(move |_| hook());
+        }
+    }
+
+    let close = Button::with_label("Close");
+    let buttons = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    buttons.append(&close);
+    if can_chmod {
+        let apply = Button::with_label("Apply");
+        apply.add_css_class("suggested-action");
+        let checks = checks.clone();
+        let win2 = win.clone();
+        apply.connect_clicked(move |_| {
+            let mode = checks.iter().enumerate().fold(0u32, |acc, (i, c)| {
+                if c.is_active() { acc | (1 << (8 - i)) } else { acc }
+            });
+            on_apply(mode);
+            win2.close();
+        });
+        buttons.append(&apply);
+    }
+    content.append(&buttons);
+
+    {
+        let win = win.clone();
+        close.connect_clicked(move |_| win.close());
+    }
+    win.set_child(Some(&content));
+    win.present();
+}
+
 /// Small modal text prompt; calls `on_ok` with the entered string.
 fn prompt(
     parent: &ApplicationWindow,
@@ -1981,6 +2195,29 @@ fn add_drag_source(view: &ColumnView, kind: &'static str, pane: &Pane) {
         ))
     });
     view.add_controller(drag);
+}
+
+/// WinSCP-style "Type" column, from the shared-mime-info database.
+fn type_description(e: &Entry) -> String {
+    if e.is_dir {
+        return gio::functions::content_type_get_description("inode/directory").to_string();
+    }
+    let (ct, _uncertain) = gio::functions::content_type_guess(Some(e.name.as_str()), &[]);
+    gio::functions::content_type_get_description(&ct).to_string()
+}
+
+/// Parse "rwxr-xr-x" into permission bits (0o755).
+fn parse_mode(perms: &str) -> Option<u32> {
+    if perms.len() != 9 {
+        return None;
+    }
+    let mut mode = 0u32;
+    for (i, c) in perms.chars().enumerate() {
+        if c != '-' {
+            mode |= 1 << (8 - i);
+        }
+    }
+    Some(mode)
 }
 
 fn sort_entries(entries: &mut [Entry]) {
