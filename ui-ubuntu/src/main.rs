@@ -30,7 +30,7 @@ use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, ColumnView, ColumnViewColumn,
     DragSource, DropDown, DropTarget, Entry as GtkEntry, Label, ListBox, ListItem, Orientation,
     PasswordEntry, Popover, ProgressBar, ScrolledWindow, SelectionMode, SignalListItemFactory,
-    SingleSelection, StringList, StringObject,
+    SingleSelection,
 };
 
 use scp_core::types::{Auth, Credentials, Entry, HostKeyPolicy, Protocol};
@@ -62,7 +62,7 @@ fn main() -> glib::ExitCode {
 
 /// One pane's list widgets plus the entries backing the visible rows.
 struct Pane {
-    model: StringList,
+    model: gio::ListStore,
     selection: SingleSelection,
     entries: Rc<RefCell<Vec<Entry>>>,
     path_label: Label,
@@ -88,6 +88,8 @@ type MenuHook = Rc<RefCell<Option<Box<dyn Fn(u32, f64, f64)>>>>;
 struct App {
     cmd: mpsc::Sender<Cmd>,
     window: ApplicationWindow,
+    /// WinSCP-style Login dialog (modal; hidden on successful connect).
+    login_window: gtk::Window,
     local: Pane,
     remote: Pane,
     local_path: RefCell<PathBuf>,
@@ -148,11 +150,16 @@ impl App {
                 rd.filter_map(|e| e.ok())
                     .map(|e| {
                         let meta = e.metadata().ok();
+                        let mtime = meta
+                            .as_ref()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64);
                         Entry {
                             name: e.file_name().to_string_lossy().into_owned(),
                             is_dir: meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
                             size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                            mtime: None,
+                            mtime,
                             perms: None,
                         }
                     })
@@ -425,6 +432,22 @@ impl App {
     }
 
     // -- Context menu actions -------------------------------------------------
+
+    /// Point the menu index at the pane's selected row (for toolbar buttons
+    /// that reuse menu actions). Returns false when nothing is selected.
+    fn select_for_menu(&self, local_pane: bool) -> bool {
+        let pane = if local_pane { &self.local } else { &self.remote };
+        let idx = pane.selection.selected();
+        if (idx as usize) >= pane.entries.borrow().len() {
+            return false;
+        }
+        if local_pane {
+            self.local_menu_index.set(idx);
+        } else {
+            self.remote_menu_index.set(idx);
+        }
+        true
+    }
 
     fn menu_entry(&self, local_pane: bool) -> Option<Entry> {
         if local_pane {
@@ -754,6 +777,7 @@ impl App {
     fn handle_event(self: &Rc<Self>, event: Event) {
         match event {
             Event::Connected { path, entries } | Event::Listed { path, entries } => {
+                let first_connect = !*self.connected.borrow();
                 *self.connected.borrow_mut() = true;
                 let mut entries = entries;
                 sort_entries(&mut entries);
@@ -761,6 +785,28 @@ impl App {
                 self.remote.show(&entries, &path);
                 *self.remote_path.borrow_mut() = path.clone();
                 self.set_status(&format!("{path} ({count} items)"));
+                if first_connect || self.login_window.is_visible() {
+                    self.login_window.set_visible(false);
+                    let session = self
+                        .pending_connect
+                        .borrow()
+                        .as_ref()
+                        .map(|(c, _)| {
+                            let target = if c.host.is_empty() {
+                                c.bucket.clone().unwrap_or_default()
+                            } else {
+                                c.host.clone()
+                            };
+                            if c.username.is_empty() {
+                                target
+                            } else {
+                                format!("{}@{}", c.username, target)
+                            }
+                        })
+                        .unwrap_or_default();
+                    self.window
+                        .set_title(Some(&format!("{session} — SCP Commander")));
+                }
             }
             Event::HostKeyUnknown { fingerprint } => {
                 self.hostkey_label.set_text(&format!(
@@ -867,16 +913,9 @@ impl Pane {
 
     fn show(&self, entries: &[Entry], path: &str) {
         self.path_label.set_text(path);
-        while self.model.n_items() > 0 {
-            self.model.remove(0);
-        }
+        self.model.remove_all();
         for e in entries {
-            let line = if e.is_dir {
-                format!("{}/", e.name)
-            } else {
-                format!("{}  ·  {}", e.name, human_size(e.size))
-            };
-            self.model.append(&line);
+            self.model.append(&glib::BoxedAnyObject::new(e.clone()));
         }
         *self.entries.borrow_mut() = entries.to_vec();
     }
@@ -896,35 +935,130 @@ fn build_ui(app: &Application) {
         .default_height(640)
         .build();
 
-    // Connection bar --------------------------------------------------------
+    // Session form (lives in the WinSCP-style Login dialog) ------------------
     let proto_dd = DropDown::from_strings(&PROTO_LABELS);
     let auth_dd = DropDown::from_strings(&AUTH_LABELS);
-    let user_entry = GtkEntry::builder().placeholder_text("user").build();
-    let host_entry = GtkEntry::builder().placeholder_text("host").hexpand(true).build();
-    let port_entry = GtkEntry::builder().text("22").max_width_chars(5).width_chars(5).build();
-    let pass_entry = PasswordEntry::builder().show_peek_icon(true).build();
-    let key_entry = GtkEntry::builder()
-        .placeholder_text("private key path")
-        .visible(false)
-        .build();
+    let user_entry = GtkEntry::builder().build();
+    let host_entry = GtkEntry::builder().hexpand(true).build();
+    let port_entry = GtkEntry::builder().text("22").max_width_chars(6).width_chars(6).build();
+    let pass_entry = PasswordEntry::builder().show_peek_icon(true).hexpand(true).build();
+    let key_entry = GtkEntry::builder().hexpand(true).build();
     let key_browse = Button::from_icon_name("document-open-symbolic");
-    key_browse.set_visible(false);
     key_browse.set_tooltip_text(Some("Choose a private key"));
-    // S3 only — hidden until the picker selects S3.
-    let bucket_entry = GtkEntry::builder().placeholder_text("bucket").visible(false).build();
-    let region_entry = GtkEntry::builder()
-        .placeholder_text("region")
-        .max_width_chars(10)
-        .visible(false)
+    let bucket_entry = GtkEntry::builder().build();
+    let region_entry = GtkEntry::builder().placeholder_text("us-east-1").build();
+
+    let form_label = |text: &str| {
+        let l = Label::builder().label(text).xalign(0.0).build();
+        l.add_css_class("dim-label");
+        l
+    };
+    let proto_label = form_label("File protocol:");
+    let auth_label = form_label("Authentication:");
+    let host_label = form_label("Host name:");
+    let port_label = form_label("Port number:");
+    let user_label = form_label("User name:");
+    let pass_label = form_label("Password:");
+    let key_label = form_label("Private key:");
+    let bucket_label = form_label("Bucket:");
+    let region_label = form_label("Region:");
+
+    let key_row = GtkBox::builder().orientation(Orientation::Horizontal).spacing(4).build();
+    key_row.append(&key_entry);
+    key_row.append(&key_browse);
+
+    let form = gtk::Grid::builder()
+        .row_spacing(8)
+        .column_spacing(10)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .hexpand(true)
+        .valign(gtk::Align::Start)
         .build();
-    let connect_btn = Button::with_label("Connect");
-    connect_btn.add_css_class("suggested-action");
+    form.attach(&proto_label, 0, 0, 1, 1);
+    form.attach(&proto_dd, 1, 0, 1, 1);
+    form.attach(&auth_label, 0, 1, 1, 1);
+    form.attach(&auth_dd, 1, 1, 1, 1);
+    form.attach(&host_label, 0, 2, 1, 1);
+    form.attach(&host_entry, 1, 2, 2, 1);
+    form.attach(&port_label, 3, 2, 1, 1);
+    form.attach(&port_entry, 4, 2, 1, 1);
+    form.attach(&user_label, 0, 3, 1, 1);
+    form.attach(&user_entry, 1, 3, 1, 1);
+    form.attach(&pass_label, 0, 4, 1, 1);
+    form.attach(&pass_entry, 1, 4, 2, 1);
+    form.attach(&key_label, 0, 5, 1, 1);
+    form.attach(&key_row, 1, 5, 2, 1);
+    form.attach(&bucket_label, 0, 6, 1, 1);
+    form.attach(&bucket_entry, 1, 6, 1, 1);
+    form.attach(&region_label, 0, 7, 1, 1);
+    form.attach(&region_entry, 1, 7, 1, 1);
+
+    // The pickers drive the default port, field visibility, and label text.
+    let update_form = {
+        let proto_dd = proto_dd.clone();
+        let auth_dd = auth_dd.clone();
+        let port_entry = port_entry.clone();
+        let auth_label = auth_label.clone();
+        let auth_dd2 = auth_dd.clone();
+        let key_label = key_label.clone();
+        let key_row = key_row.clone();
+        let pass_label = pass_label.clone();
+        let pass_entry = pass_entry.clone();
+        let host_label = host_label.clone();
+        let user_label = user_label.clone();
+        let bucket_label = bucket_label.clone();
+        let bucket_entry = bucket_entry.clone();
+        let region_label = region_label.clone();
+        let region_entry = region_entry.clone();
+        Rc::new(move || {
+            let selected = proto_dd.selected();
+            let is_s3 = selected == 3;
+            let is_sftp = selected == 0;
+            let auth = if is_sftp { auth_dd.selected() } else { 0 };
+            port_entry
+                .set_text(&Credentials::default_port(proto_from_index(selected)).to_string());
+            auth_label.set_visible(is_sftp);
+            auth_dd2.set_visible(is_sftp);
+            let show_key = is_sftp && auth == 1;
+            key_label.set_visible(show_key);
+            key_row.set_visible(show_key);
+            let show_pass = !(is_sftp && auth == 2);
+            pass_label.set_visible(show_pass);
+            pass_entry.set_visible(show_pass);
+            pass_label.set_text(if is_s3 {
+                "Secret key:"
+            } else if show_key {
+                "Passphrase:"
+            } else {
+                "Password:"
+            });
+            host_label.set_text(if is_s3 { "Endpoint (blank = AWS):" } else { "Host name:" });
+            user_label.set_text(if is_s3 { "Access key:" } else { "User name:" });
+            bucket_label.set_visible(is_s3);
+            bucket_entry.set_visible(is_s3);
+            region_label.set_visible(is_s3);
+            region_entry.set_visible(is_s3);
+        })
+    };
+    let hook = update_form.clone();
+    proto_dd.connect_selected_notify(move |_| hook());
+    let hook = update_form.clone();
+    auth_dd.connect_selected_notify(move |_| hook());
+
+    // Login dialog buttons + main-window toolbar ------------------------------
+    let login_btn = Button::with_label("Login");
+    login_btn.add_css_class("suggested-action");
+    let close_btn = Button::with_label("Close");
+    let new_session_btn = Button::with_label("New Session…");
     let sync_up_btn = Button::from_icon_name("go-up-symbolic");
     sync_up_btn.set_tooltip_text(Some("Sync local → remote (upload changes)"));
     let sync_down_btn = Button::from_icon_name("go-down-symbolic");
     sync_down_btn.set_tooltip_text(Some("Sync remote → local (download changes)"));
 
-    let conn_bar = GtkBox::builder()
+    let main_toolbar = GtkBox::builder()
         .orientation(Orientation::Horizontal)
         .spacing(6)
         .margin_top(6)
@@ -932,67 +1066,18 @@ fn build_ui(app: &Application) {
         .margin_start(6)
         .margin_end(6)
         .build();
-    conn_bar.append(&proto_dd);
-    conn_bar.append(&auth_dd);
-    conn_bar.append(&user_entry);
-    conn_bar.append(&Label::new(Some("@")));
-    conn_bar.append(&host_entry);
-    conn_bar.append(&Label::new(Some(":")));
-    conn_bar.append(&port_entry);
-    conn_bar.append(&key_entry);
-    conn_bar.append(&key_browse);
-    conn_bar.append(&pass_entry);
-    conn_bar.append(&bucket_entry);
-    conn_bar.append(&region_entry);
-    conn_bar.append(&connect_btn);
-    conn_bar.append(&sync_up_btn);
-    conn_bar.append(&sync_down_btn);
-
-    // The pickers drive default port, S3/auth field visibility, placeholders.
-    let update_form = glib::clone!(
-        #[weak] proto_dd,
-        #[weak] auth_dd,
-        #[weak] port_entry,
-        #[weak] bucket_entry,
-        #[weak] region_entry,
-        #[weak] user_entry,
-        #[weak] host_entry,
-        #[weak] key_entry,
-        #[weak] key_browse,
-        #[weak] pass_entry,
-        move || {
-            let selected = proto_dd.selected();
-            let is_s3 = selected == 3;
-            let is_sftp = selected == 0;
-            let p = Credentials::default_port(proto_from_index(selected));
-            port_entry.set_text(&p.to_string());
-            bucket_entry.set_visible(is_s3);
-            region_entry.set_visible(is_s3);
-            auth_dd.set_visible(is_sftp);
-            let auth = if is_sftp { auth_dd.selected() } else { 0 };
-            key_entry.set_visible(is_sftp && auth == 1);
-            key_browse.set_visible(is_sftp && auth == 1);
-            pass_entry.set_visible(!(is_sftp && auth == 2));
-            user_entry.set_placeholder_text(Some(if is_s3 { "access key" } else { "user" }));
-            host_entry.set_placeholder_text(Some(if is_s3 {
-                "endpoint (blank = AWS)"
-            } else {
-                "host"
-            }));
-        }
-    );
-    let hook = update_form.clone();
-    proto_dd.connect_selected_notify(move |_| hook());
-    let hook = update_form.clone();
-    auth_dd.connect_selected_notify(move |_| hook());
+    main_toolbar.append(&new_session_btn);
+    main_toolbar.append(&gtk::Separator::new(Orientation::Vertical));
+    main_toolbar.append(&sync_up_btn);
+    main_toolbar.append(&sync_down_btn);
 
     // Panes ------------------------------------------------------------------
     let local_hook: MenuHook = Rc::new(RefCell::new(None));
     let remote_hook: MenuHook = Rc::new(RefCell::new(None));
-    let (local_widget, local_pane, local_view, local_up_btn, local_new_btn) =
-        make_pane("Local", &local_hook);
-    let (remote_widget, remote_pane, remote_view, remote_up_btn, remote_new_btn) =
-        make_pane("Remote", &remote_hook);
+    let (local_widget, local_pane, local_view, local_header) =
+        make_pane("Local", &local_hook, false);
+    let (remote_widget, remote_pane, remote_view, remote_header) =
+        make_pane("Remote", &remote_hook, true);
 
     let panes = GtkBox::builder()
         .orientation(Orientation::Horizontal)
@@ -1095,29 +1180,62 @@ fn build_ui(app: &Application) {
 
     let sidebar = GtkBox::builder()
         .orientation(Orientation::Vertical)
-        .width_request(180)
+        .width_request(200)
         .build();
     sidebar.append(&sites_header);
     sidebar.append(&ScrolledWindow::builder().vexpand(true).child(&sites_list).build());
 
+    // Login dialog (WinSCP-style): sites left, session form right ---------------
+    let login_window = gtk::Window::builder()
+        .title("Login")
+        .modal(true)
+        .transient_for(&window)
+        .default_width(740)
+        .default_height(460)
+        .hide_on_close(true)
+        .build();
+
+    let login_main = GtkBox::builder().orientation(Orientation::Horizontal).build();
+    login_main.append(&sidebar);
+    login_main.append(&gtk::Separator::new(Orientation::Vertical));
+    login_main.append(&form);
+
+    let login_buttons = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .margin_top(8)
+        .margin_bottom(10)
+        .margin_start(10)
+        .margin_end(10)
+        .build();
+    let login_spacer = GtkBox::builder().hexpand(true).build();
+    login_buttons.append(&login_spacer);
+    login_buttons.append(&close_btn);
+    login_buttons.append(&login_btn);
+
+    let login_content = GtkBox::builder().orientation(Orientation::Vertical).build();
+    login_content.append(&login_main);
+    login_content.append(&hostkey_bar);
+    login_content.append(&gtk::Separator::new(Orientation::Horizontal));
+    login_content.append(&login_buttons);
+    login_window.set_child(Some(&login_content));
+    login_window.set_default_widget(Some(&login_btn));
+
     // Root layout ---------------------------------------------------------------
     let content = GtkBox::builder().orientation(Orientation::Vertical).build();
-    content.append(&conn_bar);
+    content.append(&main_toolbar);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
-    content.append(&hostkey_bar);
     content.append(&panes);
     content.append(&transfers_panel);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
     content.append(&status);
 
-    let root = GtkBox::builder().orientation(Orientation::Horizontal).build();
-    root.append(&sidebar);
-    root.append(&gtk::Separator::new(Orientation::Vertical));
-    root.append(&content);
+    let root = content;
 
     let state = Rc::new(App {
         cmd,
         window: window.clone(),
+        login_window: login_window.clone(),
         local: local_pane,
         remote: remote_pane,
         local_path: RefCell::new(glib::home_dir()),
@@ -1159,9 +1277,17 @@ fn build_ui(app: &Application) {
     setup_context_menu(&state, &remote_view, &remote_hook, false);
 
     // Wire signals ----------------------------------------------------------------
-    connect_btn.connect_clicked(glib::clone!(
+    login_btn.connect_clicked(glib::clone!(
         #[strong] state,
         move |_| state.connect_clicked()
+    ));
+    close_btn.connect_clicked(glib::clone!(
+        #[strong] login_window,
+        move |_| login_window.set_visible(false)
+    ));
+    new_session_btn.connect_clicked(glib::clone!(
+        #[strong] login_window,
+        move |_| login_window.present()
     ));
     sync_up_btn.connect_clicked(glib::clone!(
         #[strong] state,
@@ -1315,10 +1441,8 @@ fn build_ui(app: &Application) {
         #[strong] state,
         move |_, position| state.open_remote(position)
     ));
-    local_up_btn.connect_clicked(glib::clone!(#[strong] state, move |_| state.local_up()));
-    remote_up_btn.connect_clicked(glib::clone!(#[strong] state, move |_| state.remote_up()));
-    local_new_btn.connect_clicked(glib::clone!(#[strong] state, move |_| state.new_folder(true)));
-    remote_new_btn.connect_clicked(glib::clone!(#[strong] state, move |_| state.new_folder(false)));
+    build_pane_toolbar(&state, &local_header, true);
+    build_pane_toolbar(&state, &remote_header, false);
 
     // Drag and drop between panes -----------------------------------------------
     add_drag_source(&local_view, "local", &state.local);
@@ -1390,75 +1514,237 @@ fn build_ui(app: &Application) {
 
     window.set_child(Some(&root));
     window.present();
+    // WinSCP opens with the Login dialog.
+    login_window.present();
 }
 
-/// Build a titled pane: header (title + new-folder + up buttons), path label,
-/// file list. Rows get a right-click gesture that fires the pane's MenuHook
-/// with (row index, x, y) in view coordinates.
-fn make_pane(
-    title: &str,
-    hook: &MenuHook,
-) -> (GtkBox, Pane, ColumnView, Button, Button) {
-    let model = StringList::new(&[]);
-    let selection = SingleSelection::new(Some(model.clone()));
-    let view = ColumnView::new(Some(selection.clone()));
+/// WinSCP-style per-pane command toolbar appended to the pane header:
+/// up · refresh · new folder · transfer · edit (remote) · delete.
+fn build_pane_toolbar(state: &Rc<App>, header: &GtkBox, local_pane: bool) {
+    let tool = |icon: &str, tip: &str| {
+        let b = Button::from_icon_name(icon);
+        b.add_css_class("flat");
+        b.set_tooltip_text(Some(tip));
+        header.append(&b);
+        b
+    };
 
+    let up = tool("go-up-symbolic", "Parent directory");
+    up.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| if local_pane { state.local_up() } else { state.remote_up() }
+    ));
+
+    let refresh = tool("view-refresh-symbolic", "Refresh");
+    refresh.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| if local_pane { state.load_local() } else { state.refresh_remote() }
+    ));
+
+    let newf = tool("folder-new-symbolic", "New folder");
+    newf.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| state.new_folder(local_pane)
+    ));
+
+    header.append(&gtk::Separator::new(Orientation::Vertical));
+
+    let transfer = tool(
+        if local_pane { "send-to-symbolic" } else { "document-save-symbolic" },
+        if local_pane { "Upload" } else { "Download" },
+    );
+    transfer.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| {
+            if state.select_for_menu(local_pane) {
+                state.menu_transfer(local_pane);
+            }
+        }
+    ));
+
+    if !local_pane {
+        let edit = tool("document-edit-symbolic", "Edit (auto-upload on save)");
+        edit.connect_clicked(glib::clone!(
+            #[strong] state,
+            move |_| {
+                if state.select_for_menu(false) {
+                    state.menu_edit();
+                }
+            }
+        ));
+    }
+
+    let del = tool("user-trash-symbolic", "Delete");
+    del.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| {
+            if state.select_for_menu(local_pane) {
+                state.menu_delete(local_pane);
+            }
+        }
+    ));
+}
+
+/// Attach the right-click menu gesture to a row cell widget.
+fn add_menu_gesture(widget: &impl IsA<gtk::Widget>, item: &ListItem, view: &ColumnView, hook: &MenuHook) {
+    let gesture = gtk::GestureClick::builder().button(3).build();
+    let widget_c = widget.clone().upcast::<gtk::Widget>();
+    gesture.connect_pressed(glib::clone!(
+        #[strong] hook,
+        #[weak] view,
+        #[weak] item,
+        #[weak] widget_c,
+        move |_, _, x, y| {
+            let point = widget_c.compute_point(
+                &view,
+                &gtk::graphene::Point::new(x as f32, y as f32),
+            );
+            if let (Some(p), Some(cb)) = (point, hook.borrow().as_ref()) {
+                cb(item.position(), p.x() as f64, p.y() as f64);
+            }
+        }
+    ));
+    widget.add_controller(gesture);
+}
+
+/// A text column whose cell content is rendered from the row's Entry.
+fn text_column(
+    title: &str,
+    xalign: f32,
+    view: &ColumnView,
+    hook: &MenuHook,
+    render: Rc<dyn Fn(&Entry) -> String>,
+) -> ColumnViewColumn {
     let factory = SignalListItemFactory::new();
     factory.connect_setup(glib::clone!(
         #[strong] hook,
         #[weak] view,
         move |_, item| {
             let item = item.downcast_ref::<ListItem>().unwrap().clone();
-            let label = Label::builder().xalign(0.0).build();
+            let label = Label::builder().xalign(xalign).build();
+            label.add_css_class("numeric");
             item.set_child(Some(&label));
-
-            let gesture = gtk::GestureClick::builder().button(3).build();
-            gesture.connect_pressed(glib::clone!(
-                #[strong] hook,
-                #[weak] view,
-                #[weak] item,
-                #[weak] label,
-                move |_, _, x, y| {
-                    let point = label.compute_point(
-                        &view,
-                        &gtk::graphene::Point::new(x as f32, y as f32),
-                    );
-                    if let (Some(p), Some(cb)) = (point, hook.borrow().as_ref()) {
-                        cb(item.position(), p.x() as f64, p.y() as f64);
-                    }
-                }
-            ));
-            label.add_controller(gesture);
+            add_menu_gesture(&label, &item, &view, &hook);
         }
     ));
-    factory.connect_bind(|_, item| {
-        let item = item.downcast_ref::<ListItem>().unwrap();
-        let label = item.child().and_downcast::<Label>().unwrap();
-        let text = item
-            .item()
-            .and_downcast::<StringObject>()
-            .map(|s| s.string().to_string())
-            .unwrap_or_default();
-        label.set_text(&text);
-    });
+    factory.connect_bind(glib::clone!(
+        #[strong] render,
+        move |_, item| {
+            let item = item.downcast_ref::<ListItem>().unwrap();
+            let label = item.child().and_downcast::<Label>().unwrap();
+            let text = item
+                .item()
+                .and_downcast::<glib::BoxedAnyObject>()
+                .map(|o| render(&o.borrow::<Entry>()))
+                .unwrap_or_default();
+            label.set_text(&text);
+        }
+    ));
+    ColumnViewColumn::new(Some(title), Some(factory))
+}
 
-    let column = ColumnViewColumn::new(Some("Name"), Some(factory));
-    column.set_expand(true);
-    view.append_column(&column);
+/// Build a titled pane with WinSCP-style columns (Name | Size | Changed
+/// [| Rights]), a header (title + action buttons appended later by build_ui),
+/// and a path label. Rows get a right-click gesture firing the pane's
+/// MenuHook with (row index, x, y) in view coordinates.
+fn make_pane(
+    title: &str,
+    hook: &MenuHook,
+    show_rights: bool,
+) -> (GtkBox, Pane, ColumnView, GtkBox) {
+    let model = gio::ListStore::new::<glib::BoxedAnyObject>();
+    let selection = SingleSelection::new(Some(model.clone()));
+    let view = ColumnView::new(Some(selection.clone()));
+    view.add_css_class("data-table");
+
+    // Name column: icon + label.
+    let name_factory = SignalListItemFactory::new();
+    name_factory.connect_setup(glib::clone!(
+        #[strong] hook,
+        #[weak] view,
+        move |_, item| {
+            let item = item.downcast_ref::<ListItem>().unwrap().clone();
+            let row = GtkBox::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(6)
+                .build();
+            let icon = gtk::Image::new();
+            let label = Label::builder().xalign(0.0).build();
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            row.append(&icon);
+            row.append(&label);
+            item.set_child(Some(&row));
+            add_menu_gesture(&row, &item, &view, &hook);
+        }
+    ));
+    name_factory.connect_bind(|_, item| {
+        let item = item.downcast_ref::<ListItem>().unwrap();
+        let row = item.child().and_downcast::<GtkBox>().unwrap();
+        let icon = row.first_child().and_downcast::<gtk::Image>().unwrap();
+        let label = row.last_child().and_downcast::<Label>().unwrap();
+        if let Some(obj) = item.item().and_downcast::<glib::BoxedAnyObject>() {
+            let entry = obj.borrow::<Entry>();
+            icon.set_icon_name(Some(if entry.is_dir {
+                "folder-symbolic"
+            } else {
+                "text-x-generic-symbolic"
+            }));
+            label.set_text(&entry.name);
+        }
+    });
+    let name_col = ColumnViewColumn::new(Some("Name"), Some(name_factory));
+    name_col.set_expand(true);
+    view.append_column(&name_col);
+
+    let size_col = text_column(
+        "Size",
+        1.0,
+        &view,
+        hook,
+        Rc::new(|e: &Entry| if e.is_dir { String::new() } else { human_size(e.size) }),
+    );
+    size_col.set_fixed_width(85);
+    view.append_column(&size_col);
+
+    let changed_col = text_column(
+        "Changed",
+        0.0,
+        &view,
+        hook,
+        Rc::new(|e: &Entry| {
+            e.mtime
+                .and_then(|m| glib::DateTime::from_unix_local(m).ok())
+                .and_then(|dt| dt.format("%d.%m.%Y %H:%M").ok())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        }),
+    );
+    changed_col.set_fixed_width(130);
+    view.append_column(&changed_col);
+
+    if show_rights {
+        let rights_col = text_column(
+            "Rights",
+            0.0,
+            &view,
+            hook,
+            Rc::new(|e: &Entry| e.perms.clone().unwrap_or_default()),
+        );
+        rights_col.set_fixed_width(95);
+        view.append_column(&rights_col);
+    }
+
     view.set_single_click_activate(false);
 
-    let header = GtkBox::builder().orientation(Orientation::Horizontal).build();
-    let title_label = Label::builder().label(title).xalign(0.0).hexpand(true).build();
+    // WinSCP-style pane toolbar strip; build_ui appends the action buttons.
+    let header = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(2)
+        .build();
+    let title_label = Label::builder().label(title).xalign(0.0).build();
     title_label.add_css_class("heading");
-    let new_btn = Button::from_icon_name("folder-new-symbolic");
-    new_btn.add_css_class("flat");
-    new_btn.set_tooltip_text(Some("New folder"));
-    let up_btn = Button::from_icon_name("go-up-symbolic");
-    up_btn.add_css_class("flat");
-    up_btn.set_tooltip_text(Some("Parent directory"));
+    title_label.set_margin_end(8);
     header.append(&title_label);
-    header.append(&new_btn);
-    header.append(&up_btn);
 
     let path_label = Label::builder()
         .xalign(0.0)
@@ -1483,7 +1769,7 @@ fn make_pane(
         entries: Rc::new(RefCell::new(Vec::new())),
         path_label,
     };
-    (pane_box, pane, view, up_btn, new_btn)
+    (pane_box, pane, view, header)
 }
 
 /// Wire a pane's right-click context menu: a Popover of action buttons

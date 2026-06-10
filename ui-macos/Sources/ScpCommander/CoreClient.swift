@@ -19,11 +19,12 @@ enum Proto: Int32, Codable, CaseIterable {
 
 /// One row in a directory listing (local or remote).
 struct FileEntry: Identifiable, Hashable {
-    let id = UUID()
-    let name: String
-    let isDir: Bool
-    let size: UInt64
-    let perms: String?
+    var id = UUID()
+    var name: String
+    var isDir: Bool
+    var size: UInt64
+    var mtime: Date? = nil
+    var perms: String?
 }
 
 struct CoreError: LocalizedError {
@@ -266,7 +267,10 @@ final class CoreClient: @unchecked Sendable {
         let data = Data(json.utf8)
         let wire = try JSONDecoder().decode([Wire].self, from: data)
         return wire.map {
-            FileEntry(name: $0.name, isDir: $0.is_dir, size: $0.size, perms: $0.perms)
+            FileEntry(
+                name: $0.name, isDir: $0.is_dir, size: $0.size,
+                mtime: $0.mtime.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                perms: $0.perms)
         }
     }
 }

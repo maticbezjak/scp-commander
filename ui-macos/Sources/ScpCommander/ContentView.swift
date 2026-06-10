@@ -19,6 +19,8 @@ enum PaneKind {
     case remote
 }
 
+// MARK: - Main window (WinSCP-style)
+
 struct ContentView: View {
     @EnvironmentObject var state: AppState
 
@@ -30,78 +32,56 @@ struct ContentView: View {
     @State private var deleteTarget: (pane: PaneKind, entry: FileEntry)?
 
     var body: some View {
-        HStack(spacing: 0) {
-            SitesSidebar(store: state.sites)
-                .frame(width: 190)
+        VStack(spacing: 0) {
+            TopBar()
             Divider()
-            VStack(spacing: 0) {
-                ConnectionBar()
-                Divider()
-                HSplitView {
-                    FilePane(
-                        kind: "local",
-                        title: "Local",
-                        path: state.localPath,
-                        entries: state.localEntries,
-                        onUp: { state.localUp() },
-                        onOpen: { state.openLocal($0) },
-                        transferLabel: "Upload →",
-                        onTransfer: { state.upload($0) },
-                        onDrop: { if $0.pane == "remote" { state.downloadByName($0.name) } },
-                        onRename: { beginRename(.local, $0) },
-                        onDelete: { deleteTarget = (.local, $0) },
-                        onNewFolder: { beginNewFolder(.local) },
-                        onEdit: nil
-                    )
-                    FilePane(
-                        kind: "remote",
-                        title: "Remote",
-                        path: state.remotePath,
-                        entries: state.remoteEntries,
-                        onUp: { state.remoteUp() },
-                        onOpen: { state.openRemote($0) },
-                        transferLabel: "← Download",
-                        onTransfer: { state.download($0) },
-                        onDrop: { if $0.pane == "local" { state.uploadByName($0.name) } },
-                        onRename: { beginRename(.remote, $0) },
-                        onDelete: { deleteTarget = (.remote, $0) },
-                        onNewFolder: { beginNewFolder(.remote) },
-                        onEdit: { state.editRemote($0) }
-                    )
-                }
-                TransfersPanel(queue: state.transfers)
-                Divider()
-                StatusBar()
+            HSplitView {
+                FilePane(
+                    kind: "local",
+                    title: "Local",
+                    path: state.localPath,
+                    entries: state.localEntries,
+                    showRights: false,
+                    onUp: { state.localUp() },
+                    onRefresh: { state.loadLocal() },
+                    onOpen: { state.openLocal($0) },
+                    transferLabel: "Upload",
+                    onTransfer: { state.upload($0) },
+                    onDrop: { if $0.pane == "remote" { state.downloadByName($0.name) } },
+                    onRename: { beginRename(.local, $0) },
+                    onDelete: { deleteTarget = (.local, $0) },
+                    onNewFolder: { beginNewFolder(.local) },
+                    onEdit: nil
+                )
+                FilePane(
+                    kind: "remote",
+                    title: "Remote",
+                    path: state.remotePath,
+                    entries: state.remoteEntries,
+                    showRights: true,
+                    onUp: { state.remoteUp() },
+                    onRefresh: { state.refreshRemote() },
+                    onOpen: { state.openRemote($0) },
+                    transferLabel: "Download",
+                    onTransfer: { state.download($0) },
+                    onDrop: { if $0.pane == "local" { state.uploadByName($0.name) } },
+                    onRename: { beginRename(.remote, $0) },
+                    onDelete: { deleteTarget = (.remote, $0) },
+                    onNewFolder: { beginNewFolder(.remote) },
+                    onEdit: { state.editRemote($0) }
+                )
             }
+            TransfersPanel(queue: state.transfers)
+            Divider()
+            StatusBar()
         }
         .frame(minWidth: 1000, minHeight: 560)
-        .sheet(isPresented: $state.saveSitePrompt) {
-            SaveSiteSheet().environmentObject(state)
-        }
-        .alert(
-            "Unknown server host key",
-            isPresented: Binding(
-                get: { state.hostKeyPrompt != nil },
-                set: { if !$0 { state.hostKeyPrompt = nil } }
-            )
-        ) {
-            Button("Trust & Connect") {
-                if let fp = state.hostKeyPrompt {
-                    state.hostKeyPrompt = nil
-                    state.connect(trustingFingerprint: fp)
-                }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(
-                """
-                This server has not been seen before. Its key fingerprint is:
-
-                \(state.hostKeyPrompt ?? "")
-
-                If you expected a first-time connection, verify this matches \
-                the server's actual fingerprint before trusting it.
-                """)
+        .navigationTitle(
+            state.isConnected
+                ? "\(state.user.isEmpty ? "" : "\(state.user)@")\(state.host) — SCP Commander"
+                : "SCP Commander")
+        .sheet(isPresented: $state.showLogin) {
+            LoginSheet().environmentObject(state)
         }
         .alert(
             "Rename",
@@ -177,7 +157,191 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Sites sidebar
+/// Slim main-window toolbar: session controls live in the Login dialog now.
+private struct TopBar: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button {
+                state.showLogin = true
+            } label: {
+                Label("New Session", systemImage: "network")
+            }
+
+            if state.isConnected {
+                Text("\(state.user.isEmpty ? "" : "\(state.user)@")\(state.host)")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+
+                Menu {
+                    Button("Local → Remote (upload changes)") { state.sync(download: false) }
+                    Button("Remote → Local (download changes)") { state.sync(download: true) }
+                } label: {
+                    Label("Synchronize", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+
+            if state.busy { ProgressView().scaleEffect(0.6).frame(width: 18, height: 18) }
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+    }
+}
+
+// MARK: - Login dialog (WinSCP-style)
+
+private struct LoginSheet: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                SitesSidebar(store: state.sites)
+                    .frame(width: 210)
+                Divider()
+                SessionForm()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+            Divider()
+            HStack {
+                Button("Save site…") { state.beginSaveSite() }
+                    .disabled(state.host.isEmpty && state.bucket.isEmpty)
+                Spacer()
+                if state.busy { ProgressView().scaleEffect(0.6).frame(width: 18, height: 18) }
+                Button("Close") { state.showLogin = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Login") { state.connect() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        state.busy
+                            || (state.proto == .s3 ? state.bucket.isEmpty : state.host.isEmpty))
+            }
+            .padding(10)
+        }
+        .frame(width: 760, height: 440)
+        .sheet(isPresented: $state.saveSitePrompt) {
+            SaveSiteSheet().environmentObject(state)
+        }
+        .alert(
+            "Unknown server host key",
+            isPresented: Binding(
+                get: { state.hostKeyPrompt != nil },
+                set: { if !$0 { state.hostKeyPrompt = nil } }
+            )
+        ) {
+            Button("Trust & Connect") {
+                if let fp = state.hostKeyPrompt {
+                    state.hostKeyPrompt = nil
+                    state.connect(trustingFingerprint: fp)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                """
+                This server has not been seen before. Its key fingerprint is:
+
+                \(state.hostKeyPrompt ?? "")
+
+                If you expected a first-time connection, verify this matches \
+                the server's actual fingerprint before trusting it.
+                """)
+        }
+    }
+}
+
+/// The right-hand "Session" form of the Login dialog.
+private struct SessionForm: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        let isS3 = state.proto == .s3
+        let isSftp = state.proto == .sftp
+
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Session").font(.headline).foregroundStyle(.secondary)
+
+            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
+                GridRow {
+                    Text("File protocol:")
+                    Picker("", selection: $state.proto) {
+                        ForEach(Proto.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    .labelsHidden()
+                    .frame(width: 110)
+                }
+                if isSftp {
+                    GridRow {
+                        Text("Authentication:")
+                        Picker("", selection: $state.authMode) {
+                            ForEach(AuthMode.allCases, id: \.self) { Text($0.label).tag($0) }
+                        }
+                        .labelsHidden()
+                        .frame(width: 140)
+                    }
+                }
+                GridRow {
+                    Text(isS3 ? "Endpoint:" : "Host name:")
+                    HStack {
+                        TextField(isS3 ? "blank = AWS" : "host", text: $state.host)
+                            .frame(minWidth: 220)
+                        Text("Port:").foregroundStyle(.secondary)
+                        TextField("port", text: $state.port).frame(width: 56)
+                    }
+                }
+                GridRow {
+                    Text(isS3 ? "Access key:" : "User name:")
+                    TextField("", text: $state.user).frame(width: 180)
+                }
+                if isSftp && state.authMode == .keyFile {
+                    GridRow {
+                        Text("Private key:")
+                        HStack {
+                            TextField("key file", text: $state.keyPath).frame(minWidth: 220)
+                            Button("…") {
+                                let panel = NSOpenPanel()
+                                panel.canChooseFiles = true
+                                panel.canChooseDirectories = false
+                                panel.directoryURL = FileManager.default
+                                    .homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
+                                if panel.runModal() == .OK {
+                                    state.keyPath = panel.url?.path ?? ""
+                                }
+                            }
+                        }
+                    }
+                    GridRow {
+                        Text("Passphrase:")
+                        SecureField("", text: $state.password).frame(width: 180)
+                    }
+                } else if !(isSftp && state.authMode == .agent) {
+                    GridRow {
+                        Text(isS3 ? "Secret key:" : "Password:")
+                        SecureField("", text: $state.password).frame(width: 180)
+                    }
+                }
+                if isS3 {
+                    GridRow {
+                        Text("Bucket:")
+                        TextField("", text: $state.bucket).frame(width: 180)
+                    }
+                    GridRow {
+                        Text("Region:")
+                        TextField("us-east-1", text: $state.region).frame(width: 180)
+                    }
+                }
+            }
+            Spacer()
+        }
+        .padding(14)
+    }
+}
+
+// MARK: - Sites sidebar (inside the Login dialog)
 
 private struct SitesSidebar: View {
     @EnvironmentObject var state: AppState
@@ -188,18 +352,6 @@ private struct SitesSidebar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("Sites").font(.headline)
-                Spacer()
-                Button(action: { state.beginSaveSite() }) {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(.borderless)
-                .help("Save current session as a site (use Folder/Name to group)")
-            }
-            .padding(8)
-            Divider()
-
             List {
                 ForEach(store.folders, id: \.self) { folder in
                     Section {
@@ -237,7 +389,7 @@ private struct SitesSidebar: View {
     /// logs in, right click for the full menu.
     private func row(for site: Site) -> some View {
         HStack(spacing: 6) {
-            Image(systemName: "bookmark.fill").foregroundStyle(.tint)
+            Image(systemName: "display").foregroundStyle(.tint)
             VStack(alignment: .leading, spacing: 1) {
                 Text(site.displayName).lineLimit(1)
                 Text(site.proto.label).font(.caption2).foregroundStyle(.secondary)
@@ -286,93 +438,20 @@ private struct SaveSiteSheet: View {
     }
 }
 
-// MARK: - Connection bar
+// MARK: - File pane (multi-column, WinSCP-style)
 
-private struct ConnectionBar: View {
-    @EnvironmentObject var state: AppState
-
-    var body: some View {
-        HStack(spacing: 8) {
-            let isS3 = state.proto == .s3
-            let isSftp = state.proto == .sftp
-
-            Picker("", selection: $state.proto) {
-                ForEach(Proto.allCases, id: \.self) { Text($0.label).tag($0) }
-            }
-            .labelsHidden()
-            .frame(width: 80)
-
-            if isSftp {
-                Picker("", selection: $state.authMode) {
-                    ForEach(AuthMode.allCases, id: \.self) { Text($0.label).tag($0) }
-                }
-                .labelsHidden()
-                .frame(width: 100)
-            }
-
-            TextField(isS3 ? "access key" : "user", text: $state.user).frame(width: 100)
-            Text("@").foregroundStyle(.secondary)
-            TextField(isS3 ? "endpoint (blank = AWS)" : "host", text: $state.host)
-                .frame(minWidth: 120)
-            TextField("port", text: $state.port).frame(width: 50)
-
-            if isSftp && state.authMode == .keyFile {
-                TextField("key file", text: $state.keyPath).frame(width: 120)
-                Button("…") {
-                    let panel = NSOpenPanel()
-                    panel.canChooseFiles = true
-                    panel.canChooseDirectories = false
-                    panel.directoryURL = FileManager.default
-                        .homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
-                    if panel.runModal() == .OK {
-                        state.keyPath = panel.url?.path ?? ""
-                    }
-                }
-                .help("Choose a private key")
-                SecureField("passphrase", text: $state.password).frame(width: 110)
-            } else if !(isSftp && state.authMode == .agent) {
-                SecureField(isS3 ? "secret key" : "password", text: $state.password)
-                    .frame(width: 120)
-            }
-
-            if isS3 {
-                TextField("bucket", text: $state.bucket).frame(width: 100)
-                TextField("region", text: $state.region).frame(width: 80)
-            }
-
-            Button(action: { state.connect() }) {
-                Text(state.isConnected ? "Reconnect" : "Connect")
-            }
-            .keyboardShortcut(.return, modifiers: [])
-            .disabled(state.busy || (isS3 ? state.bucket.isEmpty : state.host.isEmpty))
-
-            if state.isConnected {
-                Menu {
-                    Button("Local → Remote (upload changes)") { state.sync(download: false) }
-                    Button("Remote → Local (download changes)") { state.sync(download: true) }
-                } label: {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                }
-                .menuStyle(.borderlessButton)
-                .frame(width: 40)
-                .help("Synchronize the current folders")
-            }
-
-            if state.busy { ProgressView().scaleEffect(0.6).frame(width: 18, height: 18) }
-            Spacer()
-        }
-        .padding(8)
-    }
+private enum SortKey {
+    case name, size, mtime
 }
-
-// MARK: - File pane
 
 private struct FilePane: View {
     let kind: String
     let title: String
     let path: String
     let entries: [FileEntry]
+    let showRights: Bool
     let onUp: () -> Void
+    let onRefresh: () -> Void
     let onOpen: (FileEntry) -> Void
     let transferLabel: String
     let onTransfer: (FileEntry) -> Void
@@ -383,21 +462,33 @@ private struct FilePane: View {
     let onEdit: ((FileEntry) -> Void)?
 
     @State private var selection: FileEntry.ID?
+    @State private var sortKey: SortKey = .name
+    @State private var ascending = true
+
+    private var selectedEntry: FileEntry? {
+        entries.first { $0.id == selection }
+    }
+
+    /// Directories first (always), then the active column sort.
+    private var sorted: [FileEntry] {
+        entries.sorted { a, b in
+            if a.isDir != b.isDir { return a.isDir }
+            let result: Bool
+            switch sortKey {
+            case .name:
+                result = a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            case .size:
+                result = a.size < b.size
+            case .mtime:
+                result = (a.mtime ?? .distantPast) < (b.mtime ?? .distantPast)
+            }
+            return ascending ? result : !result
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text(title).font(.headline)
-                Spacer()
-                Button(action: onNewFolder) { Image(systemName: "folder.badge.plus") }
-                    .help("New folder")
-                    .buttonStyle(.borderless)
-                Button(action: onUp) { Image(systemName: "arrow.up") }
-                    .help("Parent directory")
-                    .buttonStyle(.borderless)
-            }
-            .padding(.horizontal, 8).padding(.vertical, 4)
-
+            paneToolbar
             Text(path)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -405,34 +496,13 @@ private struct FilePane: View {
                 .truncationMode(.head)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 8)
-
+                .padding(.bottom, 2)
             Divider()
-
+            columnHeader
+            Divider()
             List(selection: $selection) {
-                ForEach(entries) { entry in
-                    EntryRow(entry: entry)
-                        .tag(entry.id)
-                        .contentShape(Rectangle())
-                        .onTapGesture(count: 2) { onOpen(entry) }
-                        .draggable(DraggedFile(pane: kind, name: entry.name))
-                        .contextMenu {
-                            if entry.isDir {
-                                Button("Open") { onOpen(entry) }
-                                Button(transferLabel.replacingOccurrences(
-                                    of: "→", with: "folder →"
-                                ).replacingOccurrences(of: "←", with: "← folder")) {
-                                    onTransfer(entry)
-                                }
-                            } else {
-                                Button(transferLabel) { onTransfer(entry) }
-                                if let onEdit {
-                                    Button("Edit (auto-upload on save)") { onEdit(entry) }
-                                }
-                            }
-                            Divider()
-                            Button("Rename…") { onRename(entry) }
-                            Button("Delete", role: .destructive) { onDelete(entry) }
-                        }
+                ForEach(sorted) { entry in
+                    row(for: entry)
                 }
             }
             .listStyle(.inset(alternatesRowBackgrounds: true))
@@ -441,28 +511,140 @@ private struct FilePane: View {
                 return items.contains { $0.pane != kind }
             }
         }
-        .frame(minWidth: 360)
+        .frame(minWidth: 380)
     }
-}
 
-private struct EntryRow: View {
-    let entry: FileEntry
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: entry.isDir ? "folder.fill" : "doc")
-                .foregroundStyle(entry.isDir ? Color.accentColor : Color.secondary)
-                .frame(width: 16)
-            Text(entry.name).lineLimit(1)
-            Spacer()
-            if !entry.isDir {
-                Text(humanSize(entry.size))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+    /// WinSCP-style per-pane command toolbar.
+    private var paneToolbar: some View {
+        HStack(spacing: 2) {
+            Text(title).font(.headline).padding(.trailing, 4)
+            toolButton("arrow.up", "Parent directory", action: onUp)
+            toolButton("arrow.clockwise", "Refresh", action: onRefresh)
+            Divider().frame(height: 14)
+            toolButton(
+                kind == "local" ? "arrow.up.circle" : "arrow.down.circle",
+                transferLabel, disabled: selectedEntry == nil
+            ) {
+                if let e = selectedEntry { onTransfer(e) }
             }
+            if onEdit != nil {
+                toolButton("pencil", "Edit (auto-upload on save)",
+                    disabled: selectedEntry?.isDir != false
+                ) {
+                    if let e = selectedEntry { onEdit?(e) }
+                }
+            }
+            toolButton("folder.badge.plus", "New folder", action: onNewFolder)
+            toolButton("trash", "Delete", disabled: selectedEntry == nil) {
+                if let e = selectedEntry { onDelete(e) }
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+    }
+
+    private func toolButton(
+        _ symbol: String, _ help: String, disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) { Image(systemName: symbol) }
+            .buttonStyle(.borderless)
+            .disabled(disabled)
+            .help(help)
+    }
+
+    /// Clickable, sortable column headers.
+    private var columnHeader: some View {
+        HStack(spacing: 0) {
+            headerCell("Name", key: .name, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            headerCell("Size", key: .size, alignment: .trailing)
+                .frame(width: 76, alignment: .trailing)
+            headerCell("Changed", key: .mtime, alignment: .leading)
+                .frame(width: 118, alignment: .leading)
+            if showRights {
+                Text("Rights")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 80, alignment: .leading)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 3)
+    }
+
+    private func headerCell(_ label: String, key: SortKey, alignment: Alignment) -> some View {
+        Button {
+            if sortKey == key {
+                ascending.toggle()
+            } else {
+                sortKey = key
+                ascending = true
+            }
+        } label: {
+            HStack(spacing: 2) {
+                Text(label).font(.caption.bold())
+                if sortKey == key {
+                    Image(systemName: ascending ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8))
+                }
+            }
+            .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func row(for entry: FileEntry) -> some View {
+        HStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: entry.isDir ? "folder.fill" : "doc")
+                    .foregroundStyle(entry.isDir ? Color.accentColor : Color.secondary)
+                    .frame(width: 16)
+                Text(entry.name).lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Text(entry.isDir ? "" : humanSize(entry.size))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 76, alignment: .trailing)
+            Text(entry.mtime.map { changedFormatter.string(from: $0) } ?? "")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 118, alignment: .leading)
+            if showRights {
+                Text(entry.perms ?? "")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 80, alignment: .leading)
+            }
+        }
+        .tag(entry.id)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { onOpen(entry) }
+        .draggable(DraggedFile(pane: kind, name: entry.name))
+        .contextMenu {
+            if entry.isDir {
+                Button("Open") { onOpen(entry) }
+                Button("\(transferLabel) folder") { onTransfer(entry) }
+            } else {
+                Button(transferLabel) { onTransfer(entry) }
+                if let onEdit {
+                    Button("Edit (auto-upload on save)") { onEdit(entry) }
+                }
+            }
+            Divider()
+            Button("Rename…") { onRename(entry) }
+            Button("Delete", role: .destructive) { onDelete(entry) }
         }
     }
 }
+
+private let changedFormatter: DateFormatter = {
+    let df = DateFormatter()
+    df.dateFormat = "dd.MM.yyyy HH:mm"
+    return df
+}()
 
 // MARK: - Transfers panel
 

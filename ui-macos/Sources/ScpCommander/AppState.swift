@@ -31,6 +31,9 @@ final class AppState: ObservableObject {
     @Published var status = "Not connected"
     @Published var busy = false
 
+    /// WinSCP-style Login dialog; shown at startup and via "New Session".
+    @Published var showLogin = true
+
     let transfers = TransferQueue()
     let sites = SitesStore()
 
@@ -127,7 +130,7 @@ final class AppState: ObservableObject {
     // MARK: - Local filesystem
 
     func loadLocal() {
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey]
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
         let url = URL(fileURLWithPath: localPath)
         let contents =
             (try? FileManager.default.contentsOfDirectory(
@@ -138,6 +141,7 @@ final class AppState: ObservableObject {
                 name: u.lastPathComponent,
                 isDir: rv?.isDirectory ?? false,
                 size: UInt64(rv?.fileSize ?? 0),
+                mtime: rv?.contentModificationDate,
                 perms: nil)
         }
         sortEntries(&entries)
@@ -219,6 +223,7 @@ final class AppState: ObservableObject {
         } onSuccess: { [weak self] entries in
             self?.showRemote(path: path, entries: entries)
             self?.status = "Connected — \(path) (\(entries.count) items)"
+            self?.showLogin = false
         } onFailure: { [weak self] error in
             guard let self else { return }
             if let core = error as? CoreError, core.isUnknownHostKey,
