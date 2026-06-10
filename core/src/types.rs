@@ -18,6 +18,8 @@ pub enum Auth {
         path: String,
         passphrase: Option<String>,
     },
+    /// Ask the running SSH agent (ssh-agent) to authenticate. SFTP only.
+    Agent,
     /// No credentials (anonymous FTP, public buckets).
     Anonymous,
 }
@@ -111,6 +113,8 @@ pub enum Error {
     Protocol(String),
     #[error("not implemented: {0}")]
     NotImplemented(String),
+    #[error("cancelled")]
+    Cancelled,
     #[error("unknown server host key: {fingerprint}")]
     UnknownHostKey { fingerprint: String },
     #[error(

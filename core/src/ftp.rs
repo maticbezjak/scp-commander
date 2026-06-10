@@ -1,12 +1,11 @@
 use std::fs::File;
-use std::io::{Cursor, Write};
 use std::path::Path;
 
 use suppaftp::list::File as ListFile;
 use suppaftp::native_tls::TlsConnector;
 use suppaftp::{FtpStream, NativeTlsConnector, NativeTlsFtpStream};
 
-use crate::transport::Transport;
+use crate::transport::{copy_with_progress, Progress, Transport};
 use crate::types::{Auth, Credentials, Entry, Error, Protocol, Result};
 
 /// FTP / FTPS backend (synchronous).
@@ -40,8 +39,8 @@ impl FtpTransport {
         let (user, pass) = match &creds.auth {
             Auth::Password(pw) => (creds.username.as_str(), pw.as_str()),
             Auth::Anonymous => ("anonymous", "anonymous@"),
-            Auth::KeyFile { .. } => {
-                return Err(Error::Auth("FTP does not support key-file auth".into()));
+            Auth::KeyFile { .. } | Auth::Agent => {
+                return Err(Error::Auth("FTP supports password auth only".into()));
             }
         };
 
@@ -98,22 +97,63 @@ impl Transport for FtpTransport {
         Ok(out)
     }
 
-    fn download(&mut self, remote: &str, local: &Path) -> Result<u64> {
-        let buf: Cursor<Vec<u8>> = with_conn!(self, c => c
-            .retr_as_buffer(remote)
-            .map_err(|e| Error::Protocol(e.to_string()))?);
-        let bytes = buf.into_inner();
+    fn download_progress(&mut self, remote: &str, local: &Path, progress: Progress) -> Result<u64> {
+        let total = with_conn!(self, c => c.size(remote).ok()).unwrap_or(0) as u64;
         let mut local_file = File::create(local)?;
-        local_file.write_all(&bytes)?;
-        Ok(bytes.len() as u64)
+        with_conn!(self, c => {
+            let mut stream = c
+                .retr_as_stream(remote)
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            match copy_with_progress(&mut stream, &mut local_file, total, progress) {
+                Ok(n) => {
+                    c.finalize_retr_stream(stream)
+                        .map_err(|e| Error::Protocol(e.to_string()))?;
+                    Ok(n)
+                }
+                Err(e) => {
+                    // Best-effort cleanup so the control connection survives.
+                    let _ = c.finalize_retr_stream(stream);
+                    Err(e)
+                }
+            }
+        })
     }
 
-    fn upload(&mut self, local: &Path, remote: &str) -> Result<u64> {
+    fn upload_progress(&mut self, local: &Path, remote: &str, progress: Progress) -> Result<u64> {
         let mut local_file = File::open(local)?;
-        let n = with_conn!(self, c => c
-            .put_file(remote, &mut local_file)
-            .map_err(|e| Error::Protocol(e.to_string()))?);
-        Ok(n)
+        let total = local_file.metadata().map(|m| m.len()).unwrap_or(0);
+        with_conn!(self, c => {
+            let mut stream = c
+                .put_with_stream(remote)
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            match copy_with_progress(&mut local_file, &mut stream, total, progress) {
+                Ok(n) => {
+                    c.finalize_put_stream(stream)
+                        .map_err(|e| Error::Protocol(e.to_string()))?;
+                    Ok(n)
+                }
+                Err(e) => {
+                    let _ = c.finalize_put_stream(stream);
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    fn mkdir(&mut self, path: &str) -> Result<()> {
+        with_conn!(self, c => c.mkdir(path).map_err(|e| Error::Protocol(e.to_string())))
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<()> {
+        with_conn!(self, c => c.rm(path).map_err(|e| Error::Protocol(e.to_string())))
+    }
+
+    fn remove_dir(&mut self, path: &str) -> Result<()> {
+        with_conn!(self, c => c.rmdir(path).map_err(|e| Error::Protocol(e.to_string())))
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        with_conn!(self, c => c.rename(from, to).map_err(|e| Error::Protocol(e.to_string())))
     }
 
     fn disconnect(&mut self) {

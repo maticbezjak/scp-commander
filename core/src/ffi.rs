@@ -84,8 +84,9 @@ fn protocol_from_int(v: c_int) -> Option<Protocol> {
 
 /// Open a connection. `protocol`: 0=SFTP, 1=FTP, 2=FTPS, 3=S3.
 ///
-/// `password`, `bucket`, `region`, `expected_fingerprint` may be null; empty
-/// strings are treated as absent (Swift can't easily pass nullable strings).
+/// Nullable/empty string parameters are treated as absent (Swift can't easily
+/// pass nullable C strings). `auth_mode`: 0 = password (in `password`),
+/// 1 = key file (`key_path`, with `password` as the passphrase), 2 = ssh-agent.
 /// `host_key_mode`: 0 = strict (fail on unknown keys), 1 = accept new keys,
 /// 2 = accept only the key whose SHA256 fingerprint equals
 /// `expected_fingerprint` (from a prior `scp_last_fingerprint`).
@@ -102,6 +103,8 @@ pub extern "C" fn scp_connect(
     region: *const c_char,
     host_key_mode: c_int,
     expected_fingerprint: *const c_char,
+    auth_mode: c_int,
+    key_path: *const c_char,
 ) -> *mut ScpSession {
     clear_error();
 
@@ -132,13 +135,26 @@ pub extern "C" fn scp_connect(
         }
     };
 
-    let mut creds = Credentials::basic(
-        proto,
-        host.to_string(),
-        port,
-        user.to_string(),
-        Auth::Password(pass.to_string()),
-    );
+    let auth = match auth_mode {
+        0 => Auth::Password(pass.to_string()),
+        1 => match non_empty(key_path) {
+            Some(path) => Auth::KeyFile {
+                path: path.to_string(),
+                passphrase: (!pass.is_empty()).then(|| pass.to_string()),
+            },
+            None => {
+                set_error("auth_mode 1 requires key_path");
+                return ptr::null_mut();
+            }
+        },
+        2 => Auth::Agent,
+        _ => {
+            set_error("invalid auth_mode");
+            return ptr::null_mut();
+        }
+    };
+
+    let mut creds = Credentials::basic(proto, host.to_string(), port, user.to_string(), auth);
     creds.bucket = non_empty(bucket).map(str::to_string);
     creds.region = non_empty(region).map(str::to_string);
     creds.host_key = host_key;
@@ -247,8 +263,21 @@ pub extern "C" fn scp_upload(
     }
 }
 
-/// Progress callback: `(transferred, total, user_data)`. `total` is 0 if unknown.
-pub type ProgressCb = extern "C" fn(u64, u64, *mut c_void);
+/// Progress callback: `(transferred, total, user_data)`. `total` is 0 if
+/// unknown. Return 0 to continue, non-zero to cancel the transfer.
+pub type ProgressCb = extern "C" fn(u64, u64, *mut c_void) -> c_int;
+
+/// Multi-file operation callback. `kind`: 0 = starting `file` (`total` bytes,
+/// `done` is 1 for downloads / 0 for uploads), 1 = byte progress for the
+/// current file (`file` is null), 2 = current file finished. Return 0 to
+/// continue, non-zero to cancel.
+pub type XferCb = extern "C" fn(
+    kind: c_int,
+    file: *const c_char,
+    done: u64,
+    total: u64,
+    user_data: *mut c_void,
+) -> c_int;
 
 /// Download with progress reporting. Returns bytes transferred, or -1 on error.
 /// `cb` is invoked on the calling thread; `user_data` is passed back verbatim.
@@ -270,9 +299,10 @@ pub extern "C" fn scp_download_cb(
         return -1;
     };
     let user = UserData(user_data);
-    let mut report = |t: u64, total: u64| {
-        if let Some(cb) = cb {
-            cb(t, total, user.0);
+    let mut report = |t: u64, total: u64| -> bool {
+        match cb {
+            Some(cb) => cb(t, total, user.0) == 0,
+            None => true,
         }
     };
     match session
@@ -281,7 +311,7 @@ pub extern "C" fn scp_download_cb(
     {
         Ok(n) => n as i64,
         Err(e) => {
-            set_error(e.to_string());
+            set_error_typed(&e);
             -1
         }
     }
@@ -306,9 +336,10 @@ pub extern "C" fn scp_upload_cb(
         return -1;
     };
     let user = UserData(user_data);
-    let mut report = |t: u64, total: u64| {
-        if let Some(cb) = cb {
-            cb(t, total, user.0);
+    let mut report = |t: u64, total: u64| -> bool {
+        match cb {
+            Some(cb) => cb(t, total, user.0) == 0,
+            None => true,
         }
     };
     match session
@@ -317,7 +348,188 @@ pub extern "C" fn scp_upload_cb(
     {
         Ok(n) => n as i64,
         Err(e) => {
-            set_error(e.to_string());
+            set_error_typed(&e);
+            -1
+        }
+    }
+}
+
+/// Adapt a C XferCb into the core's ops callback.
+fn xfer_adapter<'a>(
+    cb: Option<XferCb>,
+    user: &'a UserData,
+) -> impl FnMut(crate::ops::XferEvent) -> bool + 'a {
+    move |ev| {
+        let Some(cb) = cb else { return true };
+        match ev {
+            crate::ops::XferEvent::Start { name, total, download } => {
+                let Ok(name) = CString::new(name) else { return true };
+                cb(0, name.as_ptr(), download as u64, total, user.0) == 0
+            }
+            crate::ops::XferEvent::Bytes { done, total } => {
+                cb(1, ptr::null(), done, total, user.0) == 0
+            }
+            crate::ops::XferEvent::DoneFile => cb(2, ptr::null(), 0, 0, user.0) == 0,
+        }
+    }
+}
+
+/// Recursively download a remote directory. Returns total bytes, or -1.
+#[no_mangle]
+pub extern "C" fn scp_download_dir(
+    session: *mut ScpSession,
+    remote: *const c_char,
+    local: *const c_char,
+    cb: Option<XferCb>,
+    user_data: *mut c_void,
+) -> i64 {
+    clear_error();
+    let (Some(session), Some(remote), Some(local)) = (
+        unsafe { session.as_mut() },
+        unsafe { cstr(remote) },
+        unsafe { cstr(local) },
+    ) else {
+        set_error("invalid arguments to scp_download_dir");
+        return -1;
+    };
+    let user = UserData(user_data);
+    let mut adapter = xfer_adapter(cb, &user);
+    match crate::ops::download_dir(session.inner.as_mut(), remote, Path::new(local), &mut adapter)
+    {
+        Ok(n) => n as i64,
+        Err(e) => {
+            set_error_typed(&e);
+            -1
+        }
+    }
+}
+
+/// Recursively upload a local directory. Returns total bytes, or -1.
+#[no_mangle]
+pub extern "C" fn scp_upload_dir(
+    session: *mut ScpSession,
+    local: *const c_char,
+    remote: *const c_char,
+    cb: Option<XferCb>,
+    user_data: *mut c_void,
+) -> i64 {
+    clear_error();
+    let (Some(session), Some(local), Some(remote)) = (
+        unsafe { session.as_mut() },
+        unsafe { cstr(local) },
+        unsafe { cstr(remote) },
+    ) else {
+        set_error("invalid arguments to scp_upload_dir");
+        return -1;
+    };
+    let user = UserData(user_data);
+    let mut adapter = xfer_adapter(cb, &user);
+    match crate::ops::upload_dir(session.inner.as_mut(), Path::new(local), remote, &mut adapter) {
+        Ok(n) => n as i64,
+        Err(e) => {
+            set_error_typed(&e);
+            -1
+        }
+    }
+}
+
+/// One-way directory sync. `direction`: 0 = local→remote, 1 = remote→local.
+/// Returns the number of files copied, or -1 on error.
+#[no_mangle]
+pub extern "C" fn scp_sync_dir(
+    session: *mut ScpSession,
+    local: *const c_char,
+    remote: *const c_char,
+    direction: c_int,
+    cb: Option<XferCb>,
+    user_data: *mut c_void,
+) -> i64 {
+    clear_error();
+    let (Some(session), Some(local), Some(remote)) = (
+        unsafe { session.as_mut() },
+        unsafe { cstr(local) },
+        unsafe { cstr(remote) },
+    ) else {
+        set_error("invalid arguments to scp_sync_dir");
+        return -1;
+    };
+    let dir = match direction {
+        0 => crate::ops::SyncDirection::Upload,
+        1 => crate::ops::SyncDirection::Download,
+        _ => {
+            set_error("invalid sync direction");
+            return -1;
+        }
+    };
+    let user = UserData(user_data);
+    let mut adapter = xfer_adapter(cb, &user);
+    match crate::ops::sync_dir(session.inner.as_mut(), Path::new(local), remote, dir, &mut adapter)
+    {
+        Ok(stats) => stats.copied as i64,
+        Err(e) => {
+            set_error_typed(&e);
+            -1
+        }
+    }
+}
+
+/// Create a remote directory. Returns 0, or -1 on error.
+#[no_mangle]
+pub extern "C" fn scp_mkdir(session: *mut ScpSession, path: *const c_char) -> c_int {
+    simple_op(session, path, |t, p| t.mkdir(p))
+}
+
+/// Delete a remote file. Returns 0, or -1 on error.
+#[no_mangle]
+pub extern "C" fn scp_remove_file(session: *mut ScpSession, path: *const c_char) -> c_int {
+    simple_op(session, path, |t, p| t.remove_file(p))
+}
+
+/// Recursively delete a remote directory. Returns 0, or -1 on error.
+#[no_mangle]
+pub extern "C" fn scp_remove_dir_all(session: *mut ScpSession, path: *const c_char) -> c_int {
+    simple_op(session, path, |t, p| crate::ops::remove_dir_all(t, p))
+}
+
+/// Rename/move a remote file or directory. Returns 0, or -1 on error.
+#[no_mangle]
+pub extern "C" fn scp_rename(
+    session: *mut ScpSession,
+    from: *const c_char,
+    to: *const c_char,
+) -> c_int {
+    clear_error();
+    let (Some(session), Some(from), Some(to)) = (
+        unsafe { session.as_mut() },
+        unsafe { cstr(from) },
+        unsafe { cstr(to) },
+    ) else {
+        set_error("invalid arguments to scp_rename");
+        return -1;
+    };
+    match session.inner.rename(from, to) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error_typed(&e);
+            -1
+        }
+    }
+}
+
+fn simple_op(
+    session: *mut ScpSession,
+    path: *const c_char,
+    op: impl FnOnce(&mut dyn Transport, &str) -> crate::types::Result<()>,
+) -> c_int {
+    clear_error();
+    let (Some(session), Some(path)) = (unsafe { session.as_mut() }, unsafe { cstr(path) }) else {
+        set_error("invalid arguments");
+        return -1;
+    };
+    match op(session.inner.as_mut(), path) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error_typed(&e);
             -1
         }
     }

@@ -28,7 +28,9 @@ typedef struct ScpSession ScpSession;
  * 0 = strict (fail with SCP_ERR_UNKNOWN_HOST_KEY on new servers),
  * 1 = trust-on-first-use, 2 = accept only if the server's SHA256 fingerprint
  * equals expected_fingerprint (obtained from scp_last_fingerprint after a
- * strict connect failed). */
+ * strict connect failed).
+ * auth_mode: 0 = password, 1 = key file (key_path set, password acts as the
+ * passphrase), 2 = ssh-agent. */
 ScpSession *scp_connect(int protocol,
                         const char *host,
                         uint16_t port,
@@ -37,7 +39,9 @@ ScpSession *scp_connect(int protocol,
                         const char *bucket,
                         const char *region,
                         int host_key_mode,
-                        const char *expected_fingerprint);
+                        const char *expected_fingerprint,
+                        int auth_mode,
+                        const char *key_path);
 
 /* Classify the last error on this thread (SCP_ERR_*). */
 int scp_last_error_code(void);
@@ -52,8 +56,9 @@ char *scp_list_dir(ScpSession *session, const char *path);
 int64_t scp_download(ScpSession *session, const char *remote, const char *local);
 int64_t scp_upload(ScpSession *session, const char *local, const char *remote);
 
-/* Progress callback: (transferred, total, user_data). total is 0 if unknown. */
-typedef void (*ScpProgressCb)(uint64_t transferred, uint64_t total, void *user_data);
+/* Progress callback: (transferred, total, user_data). total is 0 if unknown.
+ * Return 0 to continue, non-zero to cancel (the call fails with "cancelled"). */
+typedef int (*ScpProgressCb)(uint64_t transferred, uint64_t total, void *user_data);
 
 /* Transfer with progress reporting. cb runs on the calling thread; user_data
  * is passed back verbatim. Returns bytes transferred, or -1 on error. */
@@ -61,6 +66,31 @@ int64_t scp_download_cb(ScpSession *session, const char *remote, const char *loc
                         ScpProgressCb cb, void *user_data);
 int64_t scp_upload_cb(ScpSession *session, const char *local, const char *remote,
                       ScpProgressCb cb, void *user_data);
+
+/* Multi-file operation callback. kind: 0 = starting `file` (total bytes; done
+ * is 1 for a download, 0 for an upload), 1 = byte progress for the current
+ * file (file is NULL), 2 = current file finished. Return 0 to continue,
+ * non-zero to cancel the whole operation. */
+typedef int (*ScpXferCb)(int kind, const char *file, uint64_t done, uint64_t total,
+                         void *user_data);
+
+/* Recursive folder transfers. Return total bytes moved, or -1 on error. */
+int64_t scp_download_dir(ScpSession *session, const char *remote, const char *local,
+                         ScpXferCb cb, void *user_data);
+int64_t scp_upload_dir(ScpSession *session, const char *local, const char *remote,
+                       ScpXferCb cb, void *user_data);
+
+/* One-way directory sync. direction: 0 = local->remote, 1 = remote->local.
+ * Copies files that are missing, differ in size, or are newer on the source.
+ * Returns the number of files copied, or -1 on error. */
+int64_t scp_sync_dir(ScpSession *session, const char *local, const char *remote,
+                     int direction, ScpXferCb cb, void *user_data);
+
+/* Remote file management. Return 0 on success, -1 on error. */
+int scp_mkdir(ScpSession *session, const char *path);
+int scp_remove_file(ScpSession *session, const char *path);
+int scp_remove_dir_all(ScpSession *session, const char *path);
+int scp_rename(ScpSession *session, const char *from, const char *to);
 
 /* Closes the session and frees the handle. Safe to pass NULL. */
 void scp_disconnect_free(ScpSession *session);

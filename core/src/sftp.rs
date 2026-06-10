@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
@@ -7,7 +6,7 @@ use ssh2::{
     CheckResult, HashType, HostKeyType, KnownHostFileKind, KnownHostKeyFormat, Session,
 };
 
-use crate::transport::{Progress, Transport};
+use crate::transport::{copy_with_progress, Progress, Transport};
 use crate::types::{Auth, Credentials, Entry, Error, HostKeyPolicy, Result};
 
 /// SFTP backend backed by libssh2 (synchronous).
@@ -41,6 +40,9 @@ impl SftpTransport {
                     Path::new(path),
                     passphrase.as_deref(),
                 )
+                .map_err(|e| Error::Auth(e.to_string()))?,
+            Auth::Agent => session
+                .userauth_agent(&creds.username)
                 .map_err(|e| Error::Auth(e.to_string()))?,
             Auth::Anonymous => {
                 return Err(Error::Auth("SFTP requires credentials".into()));
@@ -80,26 +82,6 @@ impl Transport for SftpTransport {
         Ok(out)
     }
 
-    fn download(&mut self, remote: &str, local: &Path) -> Result<u64> {
-        let mut remote_file = self
-            .sftp
-            .open(Path::new(remote))
-            .map_err(|e| Error::Protocol(e.to_string()))?;
-        let mut local_file = File::create(local)?;
-        let n = io::copy(&mut remote_file, &mut local_file)?;
-        Ok(n)
-    }
-
-    fn upload(&mut self, local: &Path, remote: &str) -> Result<u64> {
-        let mut local_file = File::open(local)?;
-        let mut remote_file = self
-            .sftp
-            .create(Path::new(remote))
-            .map_err(|e| Error::Protocol(e.to_string()))?;
-        let n = io::copy(&mut local_file, &mut remote_file)?;
-        Ok(n)
-    }
-
     fn download_progress(&mut self, remote: &str, local: &Path, progress: Progress) -> Result<u64> {
         let mut remote_file = self
             .sftp
@@ -120,32 +102,35 @@ impl Transport for SftpTransport {
         copy_with_progress(&mut local_file, &mut remote_file, total, progress)
     }
 
+    fn mkdir(&mut self, path: &str) -> Result<()> {
+        self.sftp
+            .mkdir(Path::new(path), 0o755)
+            .map_err(|e| Error::Protocol(e.to_string()))
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<()> {
+        self.sftp
+            .unlink(Path::new(path))
+            .map_err(|e| Error::Protocol(e.to_string()))
+    }
+
+    fn remove_dir(&mut self, path: &str) -> Result<()> {
+        self.sftp
+            .rmdir(Path::new(path))
+            .map_err(|e| Error::Protocol(e.to_string()))
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        self.sftp
+            .rename(Path::new(from), Path::new(to), None)
+            .map_err(|e| Error::Protocol(e.to_string()))
+    }
+
     fn disconnect(&mut self) {
         let _ = self
             .session
             .disconnect(None, "bye", None);
     }
-}
-
-/// Copy reader → writer in chunks, reporting `(transferred, total)` after each.
-fn copy_with_progress<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    total: u64,
-    progress: Progress,
-) -> Result<u64> {
-    let mut buf = [0u8; 64 * 1024];
-    let mut done: u64 = 0;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        writer.write_all(&buf[..n])?;
-        done += n as u64;
-        progress(done, total);
-    }
-    Ok(done)
 }
 
 // --- host key verification ---------------------------------------------------
