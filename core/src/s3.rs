@@ -80,7 +80,7 @@ mod imp {
                 let endpoint = if creds.host.contains("://") {
                     creds.host.clone()
                 } else {
-                    format!("https://{}", creds.host)
+                    format!("http://{}:{}", creds.host, creds.port)
                 };
                 Region::Custom {
                     region: region_str,

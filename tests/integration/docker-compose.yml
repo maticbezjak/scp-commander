@@ -7,6 +7,19 @@ services:
     ports:
       - "127.0.0.1:2222:22"
 
+  # Full SSH server used to smoke-test exec_command.
+  # atmoz/sftp forces ForceCommand internal-sftp so it can't run arbitrary commands.
+  ssh:
+    image: lscr.io/linuxserver/openssh-server
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      PASSWORD_ACCESS: "true"
+      USER_NAME: "demo"
+      USER_PASSWORD: "demopass"
+    ports:
+      - "127.0.0.1:2223:2222"
+
   ftp:
     image: delfer/alpine-ftp-server
     environment:

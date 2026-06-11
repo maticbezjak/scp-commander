@@ -43,7 +43,7 @@ cargo build -p scp-core --features s3 --bin scp-cli
 
 
 echo "==> Starting servers"
-$COMPOSE up -d sftp ftp minio
+$COMPOSE up -d sftp ftp minio ssh
 $COMPOSE up mc # one-shot: creates the S3 test bucket
 
 # Wait until each server actually answers (cold container starts take a
@@ -62,7 +62,8 @@ wait_ready() { # wait_ready <label> <probe...>
     return 1
 }
 wait_ready sftp cli --accept-new ls "sftp://demo@127.0.0.1:2222/upload" demopass
-wait_ready ftp cli ls "ftp://demo@127.0.0.1:2121/ftp/demo" demopass
+wait_ready ftp  cli ls "ftp://demo@127.0.0.1:2121/ftp/demo" demopass
+wait_ready ssh  cli --accept-new exec "sftp://demo@127.0.0.1:2223/" "echo ready" demopass
 
 # Test fixtures: a tree with a subdirectory and a dotfile.
 mkdir -p "$WORK/src/sub"
@@ -129,10 +130,11 @@ wait_ready s3 cli ls "s3://demo@127.0.0.1:9000/test" demopass123
 # (no mv-root prefix needed — pass empty string so ${mv_prefix:-...} is overridden).
 run_matrix s3 "s3://demo@127.0.0.1:9000/test" demopass123 ""
 
-# SFTP exec: smoke-test the remote command channel.
+# SFTP exec: smoke-test the remote command channel on a full SSH server
+# (atmoz/sftp uses ForceCommand internal-sftp and can't run arbitrary commands).
 echo "== sftp exec =="
-check "sftp exec echo" $CLI --accept-new exec "sftp://demo@127.0.0.1:2222/upload" "echo hello" demopass
-check "sftp exec exit1" bash -c '! '"$CLI"' --accept-new exec sftp://demo@127.0.0.1:2222/upload "exit 1" demopass'
+check "sftp exec echo"  $CLI --accept-new exec "sftp://demo@127.0.0.1:2223/" "echo hello" demopass
+check "sftp exec exit1" bash -c '! '"$CLI"' --accept-new exec sftp://demo@127.0.0.1:2223/ "exit 1" demopass'
 
 # Mirror sync: upload a tree, remove one local file, re-sync with --delete,
 # verify the remote file was removed.
@@ -140,7 +142,7 @@ echo "== sftp mirror sync =="
 mkdir -p "$WORK/mirror"
 echo "keep" > "$WORK/mirror/keep.txt"
 echo "gone" > "$WORK/mirror/gone.txt"
-check "mirror init"   $CLI --accept-new sync up "sftp://demo@127.0.0.1:2222/upload/mirror" "$WORK/mirror" demopass
+check "mirror init"   $CLI --accept-new sync up  "sftp://demo@127.0.0.1:2222/upload/mirror" "$WORK/mirror" demopass
 rm "$WORK/mirror/gone.txt"
 check "mirror --delete" $CLI --accept-new --delete sync up "sftp://demo@127.0.0.1:2222/upload/mirror" "$WORK/mirror" demopass
 check "mirror verify"   bash -c '! '"$CLI"' --accept-new ls sftp://demo@127.0.0.1:2222/upload/mirror demopass | grep gone.txt'

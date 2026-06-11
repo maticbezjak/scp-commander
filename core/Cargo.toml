@@ -26,6 +26,9 @@ chrono = "0.4"
 # core stays sync (no tokio runtime threaded through the trait).
 rust-s3 = { version = "0.37", features = ["blocking"], optional = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = []
 # Enables the real S3 backend (pulls rust-s3 + a small async runtime under the
