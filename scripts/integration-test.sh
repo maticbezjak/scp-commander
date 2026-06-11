@@ -8,8 +8,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 COMPOSE="docker compose -f tests/integration/docker-compose.yml"
-CLI=target/debug/scp-cli
 WORK=$(mktemp -d)
+# Run scp-cli with an isolated HOME (fresh known_hosts every run): containers
+# get a new host key on each recreation, which would otherwise trip the
+# fail-closed mismatch protection. Everything else (docker, cargo) keeps the
+# real HOME.
+FAKE_HOME="$WORK/home"
+mkdir -p "$FAKE_HOME"
+cli() { HOME="$FAKE_HOME" target/debug/scp-cli "$@"; }
+CLI=cli
 PASS=0
 FAIL=0
 
@@ -34,10 +41,28 @@ check() { # check <label> <command...>
 echo "==> Building scp-cli (with S3)"
 cargo build -p scp-core --features s3
 
+
 echo "==> Starting servers"
 $COMPOSE up -d sftp ftp minio
 $COMPOSE up mc # one-shot: creates the S3 test bucket
-sleep 3
+
+# Wait until each server actually answers (cold container starts take a
+# few seconds; a blind sleep flakes).
+wait_ready() { # wait_ready <label> <probe...>
+    local label=$1
+    shift
+    for _ in $(seq 1 30); do
+        if "$@" >/dev/null 2>&1; then
+            echo "  $label ready"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "  $label NOT ready after 30s" >&2
+    return 1
+}
+wait_ready sftp cli --accept-new ls "sftp://demo@127.0.0.1:2222/upload" demopass
+wait_ready ftp cli ls "ftp://demo@127.0.0.1:2121/ftp/demo" demopass
 
 # Test fixtures: a tree with a subdirectory and a dotfile.
 mkdir -p "$WORK/src/sub"
@@ -49,22 +74,30 @@ dd if=/dev/urandom of="$WORK/src/big.bin" bs=1k count=512 2>/dev/null
 run_matrix() { # run_matrix <label> <url-base> <password> <extra-flags...>
     local label=$1 base=$2 pass=$3
     shift 3
+    # ($@ is already shifted; assignment of an empty array is fine under
+    # set -u — only unguarded expansion is not, hence the FL indirection.)
     local flags=("$@")
+    local FL=""
+    if [ "$#" -gt 0 ]; then FL="${flags[*]}"; fi
+    # The rename target must stay inside the same (chrooted) tree.
+    local root="${base#*//*/}"      # path part of the url
     echo "== $label =="
-    check "$label mkdir"     $CLI "${flags[@]}" mkdir "$base/it" "$pass"
-    check "$label put"       $CLI "${flags[@]}" put "$base/it/a.txt" "$WORK/src/a.txt" "$pass"
-    check "$label ls"        $CLI "${flags[@]}" ls "$base/it" "$pass"
-    check "$label get"       $CLI "${flags[@]}" get "$base/it/a.txt" "$WORK/$label-a.txt" "$pass"
+    check "$label mkdir"     $CLI $FL mkdir "$base/it" "$pass"
+    check "$label put"       $CLI $FL put "$base/it/a.txt" "$WORK/src/a.txt" "$pass"
+    check "$label ls"        $CLI $FL ls "$base/it" "$pass"
+    check "$label get"       $CLI $FL get "$base/it/a.txt" "$WORK/$label-a.txt" "$pass"
     check "$label roundtrip" diff "$WORK/src/a.txt" "$WORK/$label-a.txt"
-    check "$label put -r"    $CLI "${flags[@]}" put -r "$base/it/tree" "$WORK/src" "$pass"
-    check "$label get -r"    $CLI "${flags[@]}" get -r "$base/it/tree" "$WORK/$label-tree" "$pass"
+    check "$label put -r"    $CLI $FL put -r "$base/it/tree" "$WORK/src" "$pass"
+    check "$label get -r"    $CLI $FL get -r "$base/it/tree" "$WORK/$label-tree" "$pass"
     check "$label tree diff" diff -r "$WORK/src" "$WORK/$label-tree"
-    check "$label sync up"   $CLI "${flags[@]}" sync up "$base/it/sync" "$WORK/src" "$pass"
-    check "$label sync down" $CLI "${flags[@]}" sync down "$base/it/sync" "$WORK/$label-sync" "$pass"
+    check "$label sync up"   $CLI $FL sync up "$base/it/sync" "$WORK/src" "$pass"
+    check "$label sync down" $CLI $FL sync down "$base/it/sync" "$WORK/$label-sync" "$pass"
     check "$label sync diff" diff -r "$WORK/src" "$WORK/$label-sync"
-    check "$label mv"        $CLI "${flags[@]}" mv "$base/it/a.txt" "/it/renamed.txt" "$pass"
-    check "$label rm"        $CLI "${flags[@]}" rm "$base/it/renamed.txt" "$pass"
-    check "$label rm -r"     $CLI "${flags[@]}" rm -r "$base/it/tree" "$pass"
+    check "$label plan"      $CLI $FL plan up "$base/it/sync" "$WORK/src" "$pass"
+    check "$label find"      $CLI $FL find "$base/it" "*.txt" "$pass"
+    check "$label mv"        $CLI $FL mv "$base/it/a.txt" "/$root/it/renamed.txt" "$pass"
+    check "$label rm"        $CLI $FL rm "$base/it/renamed.txt" "$pass"
+    check "$label rm -r"     $CLI $FL rm -r "$base/it/tree" "$pass"
 }
 
 # SFTP — also exercises host-key trust-on-first-use and chmod.

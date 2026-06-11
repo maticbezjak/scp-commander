@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  linux:
+    name: Linux (core + GTK + integration)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev build-essential pkg-config \
+            libssl-dev libssh2-1-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace (core + GTK app, with S3)
+        run: cargo build --workspace --features scp-core/s3
+      - name: Unit tests
+        run: cargo test --workspace --features scp-core/s3
+      - name: Integration tests (Docker servers)
+        run: ./scripts/integration-test.sh
+
+  macos:
+    name: macOS (core + SwiftUI app)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies
+        run: brew install libssh2 openssl@3 pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Core build + tests (with S3)
+        run: |
+          cargo build -p scp-core --features s3
+          cargo test -p scp-core --features s3
+      - name: SwiftUI app
+        run: cd ui-macos && swift build

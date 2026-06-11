@@ -39,6 +39,14 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>CFBundleIconFile</key><string>ScpCommander</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>SFTP URL</string>
+            <key>CFBundleURLSchemes</key>
+            <array><string>sftp</string><string>ftp</string></array>
+        </dict>
+    </array>
     <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>

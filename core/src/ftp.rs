@@ -74,15 +74,26 @@ impl FtpTransport {
 
 impl Transport for FtpTransport {
     fn list_dir(&mut self, path: &str) -> Result<Vec<Entry>> {
-        let lines = with_conn!(self, c => c
-            .list(Some(path))
-            .map_err(|e| Error::Protocol(e.to_string()))?);
+        // "LIST -a" makes most unix FTP servers include dotfiles (WinSCP
+        // sends the same); fall back to a plain LIST for servers that treat
+        // "-a" as a literal path.
+        let lines = with_conn!(self, c => {
+            match c.list(Some(&format!("-a {path}"))) {
+                Ok(lines) if !lines.is_empty() => lines,
+                _ => c.list(Some(path)).map_err(|e| Error::Protocol(e.to_string()))?,
+            }
+        });
 
         let mut out = Vec::new();
         for line in lines {
             // Skip lines the parser doesn't understand rather than failing the
             // whole listing — FTP server output formats vary widely.
             if let Ok(f) = line.parse::<ListFile>() {
+                // LIST -a includes "." and ".." — recursing into those would
+                // loop forever.
+                if f.name() == "." || f.name() == ".." {
+                    continue;
+                }
                 let mtime = f
                     .modified()
                     .duration_since(std::time::UNIX_EPOCH)

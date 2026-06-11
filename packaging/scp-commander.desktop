@@ -6,4 +6,5 @@ Exec=scp-commander
 Icon=folder-remote
 Terminal=false
 Categories=Network;FileTransfer;
+MimeType=x-scheme-handler/sftp;x-scheme-handler/ftp;
 Keywords=sftp;ftp;s3;scp;file;transfer;

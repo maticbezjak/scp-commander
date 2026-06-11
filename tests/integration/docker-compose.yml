@@ -11,6 +11,9 @@ services:
     image: delfer/alpine-ftp-server
     environment:
       USERS: "demo|demopass|/ftp/demo"
+      # Advertise localhost in PASV replies — otherwise clients are told the
+      # container-internal IP and data connections hang.
+      ADDRESS: "127.0.0.1"
       MIN_PORT: "21000"
       MAX_PORT: "21010"
     ports:

@@ -41,6 +41,13 @@ Protocols:
 
 Both apps (SwiftUI + GTK4) have:
 
+- **overwrite protection** (Overwrite / Skip prompts; partials resume in
+  both directions) and **preview-first sync** (WinSCP-style checklist)
+- a **dedicated transfer connection per tab** — transfers never block
+  browsing; **exclusion masks** ("*.tmp; .git/") for folder ops and sync
+- **Find Files** (recursive remote search), sites with **initial
+  directories**, **workspace restore** on launch, Finder/Nautilus **drops**,
+  Open in Terminal, Copy URL, sftp:// URL registration
 - **keyboard commander**: F5 copy, F6 move, F2 rename, Del, Backspace
   parent, Tab to switch panes; **multi-select** with batch operations
 - **auto-reconnect** (dead sessions revive transparently, with 30s NAT
@@ -126,7 +133,9 @@ an async channel drained by `glib::spawn_future_local`.
 
 `./scripts/integration-test.sh` spins up SFTP, FTP, and MinIO servers in
 Docker and drives `scp-cli` through the full operation matrix (transfers,
-recursive trees, sync, rename, chmod, deletes) with round-trip diffs.
+recursive trees, sync + dry-run plan, find, rename, chmod, deletes) with
+round-trip diffs — 33 checks, all green. CI (.github/workflows/ci.yml) runs
+the same suite on every push, alongside the unit tests and both app builds.
 
 ## How "native" is achieved
 
