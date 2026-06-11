@@ -55,13 +55,15 @@ struct ContentView: View {
                     onNavigate: { state.navigateLocal($0) },
                     onOpen: { state.openLocal($0) },
                     transferLabel: "Upload",
-                    onTransfer: { state.upload($0) },
+                    onTransfer: { state.requestTransfers([$0], from: .local) },
                     onDrop: { if $0.pane == "remote" { state.downloadByName($0.name) } },
                     onRename: { beginRename(.local, $0) },
                     onDelete: { deleteTarget = (.local, $0) },
                     onNewFolder: { beginNewFolder(.local) },
                     onEdit: nil,
-                    onProperties: { propertiesTarget = (.local, $0) }
+                    onCopyURL: nil,
+                    onProperties: { propertiesTarget = (.local, $0) },
+                    onExternalDrop: nil
                 )
                 FilePane(
                     kind: "remote",
@@ -78,13 +80,15 @@ struct ContentView: View {
                     onNavigate: { state.navigateRemote($0) },
                     onOpen: { state.openRemote($0) },
                     transferLabel: "Download",
-                    onTransfer: { state.download($0) },
+                    onTransfer: { state.requestTransfers([$0], from: .remote) },
                     onDrop: { if $0.pane == "local" { state.uploadByName($0.name) } },
                     onRename: { beginRename(.remote, $0) },
                     onDelete: { deleteTarget = (.remote, $0) },
                     onNewFolder: { beginNewFolder(.remote) },
                     onEdit: { state.editRemote($0) },
-                    onProperties: { propertiesTarget = (.remote, $0) }
+                    onCopyURL: { state.copyRemoteURL($0) },
+                    onProperties: { propertiesTarget = (.remote, $0) },
+                    onExternalDrop: { state.uploadExternal($0) }
                 )
             }
             TransfersPanel(queue: state.transfers)
@@ -99,6 +103,33 @@ struct ContentView: View {
         .onAppear { installKeyMonitor() }
         .sheet(isPresented: $state.showLogin) {
             LoginSheet().environmentObject(state)
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { state.syncPreview != nil },
+                set: { if !$0 { state.syncPreview = nil } }
+            )
+        ) {
+            SyncPreviewSheet().environmentObject(state)
+        }
+        .sheet(isPresented: $state.showFind) {
+            FindSheet().environmentObject(state)
+        }
+        .confirmationDialog(
+            state.overwritePrompt.map { p in
+                p.entries.count == 1
+                    ? "\(p.entries[0].name) already exists at the destination."
+                    : "\(p.entries.count) files already exist at the destination."
+            } ?? "",
+            isPresented: Binding(
+                get: { state.overwritePrompt != nil },
+                set: { if !$0 { state.overwritePrompt = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Overwrite", role: .destructive) { state.resolveOverwrite(overwrite: true) }
+            Button("Skip existing") { state.resolveOverwrite(overwrite: false) }
+            Button("Cancel", role: .cancel) { state.overwritePrompt = nil }
         }
         .sheet(
             isPresented: Binding(
@@ -318,6 +349,25 @@ private struct TopBar: View {
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
+
+                Button {
+                    state.showFind = true
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                }
+                .help("Find remote files (mask, e.g. *.log)")
+
+                Button {
+                    state.openTerminal()
+                } label: {
+                    Image(systemName: "terminal")
+                }
+                .help("Open SSH session in Terminal")
+
+                TextField("exclude: *.tmp; .git/", text: $state.excludeMasks)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 170)
+                    .help("Exclusion masks for folder transfers and sync")
             }
 
             if state.busy { ProgressView().scaleEffect(0.6).frame(width: 18, height: 18) }
@@ -488,6 +538,13 @@ private struct SessionForm: View {
                 )
                 .font(.caption)
                 .foregroundStyle(.orange)
+            } else if state.proto == .s3 && state.host.hasPrefix("http://") {
+                Label(
+                    "http:// endpoint sends credentials and data unencrypted.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
             }
             Spacer()
         }
@@ -619,14 +676,21 @@ private struct FilePane: View {
     let onDelete: ([FileEntry]) -> Void
     let onNewFolder: () -> Void
     let onEdit: ((FileEntry) -> Void)?
+    let onCopyURL: ((FileEntry) -> Void)?
     let onProperties: (FileEntry) -> Void
+    let onExternalDrop: (([URL]) -> Void)?
 
     @State private var sortKey: SortKey = .name
     @State private var ascending = true
     @State private var pathText = ""
+    @State private var filterText = ""
 
     private var visible: [FileEntry] {
-        showHidden ? entries : entries.filter { !$0.name.hasPrefix(".") }
+        var v = showHidden ? entries : entries.filter { !$0.name.hasPrefix(".") }
+        if !filterText.isEmpty {
+            v = v.filter { $0.name.localizedCaseInsensitiveContains(filterText) }
+        }
+        return v
     }
 
     private var selectedEntries: [FileEntry] {
@@ -684,6 +748,11 @@ private struct FilePane: View {
                 for file in items where file.pane != kind { onDrop(file) }
                 return items.contains { $0.pane != kind }
             }
+            .dropDestination(for: URL.self) { urls, _ in
+                guard let onExternalDrop, !urls.isEmpty else { return false }
+                onExternalDrop(urls)
+                return true
+            }
         }
         .frame(minWidth: 380)
         .contentShape(Rectangle())
@@ -718,6 +787,11 @@ private struct FilePane: View {
                 onDelete(selectedEntries)
             }
             Spacer()
+            TextField("filter", text: $filterText)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+                .frame(width: 90)
+                .help("Filter the visible listing by name")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -824,6 +898,9 @@ private struct FilePane: View {
                 }
                 if let onEdit {
                     Button("Edit (auto-upload on save)") { onEdit(entry) }
+                }
+                if let onCopyURL {
+                    Button("Copy URL") { onCopyURL(entry) }
                 }
             }
             Divider()
@@ -944,6 +1021,120 @@ struct PropertiesSheet: View {
                 for i in 0..<9 { bits[i] = current & (1 << (8 - i)) != 0 }
             }
         }
+    }
+}
+
+// MARK: - Sync preview (WinSCP's synchronization checklist)
+
+private struct SyncPreviewSheet: View {
+    @EnvironmentObject var state: AppState
+    @State private var selected: Set<String> = []
+    @State private var loaded = false
+
+    var body: some View {
+        let preview = state.syncPreview
+        VStack(alignment: .leading, spacing: 10) {
+            Text(
+                preview?.download == true
+                    ? "Synchronize remote → local — preview"
+                    : "Synchronize local → remote — preview"
+            )
+            .font(.headline)
+            if let preview {
+                Text(
+                    "\(preview.plan.items.count) file(s) to copy, \(preview.plan.dirs.count) folder(s) to create"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                List(preview.plan.items) { item in
+                    Toggle(isOn: binding(for: item.rel)) {
+                        HStack {
+                            Text(item.rel).lineLimit(1)
+                            Spacer()
+                            Text("\(item.reason) · \(item.size) B")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .frame(minHeight: 240)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { state.syncPreview = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button("Synchronize") {
+                    guard let preview = state.syncPreview else { return }
+                    let items = preview.plan.items.filter { selected.contains($0.rel) }
+                    state.runSyncItems(items)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(selected.isEmpty)
+            }
+        }
+        .padding(14)
+        .frame(width: 520, height: 400)
+        .onAppear {
+            guard !loaded, let preview = state.syncPreview else { return }
+            loaded = true
+            selected = Set(preview.plan.items.map(\.rel))
+        }
+    }
+
+    private func binding(for rel: String) -> Binding<Bool> {
+        Binding(
+            get: { selected.contains(rel) },
+            set: { on in
+                if on { selected.insert(rel) } else { selected.remove(rel) }
+            })
+    }
+}
+
+// MARK: - Find files
+
+private struct FindSheet: View {
+    @EnvironmentObject var state: AppState
+    @State private var mask = "*"
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Find files under \(state.remotePath)").font(.headline)
+            HStack {
+                TextField("mask, e.g. *.log", text: $mask)
+                    .onSubmit { state.runFind(mask: mask) }
+                Button("Search") { state.runFind(mask: mask) }
+                    .keyboardShortcut(.defaultAction)
+            }
+            if let results = state.findResults {
+                Text("\(results.hits.count) match(es) for \(results.mask)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                List(results.hits) { hit in
+                    HStack {
+                        Image(systemName: hit.is_dir ? "folder" : "doc")
+                            .foregroundStyle(.secondary)
+                        Text(hit.path).lineLimit(1).truncationMode(.head)
+                        Spacer()
+                        Button("Open dir") {
+                            let parent = (hit.path as NSString).deletingLastPathComponent
+                            state.navigateRemote(parent.isEmpty ? "/" : parent)
+                            state.showFind = false
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                    }
+                }
+                .frame(minHeight: 220)
+            } else {
+                Spacer()
+            }
+            HStack {
+                Spacer()
+                Button("Close") { state.showFind = false }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(14)
+        .frame(width: 560, height: 420)
     }
 }
 

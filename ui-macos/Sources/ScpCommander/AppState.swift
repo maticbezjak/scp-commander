@@ -8,8 +8,13 @@ import SwiftUI
 @MainActor
 final class SessionHandle: Identifiable {
     let id = UUID()
+    /// Browse connection: listings and file management.
     let client = CoreClient()
     let queue = DispatchQueue(label: "net.manto.ScpCommander.session")
+    /// Dedicated transfer connection so a long download never blocks
+    /// browsing (WinSCP's background-transfer model).
+    let transferClient = CoreClient()
+    let transferQueue = DispatchQueue(label: "net.manto.ScpCommander.transfer")
     var remotePath = "/"
     var remoteEntries: [FileEntry] = []
     var connected = false
@@ -59,6 +64,24 @@ final class AppState: ObservableObject {
     /// WinSCP-style Login dialog; shown at startup and via "New Session".
     @Published var showLogin = true
 
+    /// Exclusion masks for folder transfers and sync ("*.tmp; .git/").
+    @Published var excludeMasks =
+        UserDefaults.standard.string(forKey: "excludeMasks") ?? ""
+    {
+        didSet { UserDefaults.standard.set(excludeMasks, forKey: "excludeMasks") }
+    }
+
+    /// Files awaiting an overwrite decision (destination already exists).
+    @Published var overwritePrompt: (pane: PaneKind, entries: [FileEntry])?
+
+    /// Sync dry run awaiting approval in the preview sheet.
+    @Published var syncPreview:
+        (download: Bool, localRoot: String, remoteRoot: String, plan: CoreClient.SyncPlan)?
+
+    /// Results of the last remote Find.
+    @Published var findResults: (mask: String, hits: [CoreClient.FindHit])?
+    @Published var showFind = false
+
     let transfers = TransferQueue()
     let sites = SitesStore()
 
@@ -78,6 +101,84 @@ final class AppState: ObservableObject {
 
     private var keepaliveTimer: Timer?
 
+    /// One open tab, persisted for workspace restore. Passwords stay in the
+    /// Keychain; restore re-fetches them per site key.
+    private struct TabSnapshot: Codable {
+        var proto: Proto
+        var authMode: AuthMode
+        var host: String
+        var port: String
+        var user: String
+        var keyPath: String
+        var bucket: String
+        var region: String
+        var remotePath: String
+        var localPath: String
+    }
+
+    private var workspaceURL: URL {
+        let base =
+            FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("ScpCommander/workspace.json")
+    }
+
+    /// Persist the connected tabs (settings + paths) for the next launch.
+    func saveWorkspace() {
+        var snapshots: [TabSnapshot] = []
+        for (i, session) in sessions.enumerated() where session.connected {
+            // The form fields describe the *active* tab; for others use what
+            // we know from the tab title (proto specifics are best-effort).
+            if i == activeTab {
+                snapshots.append(
+                    TabSnapshot(
+                        proto: proto, authMode: authMode, host: host, port: port, user: user,
+                        keyPath: keyPath, bucket: bucket, region: region,
+                        remotePath: session.remotePath, localPath: localPath))
+            }
+        }
+        if let data = try? JSONEncoder().encode(snapshots) {
+            try? data.write(to: workspaceURL, options: .atomic)
+        }
+    }
+
+    /// Restore the saved workspace: prefill + auto-login where a password is
+    /// stored (or auth needs none). Returns false when there was nothing.
+    private func restoreWorkspace() -> Bool {
+        guard let data = try? Data(contentsOf: workspaceURL),
+            let snapshots = try? JSONDecoder().decode([TabSnapshot].self, from: data),
+            !snapshots.isEmpty
+        else { return false }
+        let snap = snapshots[0]
+        proto = snap.proto
+        authMode = snap.authMode
+        host = snap.host
+        port = snap.port
+        user = snap.user
+        keyPath = snap.keyPath
+        bucket = snap.bucket
+        region = snap.region
+        active.remotePath = snap.remotePath
+        remotePath = snap.remotePath
+        if FileManager.default.fileExists(atPath: snap.localPath) {
+            localPath = snap.localPath
+            loadLocal()
+        }
+        if snap.authMode == .password {
+            let account = Keychain.account(
+                proto: snap.proto, user: snap.user, host: snap.host, port: snap.port)
+            if let stored = Keychain.load(account: account) {
+                password = stored
+                connect()
+                return true
+            }
+            status = "Workspace restored — enter password and Connect"
+            return true
+        }
+        connect()
+        return true
+    }
+
     init() {
         loadLocal()
         // NAT keepalive every 30s for every connected tab; a session that
@@ -90,6 +191,16 @@ final class AppState: ObservableObject {
                     session.queue.async { [client = session.client] in client.keepalive() }
                 }
             }
+        }
+        // Save the workspace on quit; restore last session's tab on launch.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { _ in
+            Task { @MainActor in AppStateRegistry.shared?.saveWorkspace() }
+        }
+        AppStateRegistry.shared = self
+        if restoreWorkspace() {
+            showLogin = false
         }
     }
 
@@ -165,7 +276,9 @@ final class AppState: ObservableObject {
         let site = Site(
             name: name, proto: proto, host: host, port: port, user: user,
             authMode: proto == .sftp ? authMode : .password,
-            keyPath: keyPath, bucket: bucket, region: region)
+            keyPath: keyPath, bucket: bucket, region: region,
+            remoteDir: active.connected ? active.remotePath : "",
+            localDir: active.connected ? localPath : "")
         sites.add(site)
         if saveSitePassword && !password.isEmpty && site.authMode == .password {
             Keychain.save(account: site.keychainAccount, password: password)
@@ -186,6 +299,14 @@ final class AppState: ObservableObject {
         keyPath = site.keyPath
         bucket = site.bucket
         region = site.region
+        if !site.remoteDir.isEmpty {
+            active.remotePath = site.remoteDir
+            remotePath = site.remoteDir
+        }
+        if !site.localDir.isEmpty, FileManager.default.fileExists(atPath: site.localDir) {
+            localPath = site.localDir
+            loadLocal()
+        }
         if site.authMode == .password, let stored = Keychain.load(account: site.keychainAccount) {
             password = stored
             status = "Loaded “\(site.name)” — password from Keychain"
@@ -393,6 +514,16 @@ final class AppState: ObservableObject {
             if session === self.active { self.activeConnected = true }
             self.status = "Connected — \(path) (\(entries.count) items)"
             self.showLogin = false
+            // Bring up the dedicated transfer connection; later transfers
+            // queue behind this on the serial transferQueue, so ordering
+            // guarantees it's connected first.
+            session.transferQueue.async { [client = session.transferClient] in
+                try? client.connect(
+                    proto: p, host: h, port: portNum, user: u, password: pw,
+                    bucket: bkt, region: rgn,
+                    hostKeyMode: .strict, trustedFingerprint: "",
+                    authMode: p == .sftp ? auth : .password, keyPath: key)
+            }
         } onFailure: { [weak self] error in
             guard let self else { return }
             if let core = error as? CoreError, core.isUnknownHostKey,
@@ -527,13 +658,18 @@ final class AppState: ObservableObject {
             uploadFolder(entry)
             return
         }
+        // Resume when the remote copy is a smaller partial of this file.
+        let resume = session.remoteEntries.contains {
+            !$0.isDir && $0.name == entry.name && $0.size > 0 && $0.size < entry.size
+        }
         transferFile(
             on: session,
             remote: pathJoinPosix(session.remotePath, entry.name),
             local: pathJoin(localPath, entry.name),
             name: entry.name,
             size: entry.size,
-            direction: .upload
+            direction: .upload,
+            resumeUpload: resume
         ) { [weak self] in self?.refreshSession(session) }
     }
 
@@ -543,7 +679,8 @@ final class AppState: ObservableObject {
     private func transferFile(
         on session: SessionHandle,
         remote: String, local: String, name: String, size: UInt64,
-        direction: TransferDirection, onDone: @escaping () -> Void
+        direction: TransferDirection, resumeUpload: Bool = false,
+        onDone: @escaping () -> Void
     ) {
         var resumeOffset: UInt64 = 0
         if direction == .download, size > 0,
@@ -561,7 +698,7 @@ final class AppState: ObservableObject {
         let flag = transfer.cancelFlag
         let offset = resumeOffset
 
-        session.queue.async { [weak self, client = session.client] in
+        session.transferQueue.async { [weak self, client = session.transferClient] in
             let progress: (UInt64, UInt64) -> Bool = { done, total in
                 DispatchQueue.main.async { transfer.note(done, total: total) }
                 return !flag.isCancelled
@@ -573,6 +710,10 @@ final class AppState: ObservableObject {
                             remote: remote, local: local, offset: offset, onProgress: progress)
                     }
                     return try client.download(remote: remote, local: local, onProgress: progress)
+                }
+                if resumeUpload {
+                    return try client.uploadResume(
+                        local: local, remote: remote, onProgress: progress)
                 }
                 return try client.upload(local: local, remote: remote, onProgress: progress)
             }
@@ -615,12 +756,73 @@ final class AppState: ObservableObject {
         ) { [weak self] in self?.refreshSession(session) }
     }
 
+    /// Sync is preview-first, WinSCP-style: compute the plan, show the
+    /// checklist sheet, copy only what the user approves.
     func sync(download: Bool) {
         let session = active
         guard session.connected else {
             status = "Connect first to sync"
             return
         }
+        let local = localPath
+        let remote = session.remotePath
+        let excludes = excludeMasks
+        status = "Computing sync preview…"
+        runBusy(on: session, "Computing sync preview…") { [client = session.client] in
+            try client.syncPlan(
+                local: local, remote: remote, download: download, excludes: excludes)
+        } onSuccess: { [weak self] plan in
+            guard let self else { return }
+            if plan.items.isEmpty && plan.dirs.isEmpty {
+                self.status = "Sync preview: nothing to copy — already in sync"
+            } else {
+                self.syncPreview = (download, local, remote, plan)
+                self.status = "\(plan.items.count) file(s) would copy"
+            }
+        }
+    }
+
+    /// Execute approved items from the sync preview.
+    func runSyncItems(_ selected: [CoreClient.SyncPlanItem]) {
+        guard let preview = syncPreview else { return }
+        syncPreview = nil
+        let session = active
+        let download = preview.download
+        let localRoot = preview.localRoot
+        let remoteRoot = preview.remoteRoot
+
+        // Destination directories first.
+        if download {
+            for dir in preview.plan.dirs {
+                try? FileManager.default.createDirectory(
+                    atPath: (localRoot as NSString).appendingPathComponent(dir),
+                    withIntermediateDirectories: true)
+            }
+        } else {
+            let dirs = preview.plan.dirs
+            session.queue.async { [client = session.client] in
+                for dir in dirs {
+                    try? client.mkdir(remoteRoot + (remoteRoot.hasSuffix("/") ? "" : "/") + dir)
+                }
+            }
+        }
+        for item in selected {
+            let name = item.rel.split(separator: "/").last.map(String.init) ?? item.rel
+            let local = (localRoot as NSString).appendingPathComponent(item.rel)
+            let remote = remoteRoot + (remoteRoot.hasSuffix("/") ? "" : "/") + item.rel
+            transferFile(
+                on: session, remote: remote, local: local, name: name, size: item.size,
+                direction: download ? .download : .upload
+            ) { [weak self] in
+                if download { self?.loadLocal() } else { self?.refreshSession(session) }
+            }
+        }
+        status = "Synchronizing \(selected.count) file(s)"
+    }
+
+    @available(*, deprecated, message: "kept for reference; sync is preview-first now")
+    private func syncImmediate(download: Bool) {
+        let session = active
         let local = localPath
         let remote = session.remotePath
         let title = download ? "Sync ⬇ \(remote)" : "Sync ⬆ \(remote)"
@@ -665,12 +867,15 @@ final class AppState: ObservableObject {
         transfers.add(transfer)
         let flag = transfer.cancelFlag
 
-        session.queue.async { [weak self, client = session.client] in
+        let excludes = excludeMasks
+        session.transferQueue.async { [weak self, client = session.transferClient] in
             let handler = Self.folderEventHandler(transfer: transfer, flag: flag)
             let result = Result {
                 direction == .download
-                    ? try client.downloadDir(remote: remote, local: local, onEvent: handler)
-                    : try client.uploadDir(local: local, remote: remote, onEvent: handler)
+                    ? try client.downloadDir(
+                        remote: remote, local: local, excludes: excludes, onEvent: handler)
+                    : try client.uploadDir(
+                        local: local, remote: remote, excludes: excludes, onEvent: handler)
             }
             DispatchQueue.main.async {
                 switch result {
@@ -803,9 +1008,120 @@ final class AppState: ObservableObject {
 
     /// F5: copy the focused pane's selection to the other side.
     func transferSelected() {
-        let pane = focusedPane
-        for entry in selectedEntries(in: pane) {
-            if pane == .local { upload(entry) } else { download(entry) }
+        requestTransfers(selectedEntries(in: focusedPane), from: focusedPane)
+    }
+
+    /// Start transfers with WinSCP-style overwrite protection: entries whose
+    /// destination already holds a same-or-larger file prompt before
+    /// clobbering (smaller partials auto-resume; folders merge as before).
+    func requestTransfers(_ entries: [FileEntry], from pane: PaneKind) {
+        var ready: [FileEntry] = []
+        var conflicts: [FileEntry] = []
+        for e in entries {
+            let conflict: Bool
+            if e.isDir {
+                conflict = false
+            } else if pane == .local {
+                conflict = active.remoteEntries.contains {
+                    !$0.isDir && $0.name == e.name && $0.size >= e.size
+                }
+            } else {
+                let local = (localPath as NSString).appendingPathComponent(e.name)
+                let len =
+                    (try? FileManager.default.attributesOfItem(atPath: local)[.size]
+                        as? NSNumber)?.uint64Value
+                conflict = (len ?? 0) >= e.size && len != nil
+            }
+            if conflict { conflicts.append(e) } else { ready.append(e) }
+        }
+        for e in ready {
+            if pane == .local { upload(e) } else { download(e) }
+        }
+        if !conflicts.isEmpty {
+            overwritePrompt = (pane, conflicts)
+        }
+    }
+
+    /// "Overwrite" chosen in the prompt: replace the existing destinations.
+    func resolveOverwrite(overwrite: Bool) {
+        guard let prompt = overwritePrompt else { return }
+        overwritePrompt = nil
+        guard overwrite else { return }
+        for e in prompt.entries {
+            if prompt.pane == .local { upload(e) } else { download(e) }
+        }
+    }
+
+    /// Recursive remote search (Find Files).
+    func runFind(mask: String) {
+        let session = active
+        guard session.connected, !mask.isEmpty else { return }
+        let base = session.remotePath
+        runBusy(on: session, "Searching \(base) for \(mask)…") { [client = session.client] in
+            try client.find(base: base, mask: mask)
+        } onSuccess: { [weak self] hits in
+            self?.findResults = (mask, hits)
+            self?.status = "Find: \(hits.count) match(es) for \(mask)"
+        }
+    }
+
+    /// Open an interactive SSH session to the current server in Terminal.
+    func openTerminal() {
+        guard active.connected, proto == .sftp, !host.isEmpty else {
+            status = "Terminal sessions need a connected SFTP tab"
+            return
+        }
+        let target = user.isEmpty ? host : "\(user)@\(host)"
+        let ssh = "ssh -p \(port) \(target)"
+        let script = "tell application \"Terminal\"\nactivate\ndo script \"\(ssh)\"\nend tell"
+        let task = Process()
+        task.launchPath = "/usr/bin/osascript"
+        task.arguments = ["-e", script]
+        do {
+            try task.run()
+            status = "Opened Terminal: \(ssh)"
+        } catch {
+            status = "Could not open Terminal: \(error.localizedDescription)"
+        }
+    }
+
+    /// Copy an sftp:// URL for a remote entry to the clipboard.
+    func copyRemoteURL(_ entry: FileEntry) {
+        let scheme = proto == .ftp || proto == .ftps ? "ftp" : proto == .s3 ? "s3" : "sftp"
+        let userPart = user.isEmpty ? "" : "\(user)@"
+        let path = pathJoinPosix(active.remotePath, entry.name)
+        let url = "\(scheme)://\(userPart)\(host):\(port)\(path)"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url, forType: .string)
+        status = "Copied \(url)"
+    }
+
+    /// Upload arbitrary local files/folders (Finder drops) to the remote cwd.
+    func uploadExternal(_ urls: [URL]) {
+        let session = active
+        guard session.connected else {
+            status = "Connect first to upload"
+            return
+        }
+        for url in urls {
+            let name = url.lastPathComponent
+            let remote = pathJoinPosix(session.remotePath, name)
+            var isDir: ObjCBool = false
+            FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+            if isDir.boolValue {
+                runFolderOp(
+                    on: session, name: name, direction: .upload,
+                    remote: remote, local: url.path
+                ) { [weak self] in self?.refreshSession(session) }
+            } else {
+                let size =
+                    (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]
+                        as? NSNumber)?.uint64Value ?? 0
+                transferFile(
+                    on: session, remote: remote, local: url.path, name: name, size: size,
+                    direction: .upload
+                ) { [weak self] in self?.refreshSession(session) }
+            }
         }
     }
 
@@ -915,6 +1231,13 @@ final class AppState: ObservableObject {
             return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
     }
+}
+
+/// Weak hook so the terminate observer can reach the live AppState without
+/// retaining it.
+@MainActor
+enum AppStateRegistry {
+    static weak var shared: AppState?
 }
 
 // MARK: - Path helpers

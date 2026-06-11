@@ -17,11 +17,16 @@ struct Site: Codable, Identifiable, Hashable {
     var keyPath: String
     var bucket: String
     var region: String
+    /// Initial directories applied when the site is loaded (WinSCP's
+    /// "Remote directory" advanced setting). Empty = defaults.
+    var remoteDir: String
+    var localDir: String
 
     init(
         name: String, proto: Proto, host: String, port: String, user: String,
         authMode: AuthMode = .password, keyPath: String = "",
-        bucket: String = "", region: String = ""
+        bucket: String = "", region: String = "",
+        remoteDir: String = "", localDir: String = ""
     ) {
         self.name = name
         self.proto = proto
@@ -32,6 +37,8 @@ struct Site: Codable, Identifiable, Hashable {
         self.keyPath = keyPath
         self.bucket = bucket
         self.region = region
+        self.remoteDir = remoteDir
+        self.localDir = localDir
     }
 
     /// Decode tolerantly so sites.json files from older versions still load.
@@ -47,6 +54,8 @@ struct Site: Codable, Identifiable, Hashable {
         keyPath = try c.decodeIfPresent(String.self, forKey: .keyPath) ?? ""
         bucket = try c.decodeIfPresent(String.self, forKey: .bucket) ?? ""
         region = try c.decodeIfPresent(String.self, forKey: .region) ?? ""
+        remoteDir = try c.decodeIfPresent(String.self, forKey: .remoteDir) ?? ""
+        localDir = try c.decodeIfPresent(String.self, forKey: .localDir) ?? ""
     }
 
     /// WinSCP-style folder: the part before the first "/", if any.
@@ -87,6 +96,8 @@ struct SiteExport: Codable {
     var key_path: String
     var bucket: String
     var region: String
+    var remote_dir: String?
+    var local_dir: String?
 
     init(from site: Site) {
         name = site.name
@@ -98,6 +109,8 @@ struct SiteExport: Codable {
         key_path = site.keyPath
         bucket = site.bucket
         region = site.region
+        remote_dir = site.remoteDir
+        local_dir = site.localDir
     }
 
     var asSite: Site {
@@ -116,7 +129,8 @@ struct SiteExport: Codable {
             }
         return Site(
             name: name, proto: proto, host: host, port: port, user: user,
-            authMode: mode, keyPath: key_path, bucket: bucket, region: region)
+            authMode: mode, keyPath: key_path, bucket: bucket, region: region,
+            remoteDir: remote_dir ?? "", localDir: local_dir ?? "")
     }
 }
 
@@ -209,6 +223,8 @@ final class SitesStore: ObservableObject {
             var fsProtocol = 0
             var ftpSecure = false
             var keyPath = ""
+            var remoteDir = ""
+            var localDir = ""
         }
 
         func decode(_ s: String) -> String {
@@ -242,7 +258,8 @@ final class SitesStore: ObservableObject {
             add(
                 Site(
                     name: p.name, proto: proto, host: p.host, port: port, user: p.user,
-                    authMode: auth, keyPath: p.keyPath))
+                    authMode: auth, keyPath: p.keyPath,
+                    remoteDir: p.remoteDir, localDir: p.localDir))
             current = nil
             return 1
         }
@@ -272,6 +289,8 @@ final class SitesStore: ObservableObject {
             case "FSProtocol": current?.fsProtocol = Int(value) ?? 0
             case "FtpSecure": current?.ftpSecure = value != "0"
             case "PublicKeyFile": current?.keyPath = decode(value)
+            case "RemoteDirectory": current?.remoteDir = decode(value)
+            case "LocalDirectory": current?.localDir = decode(value)
             default: break
             }
         }

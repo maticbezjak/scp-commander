@@ -188,28 +188,28 @@ final class CoreClient: @unchecked Sendable {
 
     @discardableResult
     func downloadDir(
-        remote: String, local: String,
+        remote: String, local: String, excludes: String = "",
         onEvent: @escaping (Int32, String?, UInt64, UInt64) -> Bool
     ) throws -> Int64 {
         guard let session else { throw CoreError(message: "not connected") }
         let box = XferBox(onEvent)
         let ud = Unmanaged.passRetained(box).toOpaque()
         defer { Unmanaged<XferBox>.fromOpaque(ud).release() }
-        let n = scp_download_dir(session, remote, local, Self.xferTrampoline, ud)
+        let n = scp_download_dir(session, remote, local, excludes, Self.xferTrampoline, ud)
         if n < 0 { throw Self.lastError() }
         return n
     }
 
     @discardableResult
     func uploadDir(
-        local: String, remote: String,
+        local: String, remote: String, excludes: String = "",
         onEvent: @escaping (Int32, String?, UInt64, UInt64) -> Bool
     ) throws -> Int64 {
         guard let session else { throw CoreError(message: "not connected") }
         let box = XferBox(onEvent)
         let ud = Unmanaged.passRetained(box).toOpaque()
         defer { Unmanaged<XferBox>.fromOpaque(ud).release() }
-        let n = scp_upload_dir(session, local, remote, Self.xferTrampoline, ud)
+        let n = scp_upload_dir(session, local, remote, excludes, Self.xferTrampoline, ud)
         if n < 0 { throw Self.lastError() }
         return n
     }
@@ -217,14 +217,68 @@ final class CoreClient: @unchecked Sendable {
     /// Returns the number of files copied.
     @discardableResult
     func syncDir(
-        local: String, remote: String, download: Bool,
+        local: String, remote: String, download: Bool, excludes: String = "",
         onEvent: @escaping (Int32, String?, UInt64, UInt64) -> Bool
     ) throws -> Int64 {
         guard let session else { throw CoreError(message: "not connected") }
         let box = XferBox(onEvent)
         let ud = Unmanaged.passRetained(box).toOpaque()
         defer { Unmanaged<XferBox>.fromOpaque(ud).release() }
-        let n = scp_sync_dir(session, local, remote, download ? 1 : 0, Self.xferTrampoline, ud)
+        let n = scp_sync_dir(
+            session, local, remote, download ? 1 : 0, excludes, Self.xferTrampoline, ud)
+        if n < 0 { throw Self.lastError() }
+        return n
+    }
+
+    /// Sync dry run: what would copy, without copying.
+    struct SyncPlan: Codable {
+        var dirs: [String]
+        var items: [SyncPlanItem]
+    }
+
+    struct SyncPlanItem: Codable, Identifiable {
+        var rel: String
+        var size: UInt64
+        var reason: String
+        var id: String { rel }
+    }
+
+    func syncPlan(local: String, remote: String, download: Bool, excludes: String = "")
+        throws -> SyncPlan
+    {
+        guard let session else { throw CoreError(message: "not connected") }
+        guard let raw = scp_sync_plan(session, local, remote, download ? 1 : 0, excludes)
+        else { throw Self.lastError() }
+        defer { scp_string_free(raw) }
+        return try JSONDecoder().decode(SyncPlan.self, from: Data(String(cString: raw).utf8))
+    }
+
+    struct FindHit: Codable, Identifiable {
+        var path: String
+        var is_dir: Bool
+        var size: UInt64
+        var id: String { path }
+    }
+
+    /// Recursive remote search by mask (e.g. "*.log"), capped at `limit`.
+    func find(base: String, mask: String, limit: UInt32 = 500) throws -> [FindHit] {
+        guard let session else { throw CoreError(message: "not connected") }
+        guard let raw = scp_find(session, base, mask, limit) else { throw Self.lastError() }
+        defer { scp_string_free(raw) }
+        return try JSONDecoder().decode([FindHit].self, from: Data(String(cString: raw).utf8))
+    }
+
+    /// Resume an upload (appends after the remote file's current size).
+    @discardableResult
+    func uploadResume(
+        local: String, remote: String,
+        onProgress: @escaping (UInt64, UInt64) -> Bool
+    ) throws -> Int64 {
+        guard let session else { throw CoreError(message: "not connected") }
+        let box = ProgressBox(onProgress)
+        let ud = Unmanaged.passRetained(box).toOpaque()
+        defer { Unmanaged<ProgressBox>.fromOpaque(ud).release() }
+        let n = scp_upload_resume_cb(session, local, remote, Self.trampoline, ud)
         if n < 0 { throw Self.lastError() }
         return n
     }

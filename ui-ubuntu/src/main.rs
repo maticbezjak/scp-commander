@@ -13,6 +13,7 @@
 mod secrets;
 mod sites;
 mod worker;
+mod workspace;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -96,7 +97,12 @@ enum MoveSource {
 /// One server session, WinSCP-tab-style: its own worker thread, connection,
 /// and cached remote listing. The remote pane shows the active session.
 struct Session {
+    /// Browse connection: listings and file management.
     cmd: mpsc::Sender<Cmd>,
+    /// Dedicated transfer connection so a long download never blocks
+    /// browsing (WinSCP's background-transfer model).
+    xfer_cmd: mpsc::Sender<Cmd>,
+    creds: RefCell<Option<Credentials>>,
     remote_path: RefCell<String>,
     connected: Cell<bool>,
     cache: RefCell<Vec<Entry>>,
@@ -139,6 +145,7 @@ struct App {
     pending_connect: RefCell<Option<(Credentials, String)>>,
     pending_fingerprint: RefCell<Option<String>>,
     // Commander state
+    exclude_entry: GtkEntry,
     show_hidden: Cell<bool>,
     focused_local: Cell<bool>,
     /// Transfer id -> source to delete once the move-transfer succeeds.
@@ -375,6 +382,7 @@ impl App {
         } else {
             session.remote_path.borrow().clone()
         };
+        *session.creds.borrow_mut() = Some(creds.clone());
         *self.pending_connect.borrow_mut() = Some((creds.clone(), path.clone()));
         self.set_status("Connecting…");
         let _ = session.cmd.send(Cmd::Connect { creds, path });
@@ -437,11 +445,12 @@ impl App {
         let local = self.local_path.borrow().join(&entry.name);
         if entry.is_dir {
             let (id, cancel) = self.add_transfer(&format!("{}/", entry.name), true, 0);
-            let _ = self.session().cmd.send(Cmd::DownloadDir {
+            let _ = self.session().xfer_cmd.send(Cmd::DownloadDir {
                 id,
                 name: entry.name.clone(),
                 remote,
                 local,
+                excludes: self.exclude_masks(),
                 cancel,
             });
             return Some(id);
@@ -453,7 +462,7 @@ impl App {
                 .filter(|len| *len > 0 && *len < entry.size)
                 .unwrap_or(0);
             let (id, cancel) = self.add_transfer(&entry.name, true, entry.size);
-            let _ = self.session().cmd.send(Cmd::Download {
+            let _ = self.session().xfer_cmd.send(Cmd::Download {
                 id,
                 name: entry.name.clone(),
                 remote,
@@ -474,27 +483,38 @@ impl App {
         let remote = join_posix(&self.session().remote_path.borrow(), &entry.name);
         if entry.is_dir {
             let (id, cancel) = self.add_transfer(&format!("{}/", entry.name), false, 0);
-            let _ = self.session().cmd.send(Cmd::UploadDir {
+            let _ = self.session().xfer_cmd.send(Cmd::UploadDir {
                 id,
                 name: entry.name.clone(),
                 local,
                 remote,
+                excludes: self.exclude_masks(),
                 cancel,
             });
             return Some(id);
         } else {
+            // Resume when the remote file is a smaller partial of this one.
+            let resume = self
+                .session()
+                .cache
+                .borrow()
+                .iter()
+                .any(|r| !r.is_dir && r.name == entry.name && r.size > 0 && r.size < entry.size);
             let (id, cancel) = self.add_transfer(&entry.name, false, entry.size);
-            let _ = self.session().cmd.send(Cmd::Upload {
+            let _ = self.session().xfer_cmd.send(Cmd::Upload {
                 id,
                 name: entry.name.clone(),
                 local,
                 remote,
+                resume,
                 cancel,
             });
             return Some(id);
         }
     }
 
+    /// Sync is preview-first, WinSCP-style: compute the plan, show the
+    /// checklist, copy only what the user approves.
     fn sync(self: &Rc<Self>, download: bool) {
         if !self.session().connected.get() {
             self.set_status("Connect first to sync");
@@ -502,9 +522,79 @@ impl App {
         }
         let local = self.local_path.borrow().clone();
         let remote = self.session().remote_path.borrow().clone();
+        self.set_status("Computing sync preview…");
+        let _ = self.session().cmd.send(Cmd::SyncPlan {
+            download,
+            local,
+            remote,
+            excludes: self.exclude_masks(),
+        });
+    }
+
+    /// Execute approved sync items (rel paths) after the preview.
+    fn run_sync_items(
+        self: &Rc<Self>,
+        download: bool,
+        local_root: &std::path::Path,
+        remote_root: &str,
+        dirs: Vec<String>,
+        items: Vec<(String, u64)>,
+    ) {
+        for d in &dirs {
+            if download {
+                let _ = std::fs::create_dir_all(local_root.join(d));
+            } else {
+                let _ = self
+                    .session()
+                    .cmd
+                    .send(Cmd::Mkdir { path: join_posix(remote_root, d) });
+            }
+        }
+        for (rel, size) in items {
+            let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+            let local = local_root.join(&rel);
+            let remote = join_posix(remote_root, &rel);
+            if download {
+                if let Some(parent) = local.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let (id, cancel) = self.add_transfer(&name, true, size);
+                let _ = self.session().xfer_cmd.send(Cmd::Download {
+                    id,
+                    name,
+                    remote,
+                    local,
+                    resume: 0,
+                    cancel,
+                });
+            } else {
+                let (id, cancel) = self.add_transfer(&name, false, size);
+                let _ = self.session().xfer_cmd.send(Cmd::Upload {
+                    id,
+                    name,
+                    local,
+                    remote,
+                    resume: false,
+                    cancel,
+                });
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn sync_immediate(self: &Rc<Self>, download: bool) {
+        let local = self.local_path.borrow().clone();
+        let remote = self.session().remote_path.borrow().clone();
         let title = format!("Sync {} {}", if download { "⬇" } else { "⬆" }, remote);
         let (id, cancel) = self.add_transfer(&title, download, 0);
-        let _ = self.session().cmd.send(Cmd::Sync { id, download, local, remote, cancel });
+        let _ = self.session().xfer_cmd.send(Cmd::Sync {
+            id,
+            download,
+            local,
+            remote,
+            excludes: self.exclude_masks(),
+            cancel,
+        });
     }
 
     fn add_transfer(&self, name: &str, download: bool, total: u64) -> (u64, Arc<AtomicBool>) {
@@ -636,13 +726,7 @@ impl App {
                 targets.push(entry);
             }
         }
-        for entry in targets {
-            if local_pane {
-                self.upload(&entry);
-            } else {
-                self.download(&entry);
-            }
-        }
+        self.request_transfers(targets, local_pane);
     }
 
     fn menu_open(self: &Rc<Self>, local_pane: bool) {
@@ -784,7 +868,7 @@ impl App {
         self.edit_pending
             .borrow_mut()
             .insert(id, (remote.clone(), local.clone()));
-        let _ = self.session().cmd.send(Cmd::Download {
+        let _ = self.session().xfer_cmd.send(Cmd::Download {
             id,
             name: entry.name.clone(),
             remote,
@@ -881,6 +965,11 @@ impl App {
     fn poll_edits(self: &Rc<Self>) {
         let changed: Vec<(String, PathBuf, mpsc::Sender<Cmd>)> = {
             let mut edits = self.edits.borrow_mut();
+            // Prune watches whose temp file vanished or whose session's
+            // worker is gone (tab closed) — otherwise they pile up forever.
+            edits.retain(|w| {
+                w.local.exists() && w.cmd.send(Cmd::List { path: String::new() }).is_ok()
+            });
             let mut out = Vec::new();
             for watch in edits.iter_mut() {
                 let Ok(meta) = std::fs::metadata(&watch.local) else { continue };
@@ -899,7 +988,7 @@ impl App {
                 .unwrap_or_default();
             let size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
             let (id, cancel) = self.add_transfer(&name, false, size);
-            let _ = cmd.send(Cmd::Upload { id, name, local, remote, cancel });
+            let _ = cmd.send(Cmd::Upload { id, name, local, remote, resume: false, cancel });
         }
     }
 
@@ -929,16 +1018,81 @@ impl App {
         }
     }
 
+    /// Current exclusion masks from the toolbar entry.
+    fn exclude_masks(&self) -> String {
+        self.exclude_entry.text().to_string()
+    }
+
     /// F5: copy the focused pane's selection to the other side.
     fn transfer_selected(self: &Rc<Self>) {
         let local_pane = self.focused_local.get();
-        for entry in self.selected_entries(local_pane) {
-            if local_pane {
-                self.upload(&entry);
+        let entries = self.selected_entries(local_pane);
+        self.request_transfers(entries, local_pane);
+    }
+
+    /// Start transfers with WinSCP-style overwrite protection: entries whose
+    /// destination already holds a same-or-larger file prompt before
+    /// clobbering (smaller partials auto-resume; folders merge as before).
+    fn request_transfers(self: &Rc<Self>, entries: Vec<Entry>, local_pane: bool) {
+        let mut ready = Vec::new();
+        let mut conflicts = Vec::new();
+        for e in entries {
+            let conflict = if e.is_dir {
+                false
+            } else if local_pane {
+                // Upload: destination is the remote listing.
+                self.session()
+                    .cache
+                    .borrow()
+                    .iter()
+                    .any(|r| !r.is_dir && r.name == e.name && r.size >= e.size)
             } else {
-                self.download(&entry);
+                // Download: destination is the local directory.
+                std::fs::metadata(self.local_path.borrow().join(&e.name))
+                    .map(|m| m.len() >= e.size)
+                    .unwrap_or(false)
+            };
+            if conflict {
+                conflicts.push(e);
+            } else {
+                ready.push(e);
             }
         }
+        for e in &ready {
+            if local_pane {
+                self.upload(e);
+            } else {
+                self.download(e);
+            }
+        }
+        if conflicts.is_empty() {
+            return;
+        }
+        let message = if conflicts.len() == 1 {
+            format!("{} already exists at the destination.", conflicts[0].name)
+        } else {
+            format!("{} files already exist at the destination.", conflicts.len())
+        };
+        let state = self.clone();
+        let dialog = gtk::AlertDialog::builder()
+            .message(message)
+            .detail("Overwrite replaces the existing copies.")
+            .buttons(["Cancel", "Skip existing", "Overwrite"])
+            .cancel_button(0)
+            .default_button(1)
+            .build();
+        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |result| {
+            if result != Ok(2) {
+                return; // cancel or skip - existing files stay untouched
+            }
+            for e in &conflicts {
+                if local_pane {
+                    state.upload(e);
+                } else {
+                    state.download(e);
+                }
+            }
+        });
     }
 
     fn navigate_local(self: &Rc<Self>, text: &str) {
@@ -965,6 +1119,169 @@ impl App {
 
     fn set_focus(self: &Rc<Self>, local: bool) {
         self.focused_local.set(local);
+    }
+
+    /// Open an interactive SSH session to the current server in a terminal.
+    fn open_terminal(self: &Rc<Self>) {
+        let session = self.session();
+        let Some(creds) = session.creds.borrow().clone() else {
+            self.set_status("Connect first");
+            return;
+        };
+        if creds.protocol != Protocol::Sftp {
+            self.set_status("Terminal sessions need SFTP (SSH)");
+            return;
+        }
+        let target = if creds.username.is_empty() {
+            creds.host.clone()
+        } else {
+            format!("{}@{}", creds.username, creds.host)
+        };
+        let ssh = format!("ssh -p {} {}", creds.port, target);
+        // Try the common terminal emulators in order.
+        let candidates: [(&str, Vec<&str>); 4] = [
+            ("x-terminal-emulator", vec!["-e"]),
+            ("gnome-terminal", vec!["--"]),
+            ("konsole", vec!["-e"]),
+            ("xterm", vec!["-e"]),
+        ];
+        for (bin, args) in candidates {
+            let mut cmd = std::process::Command::new(bin);
+            for a in &args {
+                cmd.arg(a);
+            }
+            if args == ["--"] {
+                cmd.args(["ssh", "-p", &creds.port.to_string(), &target]);
+            } else {
+                cmd.arg(&ssh);
+            }
+            if cmd.spawn().is_ok() {
+                self.set_status(&format!("Opened terminal: {ssh}"));
+                return;
+            }
+        }
+        self.set_status("No terminal emulator found (tried x-terminal-emulator, gnome-terminal, konsole, xterm)");
+    }
+
+    /// Copy an sftp:// URL for the menu-target remote entry to the clipboard.
+    fn copy_remote_url(self: &Rc<Self>) {
+        let Some(entry) = self.menu_entry(false) else { return };
+        let session = self.session();
+        let Some(creds) = session.creds.borrow().clone() else { return };
+        let scheme = match creds.protocol {
+            Protocol::Ftp | Protocol::Ftps => "ftp",
+            Protocol::S3 => "s3",
+            _ => "sftp",
+        };
+        let path = join_posix(&session.remote_path.borrow(), &entry.name);
+        let user = if creds.username.is_empty() {
+            String::new()
+        } else {
+            format!("{}@", creds.username)
+        };
+        let url = format!("{scheme}://{user}{}:{}{path}", creds.host, creds.port);
+        if let Some(display) = gdk::Display::default() {
+            display.clipboard().set_text(&url);
+            self.set_status(&format!("Copied {url}"));
+        }
+    }
+
+    /// Persist the open tabs (settings + paths) for the next launch.
+    fn save_workspace(&self) {
+        let mut ws = workspace::Workspace::default();
+        for session in self.sessions.borrow().iter() {
+            let Some(creds) = session.creds.borrow().clone() else { continue };
+            if !session.connected.get() {
+                continue;
+            }
+            ws.tabs.push(workspace::TabState {
+                proto: match creds.protocol {
+                    Protocol::Ftp => 1,
+                    Protocol::Ftps => 2,
+                    Protocol::S3 => 3,
+                    _ => 0,
+                },
+                host: creds.host.clone(),
+                port: creds.port.to_string(),
+                user: creds.username.clone(),
+                auth: match &creds.auth {
+                    Auth::KeyFile { .. } => 1,
+                    Auth::Agent => 2,
+                    _ => 0,
+                },
+                key_path: match &creds.auth {
+                    Auth::KeyFile { path, .. } => path.clone(),
+                    _ => String::new(),
+                },
+                bucket: creds.bucket.clone().unwrap_or_default(),
+                region: creds.region.clone().unwrap_or_default(),
+                remote_path: session.remote_path.borrow().clone(),
+                local_path: self.local_path.borrow().to_string_lossy().into_owned(),
+            });
+        }
+        workspace::save(&ws);
+    }
+
+    /// Recreate last session's tabs; auto-login where credentials are
+    /// available (keyring password, key file, or agent). Returns false when
+    /// there was nothing to restore.
+    fn restore_workspace(self: &Rc<Self>) -> bool {
+        let ws = workspace::load();
+        if ws.tabs.is_empty() {
+            return false;
+        }
+        let mut restored = false;
+        for (i, tab) in ws.tabs.iter().enumerate() {
+            if i > 0 {
+                let session = create_session(self);
+                self.sessions.borrow_mut().push(session);
+                let last = self.sessions.borrow().len() - 1;
+                self.active_tab.set(last);
+            }
+            // Prefill the form so a failed auto-login leaves a ready dialog.
+            self.proto_dd.set_selected(tab.proto);
+            self.auth_dd.set_selected(tab.auth);
+            self.host_entry.set_text(&tab.host);
+            self.port_entry.set_text(&tab.port);
+            self.user_entry.set_text(&tab.user);
+            self.key_entry.set_text(&tab.key_path);
+            self.bucket_entry.set_text(&tab.bucket);
+            self.region_entry.set_text(&tab.region);
+            let p = PathBuf::from(&tab.local_path);
+            if p.is_dir() {
+                *self.local_path.borrow_mut() = p;
+            }
+            *self.session().remote_path.borrow_mut() = tab.remote_path.clone();
+            let password = if tab.auth == 0 {
+                secrets::load(&secrets::account(
+                    PROTO_LABELS[tab.proto as usize % 4],
+                    &tab.user,
+                    &tab.host,
+                    &tab.port,
+                ))
+            } else {
+                None
+            };
+            match password {
+                Some(pw) => {
+                    self.pass_entry.set_text(&pw);
+                    self.connect_clicked();
+                    restored = true;
+                }
+                None if tab.auth != 0 => {
+                    self.connect_clicked();
+                    restored = true;
+                }
+                None => {
+                    // No stored password: leave the prefilled login dialog up.
+                    self.login_window.present();
+                    restored = true;
+                }
+            }
+        }
+        self.load_local();
+        self.refresh_tabs();
+        restored
     }
 
     // -- Sites (WinSCP-style) -------------------------------------------------
@@ -1007,6 +1324,16 @@ impl App {
             return;
         }
         let is_sftp = proto_from_index(self.proto_dd.selected()) == Protocol::Sftp;
+        // Remember the current directories so loading the site lands there
+        // (WinSCP's "Remote directory" advanced setting).
+        let (remote_dir, local_dir) = if self.session().connected.get() {
+            (
+                self.session().remote_path.borrow().clone(),
+                self.local_path.borrow().to_string_lossy().into_owned(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
         let site = Site {
             name: name.to_string(),
             proto: self.proto_dd.selected(),
@@ -1017,6 +1344,8 @@ impl App {
             key_path: self.key_entry.text().to_string(),
             bucket: self.bucket_entry.text().to_string(),
             region: self.region_entry.text().to_string(),
+            remote_dir,
+            local_dir,
         };
         let account = Self::site_account(&site);
         self.sites.borrow_mut().add(site);
@@ -1045,6 +1374,16 @@ impl App {
         self.key_entry.set_text(&site.key_path);
         self.bucket_entry.set_text(&site.bucket);
         self.region_entry.set_text(&site.region);
+        if !site.remote_dir.is_empty() {
+            *self.session().remote_path.borrow_mut() = site.remote_dir.clone();
+        }
+        if !site.local_dir.is_empty() {
+            let p = PathBuf::from(&site.local_dir);
+            if p.is_dir() {
+                *self.local_path.borrow_mut() = p;
+                self.load_local();
+            }
+        }
         if site.auth == 0 {
             if let Some(password) = secrets::load(&Self::site_account(&site)) {
                 self.pass_entry.set_text(&password);
@@ -1191,12 +1530,41 @@ impl App {
 
     /// Handle an event from `session`'s worker. Pane/status updates only
     /// apply when that session is the active tab; caches always update.
-    fn handle_event(self: &Rc<Self>, session: &Rc<Session>, event: Event) {
+    /// Events from the dedicated transfer worker only drive transfer rows.
+    fn handle_event(self: &Rc<Self>, session: &Rc<Session>, event: Event, from_transfer: bool) {
         let is_active = Rc::ptr_eq(session, &self.session());
+        if from_transfer {
+            match &event {
+                Event::Progress { .. }
+                | Event::FileStart { .. }
+                | Event::FileDone { .. }
+                | Event::Done { .. }
+                | Event::Cancelled { .. }
+                | Event::Failed { .. } => {}
+                Event::Error(m) => {
+                    self.set_status(&format!("Transfer error: {m}"));
+                    return;
+                }
+                // Connected/Listed etc. from the transfer connection are
+                // bookkeeping only — never touch the panes.
+                _ => return,
+            }
+        }
         match event {
             Event::Connected { path, entries } | Event::Listed { path, entries } => {
                 let first_connect = !session.connected.get();
                 session.connected.set(true);
+                if first_connect && !from_transfer {
+                    // Bring up the dedicated transfer connection. Commands
+                    // sent later queue behind this Connect in the channel,
+                    // so ordering guarantees it's ready before any transfer.
+                    if let Some(creds) = session.creds.borrow().clone() {
+                        let _ = session.xfer_cmd.send(Cmd::Connect {
+                            creds,
+                            path: "/".to_string(),
+                        });
+                    }
+                }
                 let mut entries = entries;
                 sort_entries(&mut entries);
                 let count = entries.len();
@@ -1372,6 +1740,17 @@ impl App {
                     let _ = session.cmd.send(Cmd::List { path });
                 }
             }
+            Event::SyncPlanReady { download, local, remote, plan } => {
+                if plan.items.is_empty() && plan.dirs.is_empty() {
+                    self.set_status("Sync preview: nothing to copy — already in sync");
+                } else {
+                    sync_preview_dialog(self, download, local, remote, plan);
+                }
+            }
+            Event::FindResults { base, mask, hits } => {
+                self.set_status(&format!("Find: {} match(es) for {mask}", hits.len()));
+                find_results_dialog(self, &base, &mask, hits);
+            }
             Event::Error(message) => {
                 self.set_status(&format!("Error: {message}"));
                 // A failed typed navigation must not leave the path bar
@@ -1414,8 +1793,12 @@ impl Pane {
 fn create_session(state: &Rc<App>) -> Rc<Session> {
     let (event_tx, event_rx) = async_channel::unbounded::<Event>();
     let cmd = worker::spawn(event_tx);
+    let (xfer_tx, xfer_rx) = async_channel::unbounded::<Event>();
+    let xfer_cmd = worker::spawn(xfer_tx);
     let session = Rc::new(Session {
         cmd,
+        xfer_cmd,
+        creds: RefCell::new(None),
         remote_path: RefCell::new("/".to_string()),
         connected: Cell::new(false),
         cache: RefCell::new(Vec::new()),
@@ -1426,7 +1809,16 @@ fn create_session(state: &Rc<App>) -> Rc<Session> {
         let session = session.clone();
         async move {
             while let Ok(event) = event_rx.recv().await {
-                state.handle_event(&session, event);
+                state.handle_event(&session, event, false);
+            }
+        }
+    });
+    glib::spawn_future_local({
+        let state = state.clone();
+        let session = session.clone();
+        async move {
+            while let Ok(event) = xfer_rx.recv().await {
+                state.handle_event(&session, event, true);
             }
         }
     });
@@ -1528,6 +1920,7 @@ fn build_ui(app: &Application) {
         let region_label = region_label.clone();
         let region_entry = region_entry.clone();
         let insecure_label = insecure_label.clone();
+        let host_for_warn = host_entry.clone();
         let last_proto = std::cell::Cell::new(u32::MAX);
         Rc::new(move || {
             let selected = proto_dd.selected();
@@ -1564,13 +1957,23 @@ fn build_ui(app: &Application) {
             bucket_entry.set_visible(is_s3);
             region_label.set_visible(is_s3);
             region_entry.set_visible(is_s3);
-            insecure_label.set_visible(selected == 1); // plain FTP
+            // Plain FTP, or an explicit http:// S3 endpoint: cleartext.
+            let host_text = host_for_warn.text().to_string();
+            let insecure = selected == 1 || (is_s3 && host_text.starts_with("http://"));
+            insecure_label.set_text(if is_s3 {
+                "\u{26a0} http:// endpoint sends credentials and data unencrypted."
+            } else {
+                "\u{26a0} Plain FTP sends your password and data unencrypted \u{2014} prefer SFTP or FTPS."
+            });
+            insecure_label.set_visible(insecure);
         })
     };
     let hook = update_form.clone();
     proto_dd.connect_selected_notify(move |_| hook());
     let hook = update_form.clone();
     auth_dd.connect_selected_notify(move |_| hook());
+    let hook = update_form.clone();
+    host_entry.connect_changed(move |_| hook());
 
     // Login dialog buttons + main-window toolbar ------------------------------
     let login_btn = Button::with_label("Login");
@@ -1590,6 +1993,15 @@ fn build_ui(app: &Application) {
         .margin_start(6)
         .margin_end(6)
         .build();
+    let exclude_entry = GtkEntry::builder()
+        .placeholder_text("exclude: *.tmp; .git/")
+        .max_width_chars(22)
+        .tooltip_text("Exclusion masks for folder transfers and sync")
+        .build();
+    let find_btn = Button::from_icon_name("system-search-symbolic");
+    find_btn.set_tooltip_text(Some("Find remote files (mask, e.g. *.log)"));
+    let terminal_btn = Button::from_icon_name("utilities-terminal-symbolic");
+    terminal_btn.set_tooltip_text(Some("Open SSH session in a terminal"));
     let hidden_btn = gtk::ToggleButton::new();
     hidden_btn.set_icon_name("view-reveal-symbolic");
     hidden_btn.set_tooltip_text(Some("Show hidden files"));
@@ -1605,7 +2017,10 @@ fn build_ui(app: &Application) {
     main_toolbar.append(&gtk::Separator::new(Orientation::Vertical));
     main_toolbar.append(&sync_up_btn);
     main_toolbar.append(&sync_down_btn);
+    main_toolbar.append(&find_btn);
+    main_toolbar.append(&terminal_btn);
     main_toolbar.append(&hidden_btn);
+    main_toolbar.append(&exclude_entry);
     main_toolbar.append(&hint);
 
     // Panes ------------------------------------------------------------------
@@ -1831,6 +2246,7 @@ fn build_ui(app: &Application) {
         hostkey_label,
         pending_connect: RefCell::new(None),
         pending_fingerprint: RefCell::new(None),
+        exclude_entry,
         show_hidden: Cell::new(false),
         focused_local: Cell::new(true),
         pending_move: RefCell::new(HashMap::new()),
@@ -1900,6 +2316,28 @@ fn build_ui(app: &Application) {
     sync_down_btn.connect_clicked(glib::clone!(
         #[strong] state,
         move |_| state.sync(true)
+    ));
+    find_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| {
+            if !state.session().connected.get() {
+                state.set_status("Connect first to search");
+                return;
+            }
+            let st = state.clone();
+            prompt(&state.window, "Find files (mask, e.g. *.log)", "*", move |mask| {
+                if mask.is_empty() {
+                    return;
+                }
+                let base = st.session().remote_path.borrow().clone();
+                st.set_status(&format!("Searching {base} for {mask}..."));
+                let _ = st.session().cmd.send(Cmd::Find { base, mask });
+            });
+        }
+    ));
+    terminal_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| state.open_terminal()
     ));
     clear_btn.connect_clicked(glib::clone!(
         #[strong] state,
@@ -2197,6 +2635,53 @@ fn build_ui(app: &Application) {
     ));
     remote_view.add_controller(remote_drop);
 
+    // Files dropped from a file manager (Nautilus/Finder) upload directly.
+    let uri_drop = DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+    uri_drop.connect_drop(glib::clone!(
+        #[strong] state,
+        move |_, value, _, _| {
+            let Ok(files) = value.get::<gdk::FileList>() else { return false };
+            if !state.session().connected.get() {
+                state.set_status("Connect first to upload");
+                return false;
+            }
+            let mut any = false;
+            for file in files.files() {
+                let Some(path) = file.path() else { continue };
+                let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned())
+                else {
+                    continue;
+                };
+                let remote = join_posix(&state.session().remote_path.borrow(), &name);
+                if path.is_dir() {
+                    let (id, cancel) = state.add_transfer(&format!("{name}/"), false, 0);
+                    let _ = state.session().xfer_cmd.send(Cmd::UploadDir {
+                        id,
+                        name,
+                        local: path,
+                        remote,
+                        excludes: state.exclude_masks(),
+                        cancel,
+                    });
+                } else {
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    let (id, cancel) = state.add_transfer(&name, false, size);
+                    let _ = state.session().xfer_cmd.send(Cmd::Upload {
+                        id,
+                        name,
+                        local: path,
+                        remote,
+                        resume: false,
+                        cancel,
+                    });
+                }
+                any = true;
+            }
+            any
+        }
+    ));
+    remote_view.add_controller(uri_drop);
+
     // Edit-in-editor mtime polling -------------------------------------------------
     glib::timeout_add_seconds_local(
         2,
@@ -2209,10 +2694,22 @@ fn build_ui(app: &Application) {
         ),
     );
 
+    // Save the workspace (open tabs + paths) when the window closes.
+    window.connect_close_request(glib::clone!(
+        #[strong] state,
+        move |_| {
+            state.save_workspace();
+            glib::Propagation::Proceed
+        }
+    ));
+
     window.set_child(Some(&root));
     window.present();
-    // WinSCP opens with the Login dialog.
-    login_window.present();
+
+    // Restore last session's tabs; fall back to the Login dialog.
+    if !state.restore_workspace() {
+        login_window.present();
+    }
 }
 
 /// WinSCP-style per-pane command toolbar appended to the pane header:
@@ -2521,6 +3018,8 @@ fn setup_context_menu(state: &Rc<App>, view: &ColumnView, hook: &MenuHook, local
             false,
             Box::new(move || s.menu_edit()),
         );
+        let s = state.clone();
+        add_item("Copy URL", false, Box::new(move || s.copy_remote_url()));
     }
     {
         let s = state.clone();
@@ -2761,6 +3260,148 @@ fn properties_dialog(
         let win = win.clone();
         close.connect_clicked(move |_| win.close());
     }
+    win.set_child(Some(&content));
+    win.present();
+}
+
+/// WinSCP-style synchronization checklist: per-file checkboxes, copy only
+/// what the user approves.
+fn sync_preview_dialog(
+    state: &Rc<App>,
+    download: bool,
+    local_root: std::path::PathBuf,
+    remote_root: String,
+    plan: scp_core::ops::SyncPlan,
+) {
+    let win = gtk::Window::builder()
+        .transient_for(&state.window)
+        .modal(true)
+        .title(format!(
+            "Synchronize {} — preview",
+            if download { "remote → local" } else { "local → remote" }
+        ))
+        .default_width(520)
+        .default_height(420)
+        .build();
+
+    let list = GtkBox::builder().orientation(Orientation::Vertical).spacing(2).build();
+    let mut checks: Vec<(gtk::CheckButton, String, u64)> = Vec::new();
+    for item in &plan.items {
+        let check = gtk::CheckButton::builder()
+            .active(true)
+            .label(format!(
+                "{}  ({}, {})",
+                item.rel,
+                human_size(item.size),
+                item.reason.label()
+            ))
+            .build();
+        list.append(&check);
+        checks.push((check, item.rel.clone(), item.size));
+    }
+    let scroller = ScrolledWindow::builder().vexpand(true).child(&list).build();
+
+    let summary = Label::builder()
+        .label(format!(
+            "{} file(s) to copy, {} folder(s) to create",
+            plan.items.len(),
+            plan.dirs.len()
+        ))
+        .xalign(0.0)
+        .build();
+    summary.add_css_class("dim-label");
+
+    let apply = Button::with_label("Synchronize");
+    apply.add_css_class("suggested-action");
+    let cancel = Button::with_label("Cancel");
+    let buttons = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    buttons.append(&cancel);
+    buttons.append(&apply);
+
+    let content = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .margin_top(10)
+        .margin_bottom(10)
+        .margin_start(10)
+        .margin_end(10)
+        .build();
+    content.append(&summary);
+    content.append(&scroller);
+    content.append(&buttons);
+    win.set_child(Some(&content));
+
+    {
+        let win = win.clone();
+        cancel.connect_clicked(move |_| win.close());
+    }
+    {
+        let state = state.clone();
+        let win = win.clone();
+        let dirs = plan.dirs.clone();
+        apply.connect_clicked(move |_| {
+            let selected: Vec<(String, u64)> = checks
+                .iter()
+                .filter(|(c, _, _)| c.is_active())
+                .map(|(_, rel, size)| (rel.clone(), *size))
+                .collect();
+            state.run_sync_items(download, &local_root, &remote_root, dirs.clone(), selected);
+            win.close();
+        });
+    }
+    win.present();
+}
+
+/// Results of a remote Find: activate a row to jump to its directory.
+fn find_results_dialog(state: &Rc<App>, base: &str, mask: &str, hits: Vec<(String, Entry)>) {
+    let win = gtk::Window::builder()
+        .transient_for(&state.window)
+        .title(format!("Find \"{mask}\" under {base} — {} match(es)", hits.len()))
+        .default_width(560)
+        .default_height(420)
+        .build();
+    let list = ListBox::builder().selection_mode(SelectionMode::None).build();
+    for (path, e) in &hits {
+        let label = Label::builder()
+            .label(if e.is_dir {
+                format!("{path}/")
+            } else {
+                format!("{path}  ({})", human_size(e.size))
+            })
+            .xalign(0.0)
+            .margin_top(2)
+            .margin_bottom(2)
+            .margin_start(6)
+            .build();
+        list.append(&label);
+    }
+    let paths: Vec<String> = hits.iter().map(|(p, _)| p.clone()).collect();
+    list.set_activate_on_single_click(false);
+    {
+        let state = state.clone();
+        let win = win.clone();
+        list.connect_row_activated(move |_, row| {
+            if let Some(path) = paths.get(row.index().max(0) as usize) {
+                let parent = parent_posix(path);
+                let _ = state.session().cmd.send(Cmd::List { path: parent });
+                win.close();
+            }
+        });
+    }
+    let hint = Label::builder()
+        .label("Double-click a result to open its directory")
+        .xalign(0.0)
+        .margin_start(8)
+        .build();
+    hint.add_css_class("dim-label");
+    hint.add_css_class("caption");
+    let content = GtkBox::builder().orientation(Orientation::Vertical).spacing(4).build();
+    content.append(&hint);
+    content.append(&ScrolledWindow::builder().vexpand(true).child(&list).build());
     win.set_child(Some(&content));
     win.present();
 }

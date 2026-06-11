@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-use scp_core::ops::{self, SyncDirection, XferEvent};
+use scp_core::ops::{self, Filter, SyncDirection, SyncPlan, XferEvent};
 use scp_core::types::{Credentials, Entry, Error};
 use scp_core::{connect, Transport};
 
@@ -28,10 +28,22 @@ pub enum Cmd {
         resume: u64,
         cancel: Arc<AtomicBool>,
     },
-    Upload { id: u64, name: String, local: PathBuf, remote: String, cancel: Arc<AtomicBool> },
-    DownloadDir { id: u64, name: String, remote: String, local: PathBuf, cancel: Arc<AtomicBool> },
-    UploadDir { id: u64, name: String, local: PathBuf, remote: String, cancel: Arc<AtomicBool> },
-    Sync { id: u64, download: bool, local: PathBuf, remote: String, cancel: Arc<AtomicBool> },
+    Upload {
+        id: u64,
+        name: String,
+        local: PathBuf,
+        remote: String,
+        /// Append after the remote file's current size instead of replacing.
+        resume: bool,
+        cancel: Arc<AtomicBool>,
+    },
+    DownloadDir { id: u64, name: String, remote: String, local: PathBuf, excludes: String, cancel: Arc<AtomicBool> },
+    UploadDir { id: u64, name: String, local: PathBuf, remote: String, excludes: String, cancel: Arc<AtomicBool> },
+    Sync { id: u64, download: bool, local: PathBuf, remote: String, excludes: String, cancel: Arc<AtomicBool> },
+    /// Sync dry run; result arrives as Event::SyncPlanReady.
+    SyncPlan { download: bool, local: PathBuf, remote: String, excludes: String },
+    /// Recursive remote search; result arrives as Event::FindResults.
+    Find { base: String, mask: String },
     Mkdir { path: String },
     Delete { path: String, is_dir: bool },
     Rename { from: String, to: String },
@@ -54,6 +66,10 @@ pub enum Event {
     Failed { id: u64, message: String },
     /// A remote management op (mkdir/delete/rename) finished; refresh.
     OpOk { message: String },
+    /// Result of Cmd::SyncPlan.
+    SyncPlanReady { download: bool, local: PathBuf, remote: String, plan: SyncPlan },
+    /// Result of Cmd::Find.
+    FindResults { base: String, mask: String, hits: Vec<(String, Entry)> },
     Error(String),
 }
 
@@ -113,29 +129,70 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                     });
                 }
 
-                Cmd::Upload { id, name, local, remote, cancel } => {
+                Cmd::Upload { id, name, local, remote, resume, cancel } => {
                     transfer(&mut session, &send, id, name, cancel, false, |t, progress| {
-                        t.upload_progress(&local, &remote, progress)
+                        if resume {
+                            t.upload_resume(&local, &remote, progress)
+                        } else {
+                            t.upload_progress(&local, &remote, progress)
+                        }
                     });
                 }
 
-                Cmd::DownloadDir { id, name, remote, local, cancel } => {
+                Cmd::DownloadDir { id, name, remote, local, excludes, cancel } => {
+                    let filter = Filter::parse(&excludes);
                     multi(&mut session, &send, id, name, cancel, true, |t, cb| {
-                        ops::download_dir(t, &remote, &local, cb)
+                        ops::download_dir(t, &remote, &local, &filter, cb)
                     });
                 }
 
-                Cmd::UploadDir { id, name, local, remote, cancel } => {
+                Cmd::UploadDir { id, name, local, remote, excludes, cancel } => {
+                    let filter = Filter::parse(&excludes);
                     multi(&mut session, &send, id, name, cancel, false, |t, cb| {
-                        ops::upload_dir(t, &local, &remote, cb)
+                        ops::upload_dir(t, &local, &remote, &filter, cb)
                     });
                 }
 
-                Cmd::Sync { id, download, local, remote, cancel } => {
+                Cmd::Sync { id, download, local, remote, excludes, cancel } => {
+                    let filter = Filter::parse(&excludes);
                     let dir = if download { SyncDirection::Download } else { SyncDirection::Upload };
                     let name = format!("Sync {}", if download { "⬇" } else { "⬆" });
                     multi(&mut session, &send, id, name, cancel, download, |t, cb| {
-                        ops::sync_dir(t, &local, &remote, dir, cb).map(|s| s.copied as u64)
+                        ops::sync_dir(t, &local, &remote, dir, &filter, cb)
+                            .map(|s| s.copied as u64)
+                    });
+                }
+
+                Cmd::SyncPlan { download, local, remote, excludes } => {
+                    let dir = if download {
+                        SyncDirection::Download
+                    } else {
+                        SyncDirection::Upload
+                    };
+                    let filter = Filter::parse(&excludes);
+                    with_session(&mut session, &send, |t| {
+                        match ops::plan_sync(t, &local, &remote, dir, &filter) {
+                            Ok(plan) => send(Event::SyncPlanReady {
+                                download,
+                                local: local.clone(),
+                                remote: remote.clone(),
+                                plan,
+                            }),
+                            Err(e) => send(Event::Error(format!("sync preview failed: {e}"))),
+                        }
+                    });
+                }
+
+                Cmd::Find { base, mask } => {
+                    with_session(&mut session, &send, |t| {
+                        match ops::find(t, &base, &mask, 500, &mut || true) {
+                            Ok(hits) => send(Event::FindResults {
+                                base: base.clone(),
+                                mask: mask.clone(),
+                                hits,
+                            }),
+                            Err(e) => send(Event::Error(format!("find failed: {e}"))),
+                        }
                     });
                 }
 

@@ -29,6 +29,12 @@ pub struct Site {
     pub bucket: String,
     #[serde(default)]
     pub region: String,
+    /// Initial directories applied when the site is loaded (WinSCP's
+    /// "Remote directory" advanced setting). Empty = defaults.
+    #[serde(default)]
+    pub remote_dir: String,
+    #[serde(default)]
+    pub local_dir: String,
 }
 
 impl Site {
@@ -74,6 +80,10 @@ struct SiteExport {
     bucket: String,
     #[serde(default)]
     region: String,
+    #[serde(default)]
+    remote_dir: String,
+    #[serde(default)]
+    local_dir: String,
 }
 
 impl SiteExport {
@@ -88,6 +98,8 @@ impl SiteExport {
             key_path: site.key_path.clone(),
             bucket: site.bucket.clone(),
             region: site.region.clone(),
+            remote_dir: site.remote_dir.clone(),
+            local_dir: site.local_dir.clone(),
         }
     }
 
@@ -113,6 +125,8 @@ impl SiteExport {
             key_path: self.key_path,
             bucket: self.bucket,
             region: self.region,
+            remote_dir: self.remote_dir,
+            local_dir: self.local_dir,
         }
     }
 }
@@ -224,6 +238,8 @@ impl SitesStore {
                 "FSProtocol" => session.fs_protocol = value.parse().unwrap_or(0),
                 "FtpSecure" => session.ftp_secure = value != "0",
                 "PublicKeyFile" => session.key_path = url_decode(value),
+                "RemoteDirectory" => session.remote_dir = url_decode(value),
+                "LocalDirectory" => session.local_dir = url_decode(value),
                 _ => {}
             }
         }
@@ -274,6 +290,8 @@ impl SitesStore {
             key_path: s.key_path,
             bucket: String::new(),
             region: String::new(),
+            remote_dir: s.remote_dir,
+            local_dir: s.local_dir,
         });
         true
     }
@@ -310,6 +328,8 @@ struct WinScpSession {
     fs_protocol: u32,
     ftp_secure: bool,
     key_path: String,
+    remote_dir: String,
+    local_dir: String,
 }
 
 /// Decode WinSCP's %XX escapes (session names, key paths).
@@ -432,6 +452,8 @@ mod tests {
             key_path: String::new(),
             bucket: "backups".into(),
             region: "us-east-1".into(),
+            remote_dir: String::new(),
+            local_dir: String::new(),
         });
         let json = s.export_interchange().unwrap();
         let mut other = store();
