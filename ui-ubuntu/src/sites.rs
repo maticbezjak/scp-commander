@@ -313,19 +313,37 @@ struct WinScpSession {
 }
 
 /// Decode WinSCP's %XX escapes (session names, key paths).
+///
+/// Works purely on bytes: slicing the &str at byte offsets panicked when a
+/// `%` was followed by part of a multibyte UTF-8 character (a crafted .ini
+/// could crash the app). Embedded NULs are stripped — they'd otherwise break
+/// every later CString bridge.
 fn url_decode(input: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
-                out.push(b);
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                let value = (h << 4) | l;
+                if value != 0 {
+                    out.push(value);
+                }
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i]);
+        if bytes[i] != 0 {
+            out.push(bytes[i]);
+        }
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -389,6 +407,16 @@ mod tests {
         let keyed = by_name("Keyed");
         assert_eq!(keyed.auth, 1);
         assert_eq!(keyed.key_path, "C:\\keys\\id.ppk");
+    }
+
+    #[test]
+    fn url_decode_is_panic_proof() {
+        // Regression: "%aé" used to panic (str slice inside a multibyte char).
+        assert_eq!(url_decode("%a\u{e9}"), "%a\u{e9}");
+        assert_eq!(url_decode("My%20Site"), "My Site");
+        assert_eq!(url_decode("a%00b"), "ab"); // NULs stripped
+        assert_eq!(url_decode("%"), "%");
+        assert_eq!(url_decode("%zz"), "%zz");
     }
 
     #[test]

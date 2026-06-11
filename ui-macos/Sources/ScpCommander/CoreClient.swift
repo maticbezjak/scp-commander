@@ -20,7 +20,9 @@ enum Proto: Int32, Codable, CaseIterable {
 
 /// One row in a directory listing (local or remote).
 struct FileEntry: Identifiable, Hashable {
-    var id = UUID()
+    /// Stable across refreshes (names are unique within a directory) so the
+    /// selection survives a relist — a fresh UUID per listing wiped it.
+    var id: String { name }
     var name: String
     var isDir: Bool
     var size: UInt64

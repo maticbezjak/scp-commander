@@ -118,6 +118,16 @@ impl Transport for SftpTransport {
         progress: Progress,
     ) -> Result<u64> {
         use std::io::Seek;
+        // The caller's offset is advisory only: the authoritative resume
+        // point is the local file's actual length. This also makes retries
+        // (e.g. AutoReconnect re-running this op after a mid-stream failure)
+        // safe — a second attempt resumes from wherever the first stopped
+        // instead of appending the same bytes twice.
+        let _ = offset;
+        let local_file = File::options().append(true).create(true).open(local)?;
+        let offset = local_file.metadata()?.len();
+        let mut local_file = local_file;
+
         let mut remote_file = self
             .sftp
             .open(Path::new(remote))
@@ -127,7 +137,6 @@ impl Transport for SftpTransport {
         remote_file
             .seek(std::io::SeekFrom::Start(offset))
             .map_err(|e| Error::Protocol(e.to_string()))?;
-        let mut local_file = File::options().append(true).open(local)?;
         let mut report = |done: u64, total: u64| progress(offset + done, total);
         let n = copy_with_progress(&mut remote_file, &mut local_file, total, &mut report)?;
         preserve_mtime(&local_file, stat.and_then(|s| s.mtime));
@@ -183,8 +192,12 @@ impl Transport for SftpTransport {
     }
 
     fn keepalive(&mut self) -> Result<()> {
-        self.session
-            .keepalive_send()
+        // keepalive_send only WRITES a packet — on a half-open connection the
+        // write succeeds into the void, so it cannot detect a dead session.
+        // Keep it for NAT warming, but probe liveness with a real round trip.
+        let _ = self.session.keepalive_send();
+        self.sftp
+            .stat(Path::new("."))
             .map(|_| ())
             .map_err(|e| Error::Protocol(e.to_string()))
     }
@@ -218,7 +231,7 @@ fn verify_host_key(session: &Session, creds: &Credentials) -> Result<()> {
     let fingerprint = sha256_fingerprint(session)
         .ok_or_else(|| Error::Connect("could not hash server host key".into()))?;
 
-    let mut mismatch = false;
+    let mut matched = false;
     for path in [user_known_hosts_path(), app_known_hosts_path()]
         .into_iter()
         .flatten()
@@ -231,13 +244,18 @@ fn verify_host_key(session: &Session, creds: &Credentials) -> Result<()> {
             continue; // unreadable/corrupt file — treat as no information
         }
         match store.check_port(&creds.host, creds.port, key) {
-            CheckResult::Match => return Ok(()),
-            CheckResult::Mismatch => mismatch = true,
+            CheckResult::Match => matched = true,
+            // Fail-closed: a recorded mismatch in ANY store (most importantly
+            // the user's authoritative ~/.ssh/known_hosts) is terminal — a
+            // Match elsewhere must not override it.
+            CheckResult::Mismatch => {
+                return Err(Error::HostKeyMismatch { fingerprint });
+            }
             CheckResult::NotFound | CheckResult::Failure => {}
         }
     }
-    if mismatch {
-        return Err(Error::HostKeyMismatch { fingerprint });
+    if matched {
+        return Ok(());
     }
 
     match &creds.host_key {
@@ -265,6 +283,12 @@ fn remember_host_key(
         .ok_or_else(|| Error::Connect("cannot locate home directory".into()))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
+        // The same dir holds sites.json (hostnames/usernames) — keep it private.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
 
     let mut store = session

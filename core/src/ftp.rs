@@ -85,11 +85,17 @@ impl Transport for FtpTransport {
             // Skip lines the parser doesn't understand rather than failing the
             // whole listing — FTP server output formats vary widely.
             if let Ok(f) = line.parse::<ListFile>() {
+                let mtime = f
+                    .modified()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs() as i64)
+                    .filter(|m| *m > 0);
                 out.push(Entry {
                     name: f.name().to_string(),
                     is_dir: f.is_directory(),
                     size: f.size() as u64,
-                    mtime: None,
+                    mtime,
                     perms: None,
                     is_symlink: f.is_symlink(),
                 });
@@ -132,7 +138,11 @@ impl Transport for FtpTransport {
     ) -> Result<u64> {
         let total = with_conn!(self, c => c.size(remote).ok()).unwrap_or(0) as u64;
         let mtime = with_conn!(self, c => c.mdtm(remote).ok());
-        let mut local_file = File::options().append(true).open(local)?;
+        // The caller's offset is advisory; resume from the file's true length
+        // so retries can never append the same bytes twice.
+        let _ = offset;
+        let mut local_file = File::options().append(true).create(true).open(local)?;
+        let offset = local_file.metadata()?.len();
         let mut report = |done: u64, total: u64| progress(offset + done, total);
         let n = with_conn!(self, c => {
             c.resume_transfer(offset as usize)

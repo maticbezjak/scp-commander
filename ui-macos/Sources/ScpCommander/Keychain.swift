@@ -18,11 +18,18 @@ enum Keychain {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        let update: [String: Any] = [kSecValueData as String: data]
+        // ThisDeviceOnly: server passwords should not migrate to other
+        // devices via iCloud Keychain or restored backups.
+        let accessible = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        let update: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: accessible,
+        ]
         let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
         if status == errSecItemNotFound {
             var insert = query
             insert[kSecValueData as String] = data
+            insert[kSecAttrAccessible as String] = accessible
             SecItemAdd(insert as CFDictionary, nil)
         }
     }

@@ -143,9 +143,10 @@ struct App {
     focused_local: Cell<bool>,
     /// Transfer id -> source to delete once the move-transfer succeeds.
     pending_move: RefCell<HashMap<u64, MoveSource>>,
-    // Context menus
-    local_menu_index: Cell<u32>,
-    remote_menu_index: Cell<u32>,
+    // Context menus: the clicked/selected Entry is captured at popup time so
+    // an async listing refresh can't retarget the action at a different row.
+    local_menu_target: RefCell<Option<Entry>>,
+    remote_menu_target: RefCell<Option<Entry>>,
     sites_menu_index: Cell<usize>,
     // Edit-in-editor
     edit_pending: RefCell<HashMap<u64, (String, PathBuf)>>,
@@ -365,10 +366,32 @@ impl App {
 
     fn start_connect(&self, creds: Credentials) {
         self.hostkey_bar.set_visible(false);
-        let path = self.session().remote_path.borrow().clone();
+        let session = self.session();
+        // Reusing a tab to reach a DIFFERENT server: the old server's cwd
+        // almost certainly doesn't exist there - start at "/" instead.
+        let target = Self::session_label(&creds);
+        let path = if session.connected.get() && *session.title.borrow() != target {
+            "/".to_string()
+        } else {
+            session.remote_path.borrow().clone()
+        };
         *self.pending_connect.borrow_mut() = Some((creds.clone(), path.clone()));
         self.set_status("Connecting…");
-        let _ = self.session().cmd.send(Cmd::Connect { creds, path });
+        let _ = session.cmd.send(Cmd::Connect { creds, path });
+    }
+
+    /// "user@host" (or bucket) label for a set of credentials.
+    fn session_label(creds: &Credentials) -> String {
+        let target = if creds.host.is_empty() {
+            creds.bucket.clone().unwrap_or_default()
+        } else {
+            creds.host.clone()
+        };
+        if creds.username.is_empty() {
+            target
+        } else {
+            format!("{}@{}", creds.username, target)
+        }
     }
 
     /// "Trust & Connect" on the host key bar: retry pinned to the approved key.
@@ -587,22 +610,22 @@ impl App {
     /// Point the menu index at the pane's first selected row (for toolbar
     /// buttons that reuse menu actions). Returns false when nothing's selected.
     fn select_for_menu(&self, local_pane: bool) -> bool {
-        let Some(first) = self.selected_indices(local_pane).first().copied() else {
+        let Some(entry) = self.selected_entries(local_pane).into_iter().next() else {
             return false;
         };
         if local_pane {
-            self.local_menu_index.set(first);
+            *self.local_menu_target.borrow_mut() = Some(entry);
         } else {
-            self.remote_menu_index.set(first);
+            *self.remote_menu_target.borrow_mut() = Some(entry);
         }
         true
     }
 
     fn menu_entry(&self, local_pane: bool) -> Option<Entry> {
         if local_pane {
-            self.local.entry_at(self.local_menu_index.get())
+            self.local_menu_target.borrow().clone()
         } else {
-            self.remote.entry_at(self.remote_menu_index.get())
+            self.remote_menu_target.borrow().clone()
         }
     }
 
@@ -623,15 +646,19 @@ impl App {
     }
 
     fn menu_open(self: &Rc<Self>, local_pane: bool) {
-        let index = if local_pane {
-            self.local_menu_index.get()
-        } else {
-            self.remote_menu_index.get()
-        };
+        let Some(entry) = self.menu_entry(local_pane) else { return };
         if local_pane {
-            self.open_local(index);
+            if entry.is_dir {
+                self.local_path.borrow_mut().push(&entry.name);
+                self.load_local();
+            } else {
+                self.upload(&entry);
+            }
+        } else if entry.is_dir {
+            let path = join_posix(&self.session().remote_path.borrow(), &entry.name);
+            let _ = self.session().cmd.send(Cmd::List { path });
         } else {
-            self.open_remote(index);
+            self.download(&entry);
         }
     }
 
@@ -734,10 +761,21 @@ impl App {
             return;
         }
         let remote = join_posix(&self.session().remote_path.borrow(), &entry.name);
-        let dir = glib::tmp_dir()
-            .join("scp-commander-edit")
-            .join(format!("{}", self.next_id.borrow()));
-        if std::fs::create_dir_all(&dir).is_err() {
+        // Per-user runtime dir (XDG_RUNTIME_DIR is 0700) + a random leaf:
+        // a fixed, sequential path under shared /tmp would let other local
+        // users pre-create it and read or replace the file being edited.
+        let base = glib::user_runtime_dir().join("scp-commander-edit");
+        if std::fs::create_dir_all(&base).is_err() {
+            self.set_status("Could not create temp directory");
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
+        }
+        let dir = base.join(glib::uuid_string_random().as_str());
+        if std::fs::create_dir(&dir).is_err() {
             self.set_status("Could not create temp directory");
             return;
         }
@@ -1164,24 +1202,15 @@ impl App {
                 let count = entries.len();
                 *session.remote_path.borrow_mut() = path.clone();
                 *session.cache.borrow_mut() = entries.clone();
-                if first_connect {
-                    let title = self
-                        .pending_connect
-                        .borrow()
-                        .as_ref()
-                        .map(|(c, _)| {
-                            let target = if c.host.is_empty() {
-                                c.bucket.clone().unwrap_or_default()
-                            } else {
-                                c.host.clone()
-                            };
-                            if c.username.is_empty() {
-                                target
-                            } else {
-                                format!("{}@{}", c.username, target)
-                            }
-                        })
-                        .unwrap_or_default();
+                // Retitle on every (re)connect, not just the first one - a
+                // tab reused for a different server kept its stale title.
+                let title = self
+                    .pending_connect
+                    .borrow()
+                    .as_ref()
+                    .map(|(c, _)| Self::session_label(c))
+                    .unwrap_or_default();
+                if !title.is_empty() && *session.title.borrow() != title {
                     *session.title.borrow_mut() = title;
                     self.refresh_tabs();
                 }
@@ -1326,10 +1355,14 @@ impl App {
             }
             Event::Cancelled { id, name } => {
                 self.finish_row(id, "cancelled", false);
+                self.pending_move.borrow_mut().remove(&id);
+                self.edit_pending.borrow_mut().remove(&id);
                 self.set_status(&format!("Cancelled {name}"));
             }
             Event::Failed { id, message } => {
                 self.finish_row(id, &format!("failed: {message}"), false);
+                self.pending_move.borrow_mut().remove(&id);
+                self.edit_pending.borrow_mut().remove(&id);
                 self.set_status(&format!("Error: {message}"));
             }
             Event::OpOk { message } => {
@@ -1339,7 +1372,16 @@ impl App {
                     let _ = session.cmd.send(Cmd::List { path });
                 }
             }
-            Event::Error(message) => self.set_status(&format!("Error: {message}")),
+            Event::Error(message) => {
+                self.set_status(&format!("Error: {message}"));
+                // A failed typed navigation must not leave the path bar
+                // showing a directory we never entered.
+                if is_active {
+                    self.remote
+                        .path_entry
+                        .set_text(&session.remote_path.borrow());
+                }
+            }
         }
     }
 }
@@ -1459,6 +1501,14 @@ fn build_ui(app: &Application) {
     form.attach(&bucket_entry, 1, 6, 1, 1);
     form.attach(&region_label, 0, 7, 1, 1);
     form.attach(&region_entry, 1, 7, 1, 1);
+    let insecure_label = Label::builder()
+        .label("\u{26a0} Plain FTP sends your password and data unencrypted \u{2014} prefer SFTP or FTPS.")
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .build();
+    insecure_label.add_css_class("warning");
+    form.attach(&insecure_label, 0, 8, 5, 1);
 
     // The pickers drive the default port, field visibility, and label text.
     let update_form = {
@@ -1477,13 +1527,22 @@ fn build_ui(app: &Application) {
         let bucket_entry = bucket_entry.clone();
         let region_label = region_label.clone();
         let region_entry = region_entry.clone();
+        let insecure_label = insecure_label.clone();
+        let last_proto = std::cell::Cell::new(u32::MAX);
         Rc::new(move || {
             let selected = proto_dd.selected();
             let is_s3 = selected == 3;
             let is_sftp = selected == 0;
             let auth = if is_sftp { auth_dd.selected() } else { 0 };
-            port_entry
-                .set_text(&Credentials::default_port(proto_from_index(selected)).to_string());
+            // Only reset the port when the protocol actually changed - the
+            // auth dropdown also runs this hook and must not clobber a
+            // custom port the user typed.
+            if last_proto.get() != selected {
+                last_proto.set(selected);
+                port_entry.set_text(
+                    &Credentials::default_port(proto_from_index(selected)).to_string(),
+                );
+            }
             auth_label.set_visible(is_sftp);
             auth_dd2.set_visible(is_sftp);
             let show_key = is_sftp && auth == 1;
@@ -1505,6 +1564,7 @@ fn build_ui(app: &Application) {
             bucket_entry.set_visible(is_s3);
             region_label.set_visible(is_s3);
             region_entry.set_visible(is_s3);
+            insecure_label.set_visible(selected == 1); // plain FTP
         })
     };
     let hook = update_form.clone();
@@ -1774,8 +1834,8 @@ fn build_ui(app: &Application) {
         show_hidden: Cell::new(false),
         focused_local: Cell::new(true),
         pending_move: RefCell::new(HashMap::new()),
-        local_menu_index: Cell::new(0),
-        remote_menu_index: Cell::new(0),
+        local_menu_target: RefCell::new(None),
+        remote_menu_target: RefCell::new(None),
         sites_menu_index: Cell::new(0),
         edit_pending: RefCell::new(HashMap::new()),
         edits: RefCell::new(Vec::new()),
@@ -2022,6 +2082,8 @@ fn build_ui(app: &Application) {
     }
 
     // Keyboard commander: F5 copy, F6 move, F2 rename, Del, Backspace, Tab.
+    let local_view_for_keys = local_view.clone();
+    let remote_view_for_keys = remote_view.clone();
     let keys = gtk::EventControllerKey::new();
     keys.connect_key_pressed(glib::clone!(
         #[strong] state,
@@ -2064,8 +2126,15 @@ fn build_ui(app: &Application) {
                     }
                     glib::Propagation::Stop
                 }
-                gdk::Key::Tab => {
+                gdk::Key::Tab | gdk::Key::ISO_Left_Tab => {
                     state.set_focus(!local);
+                    // Move real keyboard focus too, so arrows/Enter and the
+                    // visible selection follow the commander's focused pane.
+                    if local {
+                        remote_view_for_keys.grab_focus();
+                    } else {
+                        local_view_for_keys.grab_focus();
+                    }
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -2474,11 +2543,12 @@ fn setup_context_menu(state: &Rc<App>, view: &ColumnView, hook: &MenuHook, local
         if !pane.selection.is_selected(index) {
             pane.selection.select_item(index, true);
         }
+        let entry = pane.entry_at(index);
         if local_pane {
-            s.local_menu_index.set(index);
+            *s.local_menu_target.borrow_mut() = entry;
             s.set_focus(true);
         } else {
-            s.remote_menu_index.set(index);
+            *s.remote_menu_target.borrow_mut() = entry;
             s.set_focus(false);
         }
         popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));

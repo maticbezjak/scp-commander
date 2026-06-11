@@ -481,6 +481,14 @@ private struct SessionForm: View {
                     }
                 }
             }
+            if state.proto == .ftp {
+                Label(
+                    "Plain FTP sends your password and data unencrypted — prefer SFTP or FTPS.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            }
             Spacer()
         }
         .padding(14)

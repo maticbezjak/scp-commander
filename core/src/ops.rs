@@ -55,6 +55,11 @@ pub fn download_dir(
     let entries = t.list_dir(remote)?;
     let mut bytes = 0u64;
     for e in entries {
+        if e.is_dir && e.is_symlink {
+            // Never recurse through symlinked directories: they can form
+            // cycles and point outside the tree being copied.
+            continue;
+        }
         let child_remote = join(remote, &e.name);
         let child_local = local.join(&e.name);
         if e.is_dir {
@@ -87,13 +92,15 @@ pub fn upload_dir(t: &mut dyn Transport, local: &Path, remote: &str, cb: XferCb)
     Ok(bytes)
 }
 
-/// Recursively delete a remote directory.
+/// Recursively delete a remote directory. Symlinks are unlinked, never
+/// followed — recursing through a link would delete the *target's* contents.
 pub fn remove_dir_all(t: &mut dyn Transport, path: &str) -> Result<()> {
     for e in t.list_dir(path)? {
         let child = join(path, &e.name);
-        if e.is_dir {
+        if e.is_dir && !e.is_symlink {
             remove_dir_all(t, &child)?;
         } else {
+            // Plain file, or a symlink (to anything): remove the node itself.
             t.remove_file(&child)?;
         }
     }
@@ -150,6 +157,9 @@ fn sync_inner(
         SyncDirection::Download => {
             fs::create_dir_all(local)?;
             for e in t.list_dir(remote)? {
+                if e.is_dir && e.is_symlink {
+                    continue; // never sync through symlinked directories
+                }
                 let child_remote = join(remote, &e.name);
                 let child_local = local.join(&e.name);
                 if e.is_dir {
@@ -235,10 +245,12 @@ mod tests {
     use crate::transport::Progress;
 
     /// In-memory Transport: object keys → contents, plus an explicit dir set.
+    /// Paths in `symlinks` are reported as symlinked directories.
     #[derive(Default)]
     struct FakeTransport {
         files: BTreeMap<String, Vec<u8>>,
         dirs: std::collections::BTreeSet<String>,
+        symlinks: std::collections::BTreeSet<String>,
     }
 
     impl FakeTransport {
@@ -262,7 +274,7 @@ mod tests {
                             size: 0,
                             mtime: None,
                             perms: None,
-                            is_symlink: false,
+                            is_symlink: self.symlinks.contains(d),
                         });
                     }
                 }
@@ -313,10 +325,16 @@ mod tests {
         }
 
         fn remove_file(&mut self, path: &str) -> Result<()> {
-            self.files
-                .remove(&Self::norm(path))
-                .map(|_| ())
-                .ok_or_else(|| Error::Protocol("no such file".into()))
+            let key = Self::norm(path);
+            if self.files.remove(&key).is_some() {
+                return Ok(());
+            }
+            // Unlinking a symlinked directory removes the link node only.
+            if self.symlinks.remove(&key) {
+                self.dirs.remove(&key);
+                return Ok(());
+            }
+            Err(Error::Protocol("no such file".into()))
         }
 
         fn remove_dir(&mut self, path: &str) -> Result<()> {
@@ -407,6 +425,30 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Cancelled));
         assert_eq!(starts, 2);
+        let _ = fs::remove_dir_all(&local);
+    }
+
+    #[test]
+    fn remove_dir_all_unlinks_symlinked_dirs_without_recursing() {
+        let mut t = fake_with(&[("/d/file", "x"), ("/elsewhere/secret", "s")], &["/d", "/elsewhere"]);
+        // /d/link is a symlinked dir; its "target" /elsewhere must survive.
+        t.dirs.insert("/d/link".into());
+        t.symlinks.insert("/d/link".into());
+        remove_dir_all(&mut t, "/d").unwrap();
+        assert!(t.files.contains_key("/elsewhere/secret"), "deleted through a symlink!");
+        assert!(!t.dirs.contains("/d"));
+        assert!(!t.dirs.contains("/d/link"));
+    }
+
+    #[test]
+    fn download_dir_skips_symlinked_dirs() {
+        let mut t = fake_with(&[("/d/real.txt", "ok"), ("/d/link/inner.txt", "no")], &["/d"]);
+        t.dirs.insert("/d/link".into());
+        t.symlinks.insert("/d/link".into());
+        let local = tempdir("symdl");
+        download_dir(&mut t, "/d", &local, &mut |_| true).unwrap();
+        assert!(local.join("real.txt").exists());
+        assert!(!local.join("link").exists(), "recursed through a symlink!");
         let _ = fs::remove_dir_all(&local);
     }
 

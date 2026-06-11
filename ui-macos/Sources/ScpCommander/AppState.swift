@@ -119,6 +119,9 @@ final class AppState: ObservableObject {
             sessions = [SessionHandle()]
             tabTitles = ["New Session"]
         }
+        // Closing a tab LEFT of the active one shifts indices: without this
+        // the active pane silently jumps to a different server.
+        if index < activeTab { activeTab -= 1 }
         activeTab = min(activeTab, sessions.count - 1)
         publishActive()
     }

@@ -155,9 +155,12 @@ mod imp {
             for page in pages {
                 // "Folders" — common prefixes under the delimiter.
                 for cp in page.common_prefixes.unwrap_or_default() {
+                    // strip_prefix, not trim_start_matches: the latter strips
+                    // REPEATS, so "photos/photos/" under "photos/" vanished.
                     let name = cp
                         .prefix
-                        .trim_start_matches(&prefix)
+                        .strip_prefix(&prefix)
+                        .unwrap_or(&cp.prefix)
                         .trim_end_matches('/')
                         .to_string();
                     if !name.is_empty() {
@@ -176,15 +179,22 @@ mod imp {
                     if obj.key == prefix {
                         continue; // the prefix placeholder itself
                     }
-                    let name = obj.key.trim_start_matches(&prefix).to_string();
+                    let name = obj
+                        .key
+                        .strip_prefix(&prefix)
+                        .unwrap_or(&obj.key)
+                        .to_string();
                     if name.is_empty() || name.contains('/') {
                         continue;
                     }
+                    let mtime = chrono::DateTime::parse_from_rfc3339(&obj.last_modified)
+                        .ok()
+                        .map(|d| d.timestamp());
                     out.push(Entry {
                         name,
                         is_dir: false,
                         size: obj.size,
-                        mtime: None,
+                        mtime,
                         perms: None,
                         is_symlink: false,
                     });

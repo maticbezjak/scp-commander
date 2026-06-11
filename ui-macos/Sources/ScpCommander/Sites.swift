@@ -215,13 +215,15 @@ final class SitesStore: ObservableObject {
             s.removingPercentEncoding ?? s
         }
 
-        var count = 0
         var current: Pending?
 
-        func flush() {
+        // Returns 1 when a complete session was flushed into the store.
+        // (A local-func + captured-counter version confused the compiler's
+        // reachability analysis into a bogus "will never execute" warning.)
+        func flush() -> Int {
             guard let p = current, !p.host.isEmpty, !p.name.isEmpty else {
                 current = nil
-                return
+                return 0
             }
             // WinSCP FSProtocol: 5 = FTP (FtpSecure upgrades to FTPS),
             // 7 = S3, everything else is the SSH family → SFTP here.
@@ -241,14 +243,15 @@ final class SitesStore: ObservableObject {
                 Site(
                     name: p.name, proto: proto, host: p.host, port: port, user: p.user,
                     authMode: auth, keyPath: p.keyPath))
-            count += 1
             current = nil
+            return 1
         }
 
+        var count = 0
         for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.hasPrefix("[") {
-                flush()
+                count += flush()
                 if line.hasPrefix("[Sessions\\"), line.hasSuffix("]") {
                     let name = String(line.dropFirst("[Sessions\\".count).dropLast())
                     if name != "Default%20Settings" {
@@ -272,7 +275,7 @@ final class SitesStore: ObservableObject {
             default: break
             }
         }
-        flush()
+        count += flush()
         guard count > 0 else {
             throw CoreError(message: "no [Sessions\\…] entries found — is this a WinSCP.ini?")
         }
