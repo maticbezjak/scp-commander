@@ -65,6 +65,14 @@ struct CoreError: LocalizedError {
 
     var isUnknownHostKey: Bool { code == SCP_ERR_UNKNOWN_HOST_KEY }
     var isHostKeyMismatch: Bool { code == SCP_ERR_HOST_KEY_MISMATCH }
+    /// True for IO/network-level failures that warrant a reconnect prompt.
+    var isNetworkError: Bool {
+        code != SCP_ERR_UNKNOWN_HOST_KEY && code != SCP_ERR_HOST_KEY_MISMATCH
+            && (message.contains("timed out") || message.contains("Connection")
+                || message.contains("network") || message.contains("broken pipe")
+                || message.contains("EOF") || message.contains("reset by peer")
+                || message.contains("list failed") || message.contains("not connected"))
+    }
 }
 
 enum HostKeyMode: Int32 {

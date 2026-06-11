@@ -109,6 +109,11 @@ final class AppState: ObservableObject {
     @Published var findResults: (mask: String, hits: [CoreClient.FindHit])?
     @Published var showFind = false
 
+    /// Reconnect prompt: shown when a browse error hits an already-connected session.
+    @Published var reconnectMessage: String? = nil
+    @Published var reconnectCountdown = 30
+    private var reconnectTimer: Timer?
+
     let transfers = TransferQueue()
     let sites = SitesStore()
 
@@ -574,6 +579,38 @@ final class AppState: ObservableObject {
                 self.status = "Error: \(error.localizedDescription)"
             }
         }
+    }
+
+    // MARK: - Reconnect
+
+    func showReconnectDialog(message: String) {
+        reconnectCountdown = 30
+        reconnectMessage = "Network error: \(message)"
+        reconnectTimer?.invalidate()
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.reconnectCountdown <= 1 {
+                    t.invalidate()
+                    self.reconnectMessage = nil
+                    self.connect()
+                } else {
+                    self.reconnectCountdown -= 1
+                }
+            }
+        }
+    }
+
+    func dismissReconnect() {
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+        reconnectMessage = nil
+    }
+
+    func triggerReconnect() {
+        dismissReconnect()
+        connect()
     }
 
     func openRemote(_ entry: FileEntry) {
@@ -1363,7 +1400,15 @@ final class AppState: ObservableObject {
                     if let onFailure {
                         onFailure(error)
                     } else {
-                        self.status = "Error: \(error.localizedDescription)"
+                        let msg = error.localizedDescription
+                        self.status = "Error: \(msg)"
+                        // Show reconnect dialog for network errors on active sessions.
+                        if session.connected && self.reconnectMessage == nil {
+                            let isNetworkError = (error as? CoreError)?.isNetworkError ?? true
+                            if isNetworkError {
+                                self.showReconnectDialog(message: msg)
+                            }
+                        }
                     }
                 }
             }

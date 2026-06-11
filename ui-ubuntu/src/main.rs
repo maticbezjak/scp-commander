@@ -398,6 +398,17 @@ impl App {
         let _ = session.cmd.send(Cmd::Connect { creds, path, silent: false });
     }
 
+    /// Reconnect the given session using its stored credentials (called by the
+    /// reconnect dialog countdown or button).
+    fn do_connect(&self, session: Rc<Session>) {
+        if let Some(creds) = session.creds.borrow().clone() {
+            let path = session.remote_path.borrow().clone();
+            session.connected.set(false);
+            self.set_status("Reconnecting…");
+            let _ = session.cmd.send(Cmd::Connect { creds, path, silent: false });
+        }
+    }
+
     /// "user@host" (or bucket) label for a set of credentials.
     fn session_label(creds: &Credentials) -> String {
         let target = if creds.host.is_empty() {
@@ -1900,6 +1911,10 @@ impl App {
                         .path_entry
                         .set_text(&session.remote_path.borrow());
                 }
+                // Offer reconnect when a browse error hits an established session.
+                if !from_transfer && session.connected.get() {
+                    reconnect_dialog(self, session, &message);
+                }
             }
         }
     }
@@ -2317,6 +2332,52 @@ fn build_ui(app: &Application) {
         .margin_bottom(4)
         .build();
 
+    // Bottom command bar -------------------------------------------------------
+    let cmd_bar = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(4)
+        .margin_start(6)
+        .margin_end(6)
+        .margin_top(3)
+        .margin_bottom(3)
+        .build();
+
+    // Synchronize menu button
+    let sync_menu = gio::Menu::new();
+    sync_menu.append(Some("Local → Remote (upload changes)"), Some("win.sync-up"));
+    sync_menu.append(Some("Remote → Local (download changes)"), Some("win.sync-down"));
+    let sync_btn = gtk::MenuButton::builder()
+        .label("Synchronize")
+        .menu_model(&sync_menu)
+        .build();
+    sync_btn.set_tooltip_text(Some("Synchronize panes"));
+    cmd_bar.append(&sync_btn);
+
+    // Separator
+    let sep1 = gtk::Separator::new(Orientation::Vertical);
+    sep1.set_margin_start(4);
+    sep1.set_margin_end(4);
+    cmd_bar.append(&sep1);
+
+    // Queue button
+    let queue_btn = Button::with_label("Queue");
+    queue_btn.set_tooltip_text(Some("Show/hide the transfer queue"));
+    cmd_bar.append(&queue_btn);
+
+    // Separator
+    let sep2 = gtk::Separator::new(Orientation::Vertical);
+    sep2.set_margin_start(4);
+    sep2.set_margin_end(4);
+    cmd_bar.append(&sep2);
+
+    // Transfer Settings label (non-interactive for now — speed limit via menu)
+    let xfer_settings_lbl = Label::builder()
+        .label("Transfer Settings: Default")
+        .xalign(0.0)
+        .build();
+    xfer_settings_lbl.add_css_class("dim-label");
+    cmd_bar.append(&xfer_settings_lbl);
+
     // Sites sidebar ------------------------------------------------------------
     // WinSCP behavior: single click selects/edits, double click logs in.
     let sites_list = ListBox::builder()
@@ -2422,6 +2483,8 @@ fn build_ui(app: &Application) {
     content.append(&tabs_box);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
     content.append(&panes);
+    content.append(&gtk::Separator::new(Orientation::Horizontal));
+    content.append(&cmd_bar);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
     content.append(&status);
 
@@ -2566,6 +2629,25 @@ fn build_ui(app: &Application) {
         #[strong] state,
         move |_| state.cancel_all()
     ));
+    queue_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| state.transfers_window.present()
+    ));
+    // Sync menu actions for the bottom command bar
+    {
+        let sync_up = gio::SimpleAction::new("sync-up", None);
+        sync_up.connect_activate(glib::clone!(
+            #[strong] state,
+            move |_, _| state.sync(false)
+        ));
+        window.add_action(&sync_up);
+        let sync_down = gio::SimpleAction::new("sync-down", None);
+        sync_down.connect_activate(glib::clone!(
+            #[strong] state,
+            move |_, _| state.sync(true)
+        ));
+        window.add_action(&sync_down);
+    }
     clear_btn.connect_clicked(glib::clone!(
         #[strong] state,
         move |_| state.clear_finished()
@@ -3369,6 +3451,96 @@ fn setup_context_menu(state: &Rc<App>, view: &ColumnView, hook: &MenuHook, local
         popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         popover.popup();
     }));
+}
+
+/// Reconnect dialog: network error on an active session.
+/// Shows the error message with a countdown Reconnect button (auto-fires at 0).
+fn reconnect_dialog(state: &Rc<App>, session: &Rc<Session>, message: &str) {
+    let win = gtk::Window::builder()
+        .title("Network Error")
+        .transient_for(&state.window)
+        .modal(true)
+        .resizable(false)
+        .default_width(420)
+        .build();
+
+    let vbox = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(12)
+        .margin_top(20)
+        .margin_bottom(16)
+        .margin_start(20)
+        .margin_end(20)
+        .build();
+
+    // Icon + message row
+    let msg_row = GtkBox::builder().orientation(Orientation::Horizontal).spacing(12).build();
+    let icon = gtk::Image::from_icon_name("network-error-symbolic");
+    icon.set_pixel_size(40);
+    let msg_lbl = Label::builder()
+        .label(&format!("Network error:\n{message}"))
+        .wrap(true)
+        .xalign(0.0)
+        .max_width_chars(50)
+        .build();
+    msg_row.append(&icon);
+    msg_row.append(&msg_lbl);
+    vbox.append(&msg_row);
+    vbox.append(&gtk::Separator::new(Orientation::Horizontal));
+
+    // Buttons row
+    let btn_row = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .build();
+
+    let cancel_btn = Button::with_label("Cancel");
+    let reconnect_btn = Button::with_label("Reconnect (30 s)");
+    reconnect_btn.add_css_class("suggested-action");
+
+    btn_row.append(&cancel_btn);
+    btn_row.append(&gtk::Box::builder().hexpand(true).build()); // spacer
+    btn_row.append(&reconnect_btn);
+    vbox.append(&btn_row);
+    win.set_child(Some(&vbox));
+
+    // Countdown
+    let seconds = Rc::new(Cell::new(30u32));
+    let reconnect_btn_c = reconnect_btn.clone();
+    let state_c = state.clone();
+    let session_c = session.clone();
+    let win_c = win.clone();
+
+    let do_reconnect = {
+        let state = state_c.clone();
+        let session = session_c.clone();
+        let win = win_c.clone();
+        move || {
+            win.close();
+            state.do_connect(session.clone());
+        }
+    };
+
+    let do_reconnect_btn = do_reconnect.clone();
+    reconnect_btn.connect_clicked(move |_| do_reconnect_btn());
+    cancel_btn.connect_clicked({
+        let win = win_c.clone();
+        move |_| win.close()
+    });
+
+    glib::timeout_add_seconds_local(1, move || {
+        let s = seconds.get().saturating_sub(1);
+        seconds.set(s);
+        if s == 0 {
+            do_reconnect();
+            glib::ControlFlow::Break
+        } else {
+            reconnect_btn_c.set_label(&format!("Reconnect ({s} s)"));
+            glib::ControlFlow::Continue
+        }
+    });
+
+    win.present();
 }
 
 /// WinSCP's "Save session as site" dialog: site name (Folder/Name groups)

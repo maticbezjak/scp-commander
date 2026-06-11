@@ -134,7 +134,8 @@ struct ContentView: View {
                     onExec: state.proto == .sftp ? { _ in state.beginExecCommand() } : nil
                 )
             }
-            TransfersPanel(queue: state.transfers)
+            Divider()
+            CommandBar()
             Divider()
             StatusBar()
         }
@@ -229,6 +230,14 @@ struct ContentView: View {
         }
         .sheet(isPresented: $state.showExecResult) {
             ExecResultSheet().environmentObject(state)
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { state.reconnectMessage != nil },
+                set: { if !$0 { state.dismissReconnect() } }
+            )
+        ) {
+            ReconnectSheet().environmentObject(state)
         }
         .alert(
             "Duplicate as…",
@@ -450,6 +459,12 @@ private struct TopBar: View {
             Text("F5 copy · F6 move · F2 rename · Tab panes")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
+            Button {
+                HelpWindowController.shared.show()
+            } label: {
+                Image(systemName: "questionmark.circle")
+            }
+            .help("Help")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
@@ -481,6 +496,10 @@ private struct LoginSheet: View {
                 .fixedSize()
                 Button("Save site…") { state.beginSaveSite() }
                     .disabled(state.host.isEmpty && state.bucket.isEmpty)
+                Button { HelpWindowController.shared.show() } label: {
+                    Image(systemName: "questionmark.circle")
+                }
+                .help("Help")
                 Spacer()
                 if state.busy { ProgressView().scaleEffect(0.6).frame(width: 18, height: 18) }
                 Button("Close") { state.showLogin = false }
@@ -560,13 +579,16 @@ private struct SessionForm: View {
                     HStack {
                         TextField(isS3 ? "blank = AWS" : "host", text: $state.host)
                             .frame(minWidth: 220)
+                            .onChange(of: state.host) { _ in state.tryFillSavedPassword() }
                         Text("Port:").foregroundStyle(.secondary)
                         TextField("port", text: $state.port).frame(width: 56)
+                            .onChange(of: state.port) { _ in state.tryFillSavedPassword() }
                     }
                 }
                 GridRow {
                     Text(isS3 ? "Access key:" : "User name:")
                     TextField("", text: $state.user).frame(width: 180)
+                        .onChange(of: state.user) { _ in state.tryFillSavedPassword() }
                 }
                 if isSftp && state.authMode == .keyFile {
                     GridRow {
@@ -603,6 +625,13 @@ private struct SessionForm: View {
                     GridRow {
                         Text("Region:")
                         TextField("us-east-1", text: $state.region).frame(width: 180)
+                    }
+                }
+                if !(isSftp && state.authMode == .agent) {
+                    GridRow {
+                        Text("")
+                        Toggle("Remember password", isOn: $state.rememberPassword)
+                            .disabled(state.password.isEmpty)
                     }
                 }
             }
@@ -799,26 +828,20 @@ private struct FilePane: View {
     var body: some View {
         VStack(spacing: 0) {
             paneToolbar
-            TextField("path", text: $pathText)
-                .textFieldStyle(.plain)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 8)
-                .padding(.bottom, 2)
-                .onAppear { pathText = path }
-                .onChange(of: path) { pathText = $0 }
-                .onSubmit { onNavigate(pathText) }
             Divider()
             columnHeader
             Divider()
             List(selection: $selection) {
+                parentRow
                 ForEach(sorted) { entry in
                     row(for: entry)
                 }
             }
             .listStyle(.inset(alternatesRowBackgrounds: true))
             .background(DoubleClickMonitor {
-                if let entry = sorted.first(where: { selection.contains($0.id) }) {
+                if selection.contains("..") {
+                    onUp()
+                } else if let entry = sorted.first(where: { selection.contains($0.id) }) {
                     onOpen(entry)
                 }
             })
@@ -838,42 +861,68 @@ private struct FilePane: View {
         .onTapGesture { onFocus() }
     }
 
-    /// WinSCP-style per-pane command toolbar.
+    /// WinSCP-style per-pane header: title + nav buttons, then address bar.
     private var paneToolbar: some View {
-        HStack(spacing: 2) {
-            Text(title)
-                .font(.headline)
-                .foregroundStyle(isFocused ? Color.accentColor : Color.primary)
-                .padding(.trailing, 4)
-            toolButton("arrow.up", "Parent directory", action: onUp)
-            toolButton("arrow.clockwise", "Refresh", action: onRefresh)
-            Divider().frame(height: 14)
-            toolButton(
-                kind == "local" ? "arrow.up.circle" : "arrow.down.circle",
-                "\(transferLabel) (F5)", disabled: selectedEntries.isEmpty
-            ) {
-                for entry in selectedEntries { onTransfer(entry) }
-            }
-            if onEdit != nil {
-                toolButton("pencil", "Edit (auto-upload on save)",
-                    disabled: selectedEntries.first?.isDir != false
+        VStack(spacing: 0) {
+            // ── Row 1: title + action buttons ───────────────────────────────
+            HStack(spacing: 2) {
+                Text(title)
+                    .font(.subheadline.bold())
+                    .foregroundStyle(isFocused ? Color.accentColor : Color.primary)
+                    .padding(.trailing, 2)
+                toolButton("arrow.up", "Parent directory", action: onUp)
+                toolButton("arrow.clockwise", "Refresh", action: onRefresh)
+                Divider().frame(height: 14).padding(.horizontal, 2)
+                toolButton(
+                    kind == "local" ? "arrow.up.circle" : "arrow.down.circle",
+                    "\(transferLabel) (F5)", disabled: selectedEntries.isEmpty
                 ) {
-                    if let e = selectedEntries.first { onEdit?(e) }
+                    for entry in selectedEntries { onTransfer(entry) }
                 }
+                if onEdit != nil {
+                    toolButton("pencil", "Edit (auto-upload on save)",
+                        disabled: selectedEntries.first?.isDir != false
+                    ) {
+                        if let e = selectedEntries.first { onEdit?(e) }
+                    }
+                }
+                toolButton("folder.badge.plus", "New folder", action: onNewFolder)
+                toolButton("trash", "Delete", disabled: selectedEntries.isEmpty) {
+                    onDelete(selectedEntries)
+                }
+                Spacer()
+                TextField("filter", text: $filterText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .frame(width: 86)
+                    .help("Filter the visible listing by name")
             }
-            toolButton("folder.badge.plus", "New folder", action: onNewFolder)
-            toolButton("trash", "Delete", disabled: selectedEntries.isEmpty) {
-                onDelete(selectedEntries)
+            .padding(.horizontal, 8)
+            .padding(.top, 4)
+            .padding(.bottom, 3)
+
+            // ── Row 2: address bar ──────────────────────────────────────────
+            HStack(spacing: 4) {
+                Image(systemName: "folder")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("path", text: $pathText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12, design: .monospaced))
+                    .onAppear { pathText = path }
+                    .onChange(of: path) { pathText = $0 }
+                    .onSubmit { onNavigate(pathText) }
             }
-            Spacer()
-            TextField("filter", text: $filterText)
-                .textFieldStyle(.roundedBorder)
-                .font(.caption)
-                .frame(width: 90)
-                .help("Filter the visible listing by name")
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(.background.opacity(0.6))
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(isFocused ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.25), lineWidth: 1)
+                    .padding(.horizontal, 6)
+            )
+            .padding(.bottom, 3)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
     }
 
     private func toolButton(
@@ -935,6 +984,17 @@ private struct FilePane: View {
             .foregroundStyle(.secondary)
         }
         .buttonStyle(.plain)
+    }
+
+    /// Fixed ".." row at the top of every listing — double-click navigates up.
+    private var parentRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.up.left").frame(width: 16)
+            Text("..").bold()
+            Spacer()
+        }
+        .foregroundStyle(.secondary)
+        .tag("..")
     }
 
     private func row(for entry: FileEntry) -> some View {
@@ -1326,116 +1386,6 @@ private struct ExecResultSheet: View {
     }
 }
 
-// MARK: - Transfers panel
-
-private struct TransfersPanel: View {
-    @ObservedObject var queue: TransferQueue
-
-    var body: some View {
-        let items = queue.items
-        if !items.isEmpty {
-            VStack(spacing: 0) {
-                Divider()
-                HStack {
-                    Text("Transfers").font(.caption).bold()
-                    Spacer()
-                    Button("Cancel all") { queue.cancelAll() }
-                        .buttonStyle(.borderless)
-                        .font(.caption)
-                        .disabled(queue.items.allSatisfy { $0.state != .active })
-                    Button("Clear finished") { queue.clearFinished() }
-                        .buttonStyle(.borderless)
-                        .font(.caption)
-                }
-                .padding(.horizontal, 8).padding(.vertical, 2)
-
-                ScrollView {
-                    VStack(spacing: 2) {
-                        ForEach(items) { TransferRow(transfer: $0) }
-                    }
-                    .padding(.horizontal, 8)
-                }
-                .frame(maxHeight: 120)
-            }
-        }
-    }
-}
-
-private struct TransferRow: View {
-    @ObservedObject var transfer: Transfer
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: transfer.direction.symbol)
-            VStack(alignment: .leading, spacing: 0) {
-                Text(transfer.name).lineLimit(1)
-                if let current = transfer.currentFile, transfer.state == .active {
-                    Text(current)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.head)
-                }
-            }
-            .frame(width: 180, alignment: .leading)
-            progress
-            Spacer()
-            Text(detail).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-            if transfer.state == .active {
-                Button {
-                    transfer.cancelFlag.cancel()
-                } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                }
-                .buttonStyle(.borderless)
-                .help("Cancel")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var progress: some View {
-        switch transfer.state {
-        case .active:
-            if let f = transfer.fraction {
-                ProgressView(value: f).frame(width: 160)
-            } else {
-                ProgressView().scaleEffect(0.5).frame(width: 40)
-            }
-        case .done:
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-        case .cancelled:
-            Image(systemName: "slash.circle").foregroundStyle(.orange)
-        case .failed:
-            Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
-        }
-    }
-
-    private var detail: String {
-        switch transfer.state {
-        case .failed(let msg): return msg
-        case .cancelled: return "cancelled"
-        case .done:
-            let files = transfer.filesDone > 0 ? "\(transfer.filesDone) files · " : ""
-            return files + humanSize(max(transfer.total, transfer.transferred))
-        case .active:
-            var parts: [String] = []
-            if transfer.total > 0 {
-                parts.append("\(humanSize(transfer.transferred)) / \(humanSize(transfer.total))")
-            } else {
-                parts.append(humanSize(transfer.transferred))
-            }
-            if transfer.speed > 1 {
-                parts.append("\(humanSize(UInt64(transfer.speed)))/s")
-            }
-            if let eta = transfer.eta {
-                parts.append(eta)
-            }
-            return parts.joined(separator: " · ")
-        }
-    }
-}
-
 private struct StatusBar: View {
     @EnvironmentObject var state: AppState
     var body: some View {
@@ -1447,7 +1397,106 @@ private struct StatusBar: View {
     }
 }
 
-private func humanSize(_ bytes: UInt64) -> String {
+// MARK: - Bottom command bar
+
+private struct CommandBar: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Menu {
+                Button("Local → Remote (upload changes)") { state.sync(download: false) }
+                Button("Remote → Local (download changes)") { state.sync(download: true) }
+                Divider()
+                Toggle("Mirror mode (delete extraneous)", isOn: $state.mirrorSync)
+            } label: {
+                Label("Synchronize", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+            }
+            .menuStyle(.borderedButton)
+            .controlSize(.small)
+            .fixedSize()
+            .disabled(!state.isConnected)
+
+            Divider().frame(height: 16)
+
+            Menu {
+                Button("Show Queue") { TransferWindowController.shared.show(queue: state.transfers) }
+                Divider()
+                Button("Clear Finished") { state.transfers.clearFinished() }
+                Button("Cancel All", role: .destructive) { state.transfers.cancelAll() }
+            } label: {
+                Label("Queue", systemImage: "list.bullet.rectangle")
+                    .font(.caption)
+            }
+            .menuStyle(.borderedButton)
+            .controlSize(.small)
+            .fixedSize()
+
+            Divider().frame(height: 16)
+
+            Menu {
+                Text("Transfer Settings").font(.caption).foregroundStyle(.secondary)
+                Divider()
+                Picker("Speed limit", selection: $state.speedLimitKbs) {
+                    Text("No limit").tag(0)
+                    Text("100 KiB/s").tag(100)
+                    Text("500 KiB/s").tag(500)
+                    Text("1 MiB/s").tag(1024)
+                    Text("5 MiB/s").tag(5120)
+                }
+            } label: {
+                Label(
+                    state.speedLimitKbs == 0 ? "Transfer Settings: Default"
+                        : "Transfer Settings: \(state.speedLimitKbs < 1024 ? "\(state.speedLimitKbs) KiB/s" : "\(state.speedLimitKbs / 1024) MiB/s")",
+                    systemImage: "slider.horizontal.3"
+                )
+                .font(.caption)
+            }
+            .menuStyle(.borderedButton)
+            .controlSize(.small)
+            .fixedSize()
+
+            Spacer()
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+    }
+}
+
+// MARK: - Reconnect sheet
+
+private struct ReconnectSheet: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        VStack(spacing: 16) {
+            HStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.largeTitle)
+                    .foregroundStyle(.red)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Connection lost").font(.headline)
+                    Text(state.reconnectMessage ?? "")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack(spacing: 12) {
+                Button("Cancel") { state.dismissReconnect() }
+                    .keyboardShortcut(.escape)
+                Spacer()
+                Button("Reconnect (\(state.reconnectCountdown) s)") { state.triggerReconnect() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.return)
+            }
+        }
+        .padding(24)
+        .frame(width: 420)
+    }
+}
+
+func humanSize(_ bytes: UInt64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB"]
     var value = Double(bytes)
     var i = 0
