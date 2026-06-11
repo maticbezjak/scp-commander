@@ -48,8 +48,7 @@ impl FtpTransport {
             Protocol::Ftp => {
                 let mut ftp = FtpStream::connect((creds.host.as_str(), creds.port))
                     .map_err(|e| Error::Connect(e.to_string()))?;
-                ftp.login(user, pass)
-                    .map_err(|e| Error::Auth(e.to_string()))?;
+                ftp.login(user, pass).map_err(login_error)?;
                 Conn::Plain(ftp)
             }
             Protocol::Ftps => {
@@ -63,8 +62,7 @@ impl FtpTransport {
                 let mut ftp = ftp
                     .into_secure(connector, &creds.host)
                     .map_err(|e| Error::Connect(e.to_string()))?;
-                ftp.login(user, pass)
-                    .map_err(|e| Error::Auth(e.to_string()))?;
+                ftp.login(user, pass).map_err(login_error)?;
                 Conn::Secure(ftp)
             }
             _ => return Err(Error::Protocol("not an FTP protocol".into())),
@@ -187,6 +185,37 @@ impl Transport for FtpTransport {
         })
     }
 
+    fn upload_resume(&mut self, local: &Path, remote: &str, progress: Progress) -> Result<u64> {
+        use std::io::Seek;
+        let offset = with_conn!(self, c => c.size(remote).ok()).unwrap_or(0) as u64;
+        let mut local_file = File::open(local)?;
+        let total = local_file.metadata().map(|m| m.len()).unwrap_or(0);
+        if offset >= total {
+            return Ok(offset);
+        }
+        local_file
+            .seek(std::io::SeekFrom::Start(offset))
+            .map_err(Error::Io)?;
+        let mut report = |done: u64, total: u64| progress(offset + done, total);
+        let n = with_conn!(self, c => {
+            let mut stream = c
+                .append_with_stream(remote)
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            match copy_with_progress(&mut local_file, &mut stream, total, &mut report) {
+                Ok(n) => {
+                    c.finalize_put_stream(stream)
+                        .map_err(|e| Error::Protocol(e.to_string()))?;
+                    Ok(n)
+                }
+                Err(e) => {
+                    let _ = c.finalize_put_stream(stream);
+                    Err(e)
+                }
+            }
+        })?;
+        Ok(offset + n)
+    }
+
     fn mkdir(&mut self, path: &str) -> Result<()> {
         with_conn!(self, c => c.mkdir(path).map_err(|e| Error::Protocol(e.to_string())))
     }
@@ -219,6 +248,21 @@ impl Transport for FtpTransport {
 
     fn disconnect(&mut self) {
         let _ = with_conn!(self, c => c.quit());
+    }
+}
+
+/// A 5xx "not logged in" is an auth rejection; everything else during login
+/// (dropped socket, timeouts) is a connection problem — labelling those
+/// "authentication failed" sends the UI into wrong-password flows.
+fn login_error(e: suppaftp::FtpError) -> Error {
+    match &e {
+        suppaftp::FtpError::UnexpectedResponse(resp)
+            if resp.status == suppaftp::Status::NotLoggedIn =>
+        {
+            Error::Auth(e.to_string())
+        }
+        suppaftp::FtpError::UnexpectedResponse(_) => Error::Auth(e.to_string()),
+        _ => Error::Connect(e.to_string()),
     }
 }
 

@@ -32,7 +32,7 @@ impl SftpTransport {
         match &creds.auth {
             Auth::Password(pw) => session
                 .userauth_password(&creds.username, pw)
-                .map_err(|e| Error::Auth(e.to_string()))?,
+                .map_err(auth_or_connect)?,
             Auth::KeyFile { path, passphrase } => session
                 .userauth_pubkey_file(
                     &creds.username,
@@ -40,10 +40,10 @@ impl SftpTransport {
                     Path::new(path),
                     passphrase.as_deref(),
                 )
-                .map_err(|e| Error::Auth(e.to_string()))?,
+                .map_err(auth_or_connect)?,
             Auth::Agent => session
                 .userauth_agent(&creds.username)
-                .map_err(|e| Error::Auth(e.to_string()))?,
+                .map_err(auth_or_connect)?,
             Auth::Anonymous => {
                 return Err(Error::Auth("SFTP requires credentials".into()));
             }
@@ -68,6 +68,11 @@ impl Transport for SftpTransport {
             .readdir(Path::new(path))
             .map_err(|e| Error::Protocol(e.to_string()))?;
 
+        // Resolving a symlink's target costs one extra round trip; cap it so
+        // a directory full of links doesn't take O(links x RTT) to list.
+        const MAX_SYMLINK_RESOLUTIONS: usize = 64;
+        let mut resolved = 0usize;
+
         let mut out = Vec::with_capacity(entries.len());
         for (p, stat) in entries {
             let name = p
@@ -77,7 +82,8 @@ impl Transport for SftpTransport {
             // readdir lstats: symlinks report as links, not their targets.
             // Follow them so a link to a directory navigates like one.
             let is_symlink = stat.file_type().is_symlink();
-            let (is_dir, size) = if is_symlink {
+            let (is_dir, size) = if is_symlink && resolved < MAX_SYMLINK_RESOLUTIONS {
+                resolved += 1;
                 match self.sftp.stat(&p) {
                     Ok(target) => (target.is_dir(), target.size.unwrap_or(0)),
                     Err(_) => (false, 0), // dangling link
@@ -145,12 +151,52 @@ impl Transport for SftpTransport {
 
     fn upload_progress(&mut self, local: &Path, remote: &str, progress: Progress) -> Result<u64> {
         let mut local_file = File::open(local)?;
-        let total = local_file.metadata().map(|m| m.len()).unwrap_or(0);
-        let mut remote_file = self
+        let meta = local_file.metadata().ok();
+        let total = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let n = {
+            let mut remote_file = self
+                .sftp
+                .create(Path::new(remote))
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            copy_with_progress(&mut local_file, &mut remote_file, total, progress)?
+        };
+        self.stamp_remote_mtime(remote, meta.as_ref());
+        Ok(n)
+    }
+
+    fn upload_resume(&mut self, local: &Path, remote: &str, progress: Progress) -> Result<u64> {
+        use std::io::Seek;
+        // The server's current size is the authoritative resume point.
+        let offset = self
             .sftp
-            .create(Path::new(remote))
-            .map_err(|e| Error::Protocol(e.to_string()))?;
-        copy_with_progress(&mut local_file, &mut remote_file, total, progress)
+            .stat(Path::new(remote))
+            .ok()
+            .and_then(|s| s.size)
+            .unwrap_or(0);
+        let mut local_file = File::open(local)?;
+        let meta = local_file.metadata().ok();
+        let total = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        if offset >= total {
+            return Ok(offset); // nothing left to send
+        }
+        local_file
+            .seek(std::io::SeekFrom::Start(offset))
+            .map_err(Error::Io)?;
+        let n = {
+            let mut remote_file = self
+                .sftp
+                .open_mode(
+                    Path::new(remote),
+                    ssh2::OpenFlags::WRITE | ssh2::OpenFlags::APPEND,
+                    0o644,
+                    ssh2::OpenType::File,
+                )
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            let mut report = |done: u64, total: u64| progress(offset + done, total);
+            copy_with_progress(&mut local_file, &mut remote_file, total, &mut report)?
+        };
+        self.stamp_remote_mtime(remote, meta.as_ref());
+        Ok(offset + n)
     }
 
     fn mkdir(&mut self, path: &str) -> Result<()> {
@@ -206,6 +252,42 @@ impl Transport for SftpTransport {
         let _ = self
             .session
             .disconnect(None, "bye", None);
+    }
+}
+
+impl SftpTransport {
+    /// Mirror the local file's mtime onto the freshly uploaded remote file,
+    /// so sync comparisons stay honest in both directions. Best-effort.
+    fn stamp_remote_mtime(&self, remote: &str, meta: Option<&std::fs::Metadata>) {
+        let Some(mtime) = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+        else {
+            return;
+        };
+        let stat = ssh2::FileStat {
+            size: None,
+            uid: None,
+            gid: None,
+            perm: None,
+            atime: Some(mtime),
+            mtime: Some(mtime),
+        };
+        let _ = self.sftp.setstat(Path::new(remote), stat);
+    }
+}
+
+/// Auth calls also surface transport failures (socket died mid-login):
+/// labelling those "authentication failed" sends the UI into wrong-password
+/// flows. Only genuine auth rejections map to Error::Auth.
+fn auth_or_connect(e: ssh2::Error) -> Error {
+    match e.code() {
+        // LIBSSH2_ERROR_AUTHENTICATION_FAILED / _PUBLICKEY_UNVERIFIED
+        ssh2::ErrorCode::Session(-18) | ssh2::ErrorCode::Session(-19) => {
+            Error::Auth(e.to_string())
+        }
+        _ => Error::Connect(e.to_string()),
     }
 }
 

@@ -61,6 +61,17 @@ pub trait Transport: Send {
         ))
     }
 
+    /// Resume an upload: append the local file's tail after the remote
+    /// file's current size (taken from the server). Returns total bytes at
+    /// the remote afterwards. The default refuses; SFTP and FTP support it.
+    fn upload_resume(&mut self, _local: &Path, _remote: &str, _progress: Progress)
+        -> Result<u64>
+    {
+        Err(Error::NotImplemented(
+            "upload resume is not supported on this protocol".into(),
+        ))
+    }
+
     /// Liveness probe / keepalive. Errors when the connection is dead.
     /// Also keeps NAT mappings warm when called periodically while idle.
     fn keepalive(&mut self) -> Result<()> {
@@ -154,6 +165,10 @@ impl Transport for AutoReconnect {
         progress: Progress,
     ) -> Result<u64> {
         self.run(|t| t.download_resume(remote, local, offset, &mut *progress))
+    }
+
+    fn upload_resume(&mut self, local: &Path, remote: &str, progress: Progress) -> Result<u64> {
+        self.run(|t| t.upload_resume(local, remote, &mut *progress))
     }
 
     fn mkdir(&mut self, path: &str) -> Result<()> {

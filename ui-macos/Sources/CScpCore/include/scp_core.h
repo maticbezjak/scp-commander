@@ -74,17 +74,32 @@ int64_t scp_upload_cb(ScpSession *session, const char *local, const char *remote
 typedef int (*ScpXferCb)(int kind, const char *file, uint64_t done, uint64_t total,
                          void *user_data);
 
-/* Recursive folder transfers. Return total bytes moved, or -1 on error. */
+/* Recursive folder transfers. Return total bytes moved, or -1 on error.
+ * excludes: ";"-separated WinSCP-style masks ("*.tmp; .git/"); NULL/empty = none. */
 int64_t scp_download_dir(ScpSession *session, const char *remote, const char *local,
-                         ScpXferCb cb, void *user_data);
+                         const char *excludes, ScpXferCb cb, void *user_data);
 int64_t scp_upload_dir(ScpSession *session, const char *local, const char *remote,
-                       ScpXferCb cb, void *user_data);
+                       const char *excludes, ScpXferCb cb, void *user_data);
 
 /* One-way directory sync. direction: 0 = local->remote, 1 = remote->local.
  * Copies files that are missing, differ in size, or are newer on the source.
  * Returns the number of files copied, or -1 on error. */
 int64_t scp_sync_dir(ScpSession *session, const char *local, const char *remote,
-                     int direction, ScpXferCb cb, void *user_data);
+                     int direction, const char *excludes, ScpXferCb cb, void *user_data);
+
+/* Sync dry run: returns JSON {"dirs":[...],"items":[{"rel","size","reason"}]}
+ * (free with scp_string_free) or NULL on error. Copies nothing. */
+char *scp_sync_plan(ScpSession *session, const char *local, const char *remote,
+                    int direction, const char *excludes);
+
+/* Recursive remote search by mask ("*.log"). Returns JSON
+ * [{"path","is_dir","size"}] (free with scp_string_free), or NULL. */
+char *scp_find(ScpSession *session, const char *base, const char *mask, uint32_t limit);
+
+/* Resume an upload: appends the local tail after the remote file's current
+ * size. Returns total remote bytes afterwards, or -1. */
+int64_t scp_upload_resume_cb(ScpSession *session, const char *local, const char *remote,
+                             ScpProgressCb cb, void *user_data);
 
 /* Remote file management. Return 0 on success, -1 on error. */
 int scp_mkdir(ScpSession *session, const char *path);

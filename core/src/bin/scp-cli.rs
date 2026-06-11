@@ -17,13 +17,15 @@
 use std::path::Path;
 use std::process::exit;
 
-use scp_core::ops::{self, SyncDirection, XferEvent};
+use scp_core::ops::{self, Filter, SyncDirection, XferEvent};
 use scp_core::types::{Auth, Credentials, Error, HostKeyPolicy, Protocol};
 use scp_core::{connect, Result};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  scp-cli [flags] ls    <url>              [password]\n  scp-cli [flags] get   [-r] <url> <local> [password]\n  scp-cli [flags] put   [-r] <url> <local> [password]\n  scp-cli [flags] rm    [-r] <url>         [password]\n  scp-cli [flags] mv    <url> <new-path>   [password]\n  scp-cli [flags] mkdir <url>              [password]\n  scp-cli [flags] sync  up|down <url> <local-dir> [password]\n\nflags: --accept-new | --agent | --key <path>\nurl: sftp://user@host[:port]/path  or  ftp://[user@]host[:port]/path"
+        "usage:\n  scp-cli [flags] ls    <url>              [password]\n  scp-cli [flags] get   [-r] <url> <local> [password]\n  scp-cli [flags] put   [-r] <url> <local> [password]\n  scp-cli [flags] rm    [-r] <url>         [password]\n  scp-cli [flags] mv    <url> <new-path>   [password]\n  scp-cli [flags] mkdir <url>              [password]\n  scp-cli [flags] sync  up|down <url> <local-dir> [password]\n\nflags: --accept-new | --agent | --key <path> | --exclude \"*.tmp; .git/\"
+extra: plan up|down <url> <local-dir>   (sync dry run)
+       find <url> <mask>                (recursive remote search)\nurl: sftp://user@host[:port]/path  or  ftp://[user@]host[:port]/path"
     );
     exit(2);
 }
@@ -38,6 +40,7 @@ struct Flags {
     agent: bool,
     key: Option<String>,
     recursive: bool,
+    filter: Filter,
 }
 
 fn parse_url(url: &str, password: Option<&str>, flags: &Flags) -> std::result::Result<ParsedUrl, String> {
@@ -105,7 +108,15 @@ fn run() -> Result<()> {
         agent: false,
         key: None,
         recursive: false,
+        filter: Filter::empty(),
     };
+    if let Some(pos) = args.iter().position(|a| a == "--exclude") {
+        args.remove(pos);
+        if pos >= args.len() {
+            usage();
+        }
+        flags.filter = Filter::parse(&args.remove(pos));
+    }
     if let Some(pos) = args.iter().position(|a| a == "--accept-new") {
         args.remove(pos);
         flags.host_key = HostKeyPolicy::AcceptNew;
@@ -150,7 +161,13 @@ fn run() -> Result<()> {
                 .unwrap_or_else(|e| fail(&e));
             let mut t = connect(&parsed.creds)?;
             let n = if flags.recursive {
-                ops::download_dir(t.as_mut(), &parsed.path, Path::new(local), &mut print_events)?
+                ops::download_dir(
+                    t.as_mut(),
+                    &parsed.path,
+                    Path::new(local),
+                    &flags.filter,
+                    &mut print_events,
+                )?
             } else {
                 t.download(&parsed.path, Path::new(local))?
             };
@@ -164,7 +181,13 @@ fn run() -> Result<()> {
                 .unwrap_or_else(|e| fail(&e));
             let mut t = connect(&parsed.creds)?;
             let n = if flags.recursive {
-                ops::upload_dir(t.as_mut(), Path::new(local), &parsed.path, &mut print_events)?
+                ops::upload_dir(
+                    t.as_mut(),
+                    Path::new(local),
+                    &parsed.path,
+                    &flags.filter,
+                    &mut print_events,
+                )?
             } else {
                 t.upload(Path::new(local), &parsed.path)?
             };
@@ -216,6 +239,46 @@ fn run() -> Result<()> {
             println!("chmod {mode:o} {}", parsed.path);
             t.disconnect();
         }
+        "plan" => {
+            let dir = match args.get(1).map(String::as_str) {
+                Some("up") => SyncDirection::Upload,
+                Some("down") => SyncDirection::Download,
+                _ => usage(),
+            };
+            let url = args.get(2).unwrap_or_else(|| usage());
+            let local = args.get(3).unwrap_or_else(|| usage());
+            let parsed = parse_url(url, args.get(4).map(String::as_str), &flags)
+                .unwrap_or_else(|e| fail(&e));
+            let mut t = connect(&parsed.creds)?;
+            let plan = ops::plan_sync(
+                t.as_mut(),
+                Path::new(local),
+                &parsed.path,
+                dir,
+                &flags.filter,
+            )?;
+            for d in &plan.dirs {
+                println!("mkdir {d}");
+            }
+            for item in &plan.items {
+                println!("copy  {} ({} bytes, {})", item.rel, item.size, item.reason.label());
+            }
+            println!("plan: {} dir(s), {} file(s)", plan.dirs.len(), plan.items.len());
+            t.disconnect();
+        }
+        "find" => {
+            let url = args.get(1).unwrap_or_else(|| usage());
+            let mask = args.get(2).unwrap_or_else(|| usage());
+            let parsed = parse_url(url, args.get(3).map(String::as_str), &flags)
+                .unwrap_or_else(|e| fail(&e));
+            let mut t = connect(&parsed.creds)?;
+            let hits = ops::find(t.as_mut(), &parsed.path, mask, 1000, &mut || true)?;
+            for (path, e) in &hits {
+                println!("{}{}", path, if e.is_dir { "/" } else { "" });
+            }
+            println!("{} match(es)", hits.len());
+            t.disconnect();
+        }
         "sync" => {
             let dir = match args.get(1).map(String::as_str) {
                 Some("up") => SyncDirection::Upload,
@@ -228,7 +291,14 @@ fn run() -> Result<()> {
                 .unwrap_or_else(|e| fail(&e));
             let mut t = connect(&parsed.creds)?;
             let stats =
-                ops::sync_dir(t.as_mut(), Path::new(local), &parsed.path, dir, &mut print_events)?;
+                ops::sync_dir(
+                    t.as_mut(),
+                    Path::new(local),
+                    &parsed.path,
+                    dir,
+                    &flags.filter,
+                    &mut print_events,
+                )?;
             println!(
                 "sync done: {} copied, {} unchanged, {} bytes",
                 stats.copied, stats.skipped, stats.bytes

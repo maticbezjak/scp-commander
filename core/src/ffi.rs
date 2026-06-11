@@ -380,6 +380,7 @@ pub extern "C" fn scp_download_dir(
     session: *mut ScpSession,
     remote: *const c_char,
     local: *const c_char,
+    excludes: *const c_char,
     cb: Option<XferCb>,
     user_data: *mut c_void,
 ) -> i64 {
@@ -392,10 +393,16 @@ pub extern "C" fn scp_download_dir(
         set_error("invalid arguments to scp_download_dir");
         return -1;
     };
+    let filter = parse_filter(excludes);
     let user = UserData(user_data);
     let mut adapter = xfer_adapter(cb, &user);
-    match crate::ops::download_dir(session.inner.as_mut(), remote, Path::new(local), &mut adapter)
-    {
+    match crate::ops::download_dir(
+        session.inner.as_mut(),
+        remote,
+        Path::new(local),
+        &filter,
+        &mut adapter,
+    ) {
         Ok(n) => n as i64,
         Err(e) => {
             set_error_typed(&e);
@@ -410,6 +417,7 @@ pub extern "C" fn scp_upload_dir(
     session: *mut ScpSession,
     local: *const c_char,
     remote: *const c_char,
+    excludes: *const c_char,
     cb: Option<XferCb>,
     user_data: *mut c_void,
 ) -> i64 {
@@ -422,9 +430,16 @@ pub extern "C" fn scp_upload_dir(
         set_error("invalid arguments to scp_upload_dir");
         return -1;
     };
+    let filter = parse_filter(excludes);
     let user = UserData(user_data);
     let mut adapter = xfer_adapter(cb, &user);
-    match crate::ops::upload_dir(session.inner.as_mut(), Path::new(local), remote, &mut adapter) {
+    match crate::ops::upload_dir(
+        session.inner.as_mut(),
+        Path::new(local),
+        remote,
+        &filter,
+        &mut adapter,
+    ) {
         Ok(n) => n as i64,
         Err(e) => {
             set_error_typed(&e);
@@ -441,6 +456,7 @@ pub extern "C" fn scp_sync_dir(
     local: *const c_char,
     remote: *const c_char,
     direction: c_int,
+    excludes: *const c_char,
     cb: Option<XferCb>,
     user_data: *mut c_void,
 ) -> i64 {
@@ -461,16 +477,151 @@ pub extern "C" fn scp_sync_dir(
             return -1;
         }
     };
+    let filter = parse_filter(excludes);
     let user = UserData(user_data);
     let mut adapter = xfer_adapter(cb, &user);
-    match crate::ops::sync_dir(session.inner.as_mut(), Path::new(local), remote, dir, &mut adapter)
-    {
+    match crate::ops::sync_dir(
+        session.inner.as_mut(),
+        Path::new(local),
+        remote,
+        dir,
+        &filter,
+        &mut adapter,
+    ) {
         Ok(stats) => stats.copied as i64,
         Err(e) => {
             set_error_typed(&e);
             -1
         }
     }
+}
+
+/// Sync dry run. Returns a JSON object the caller frees with scp_string_free:
+/// {"dirs":["sub"],"items":[{"rel":"sub/a.txt","size":12,"reason":"missing"}]}
+/// or null on error. `direction`: 0 = local→remote, 1 = remote→local.
+#[no_mangle]
+pub extern "C" fn scp_sync_plan(
+    session: *mut ScpSession,
+    local: *const c_char,
+    remote: *const c_char,
+    direction: c_int,
+    excludes: *const c_char,
+) -> *mut c_char {
+    clear_error();
+    let (Some(session), Some(local), Some(remote)) = (
+        unsafe { session.as_mut() },
+        unsafe { cstr(local) },
+        unsafe { cstr(remote) },
+    ) else {
+        set_error("invalid arguments to scp_sync_plan");
+        return ptr::null_mut();
+    };
+    let dir = match direction {
+        0 => crate::ops::SyncDirection::Upload,
+        1 => crate::ops::SyncDirection::Download,
+        _ => {
+            set_error("invalid sync direction");
+            return ptr::null_mut();
+        }
+    };
+    let filter = parse_filter(excludes);
+    match crate::ops::plan_sync(session.inner.as_mut(), Path::new(local), remote, dir, &filter) {
+        Ok(plan) => match CString::new(plan_to_json(&plan)) {
+            Ok(s) => s.into_raw(),
+            Err(_) => {
+                set_error("plan contained a NUL byte");
+                ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_error_typed(&e);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Recursive remote search by mask. Returns a JSON array of
+/// {"path":"/full/path","is_dir":bool,"size":N} (free with scp_string_free),
+/// or null on error. At most `limit` results.
+#[no_mangle]
+pub extern "C" fn scp_find(
+    session: *mut ScpSession,
+    base: *const c_char,
+    mask: *const c_char,
+    limit: u32,
+) -> *mut c_char {
+    clear_error();
+    let (Some(session), Some(base), Some(mask)) = (
+        unsafe { session.as_mut() },
+        unsafe { cstr(base) },
+        unsafe { cstr(mask) },
+    ) else {
+        set_error("invalid arguments to scp_find");
+        return ptr::null_mut();
+    };
+    let mut keep_going = || true;
+    match crate::ops::find(
+        session.inner.as_mut(),
+        base,
+        mask,
+        limit as usize,
+        &mut keep_going,
+    ) {
+        Ok(hits) => {
+            let mut out = String::from("[");
+            for (i, (path, e)) in hits.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str("{\"path\":");
+                json_str(&mut out, path);
+                out.push_str(",\"is_dir\":");
+                out.push_str(if e.is_dir { "true" } else { "false" });
+                out.push_str(&format!(",\"size\":{}", e.size));
+                out.push('}');
+            }
+            out.push(']');
+            match CString::new(out) {
+                Ok(s) => s.into_raw(),
+                Err(_) => ptr::null_mut(),
+            }
+        }
+        Err(e) => {
+            set_error_typed(&e);
+            ptr::null_mut()
+        }
+    }
+}
+
+fn parse_filter(excludes: *const c_char) -> crate::ops::Filter {
+    unsafe { cstr(excludes) }
+        .filter(|s| !s.is_empty())
+        .map(crate::ops::Filter::parse)
+        .unwrap_or_default()
+}
+
+fn plan_to_json(plan: &crate::ops::SyncPlan) -> String {
+    let mut out = String::from("{\"dirs\":[");
+    for (i, d) in plan.dirs.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json_str(&mut out, d);
+    }
+    out.push_str("],\"items\":[");
+    for (i, item) in plan.items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"rel\":");
+        json_str(&mut out, &item.rel);
+        out.push_str(&format!(",\"size\":{}", item.size));
+        out.push_str(",\"reason\":");
+        json_str(&mut out, item.reason.label());
+        out.push('}');
+    }
+    out.push_str("]}");
+    out
 }
 
 /// Create a remote directory. Returns 0, or -1 on error.
@@ -521,6 +672,44 @@ pub extern "C" fn scp_download_resume_cb(
     match session
         .inner
         .download_resume(remote, Path::new(local), offset, &mut report)
+    {
+        Ok(n) => n as i64,
+        Err(e) => {
+            set_error_typed(&e);
+            -1
+        }
+    }
+}
+
+/// Resume an upload: appends the local file's tail after the remote file's
+/// current size. Returns total bytes at the remote afterwards, or -1.
+#[no_mangle]
+pub extern "C" fn scp_upload_resume_cb(
+    session: *mut ScpSession,
+    local: *const c_char,
+    remote: *const c_char,
+    cb: Option<ProgressCb>,
+    user_data: *mut c_void,
+) -> i64 {
+    clear_error();
+    let (Some(session), Some(local), Some(remote)) = (
+        unsafe { session.as_mut() },
+        unsafe { cstr(local) },
+        unsafe { cstr(remote) },
+    ) else {
+        set_error("invalid arguments to scp_upload_resume_cb");
+        return -1;
+    };
+    let user = UserData(user_data);
+    let mut report = |t: u64, total: u64| -> bool {
+        match cb {
+            Some(cb) => cb(t, total, user.0) == 0,
+            None => true,
+        }
+    };
+    match session
+        .inner
+        .upload_resume(Path::new(local), remote, &mut report)
     {
         Ok(n) => n as i64,
         Err(e) => {

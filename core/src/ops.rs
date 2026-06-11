@@ -44,17 +44,277 @@ pub struct SyncStats {
     pub bytes: u64,
 }
 
+/// Exclusion masks for multi-file operations, WinSCP-style:
+/// `"*.tmp; .git/; node_modules/"` — `;`-separated, `*` wildcards, a trailing
+/// `/` restricts the pattern to directories.
+#[derive(Debug, Clone, Default)]
+pub struct Filter {
+    patterns: Vec<(String, bool)>, // (pattern, dir_only)
+}
+
+impl Filter {
+    pub fn parse(spec: &str) -> Self {
+        let patterns = spec
+            .split(';')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| match p.strip_suffix('/') {
+                Some(dir) => (dir.to_string(), true),
+                None => (p.to_string(), false),
+            })
+            .collect();
+        Self { patterns }
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// True when `name` should be skipped.
+    pub fn excludes(&self, name: &str, is_dir: bool) -> bool {
+        self.patterns.iter().any(|(pat, dir_only)| {
+            (!dir_only || is_dir) && glob_match(pat.as_bytes(), name.as_bytes())
+        })
+    }
+}
+
+/// Case-insensitive `*`-wildcard match.
+fn glob_match(pat: &[u8], name: &[u8]) -> bool {
+    if pat.is_empty() {
+        return name.is_empty();
+    }
+    match pat[0] {
+        b'*' => {
+            glob_match(&pat[1..], name) || (!name.is_empty() && glob_match(pat, &name[1..]))
+        }
+        c => {
+            !name.is_empty()
+                && name[0].eq_ignore_ascii_case(&c)
+                && glob_match(&pat[1..], &name[1..])
+        }
+    }
+}
+
+/// One entry of a sync dry run.
+#[derive(Debug, Clone)]
+pub struct PlanItem {
+    /// Path relative to the sync roots, e.g. "sub/file.txt".
+    pub rel: String,
+    pub size: u64,
+    pub reason: PlanReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanReason {
+    Missing,
+    SizeDiffers,
+    Newer,
+}
+
+impl PlanReason {
+    pub fn label(&self) -> &'static str {
+        match self {
+            PlanReason::Missing => "missing",
+            PlanReason::SizeDiffers => "size differs",
+            PlanReason::Newer => "newer",
+        }
+    }
+}
+
+/// A sync dry run: the files that would be copied and the destination
+/// directories that must exist first (both relative to the roots).
+#[derive(Debug, Clone, Default)]
+pub struct SyncPlan {
+    pub items: Vec<PlanItem>,
+    pub dirs: Vec<String>,
+}
+
+/// Compute what [`sync_dir`] would copy, without copying anything.
+pub fn plan_sync(
+    t: &mut dyn Transport,
+    local: &Path,
+    remote: &str,
+    direction: SyncDirection,
+    filter: &Filter,
+) -> Result<SyncPlan> {
+    let mut plan = SyncPlan::default();
+    plan_inner(t, local, remote, direction, filter, "", &mut plan)?;
+    Ok(plan)
+}
+
+fn plan_inner(
+    t: &mut dyn Transport,
+    local: &Path,
+    remote: &str,
+    direction: SyncDirection,
+    filter: &Filter,
+    rel: &str,
+    plan: &mut SyncPlan,
+) -> Result<()> {
+    let rel_join = |name: &str| {
+        if rel.is_empty() {
+            name.to_string()
+        } else {
+            format!("{rel}/{name}")
+        }
+    };
+    match direction {
+        SyncDirection::Upload => {
+            let remote_entries: Vec<Entry> = t.list_dir(remote).unwrap_or_default();
+            let dest_exists = !remote_entries.is_empty() || rel.is_empty();
+            for entry in fs::read_dir(local)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let is_dir = entry.file_type()?.is_dir();
+                if filter.excludes(&name, is_dir) {
+                    continue;
+                }
+                if is_dir {
+                    let child_rel = rel_join(&name);
+                    if !remote_entries.iter().any(|e| e.name == name && e.is_dir) {
+                        plan.dirs.push(child_rel.clone());
+                    }
+                    plan_inner(
+                        t,
+                        &entry.path(),
+                        &join(remote, &name),
+                        direction,
+                        filter,
+                        &child_rel,
+                        plan,
+                    )?;
+                    continue;
+                }
+                let meta = entry.metadata()?;
+                let dst = remote_entries.iter().find(|e| e.name == name && !e.is_dir);
+                if let Some(reason) =
+                    copy_reason(meta.len(), mtime_unix(&meta), dst.map(|e| (e.size, e.mtime)))
+                {
+                    plan.items.push(PlanItem {
+                        rel: rel_join(&name),
+                        size: meta.len(),
+                        reason,
+                    });
+                }
+            }
+            let _ = dest_exists;
+        }
+        SyncDirection::Download => {
+            for e in t.list_dir(remote)? {
+                if filter.excludes(&e.name, e.is_dir) {
+                    continue;
+                }
+                if e.is_dir && e.is_symlink {
+                    continue;
+                }
+                let child_local = local.join(&e.name);
+                if e.is_dir {
+                    let child_rel = rel_join(&e.name);
+                    if !child_local.is_dir() {
+                        plan.dirs.push(child_rel.clone());
+                    }
+                    plan_inner(
+                        t,
+                        &child_local,
+                        &join(remote, &e.name),
+                        direction,
+                        filter,
+                        &child_rel,
+                        plan,
+                    )?;
+                    continue;
+                }
+                let dst = fs::metadata(&child_local)
+                    .ok()
+                    .map(|m| (m.len(), mtime_unix(&m)));
+                if let Some(reason) = copy_reason(e.size, e.mtime, dst) {
+                    plan.items.push(PlanItem {
+                        rel: rel_join(&e.name),
+                        size: e.size,
+                        reason,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Why a file would be copied, or None when it's up to date.
+fn copy_reason(
+    src_size: u64,
+    src_mtime: Option<i64>,
+    dst: Option<(u64, Option<i64>)>,
+) -> Option<PlanReason> {
+    let Some((dst_size, dst_mtime)) = dst else {
+        return Some(PlanReason::Missing);
+    };
+    if src_size != dst_size {
+        return Some(PlanReason::SizeDiffers);
+    }
+    match (src_mtime, dst_mtime) {
+        (Some(s), Some(d)) if s > d + 2 => Some(PlanReason::Newer),
+        _ => None,
+    }
+}
+
+/// Recursively search the remote tree for names matching `mask` (e.g.
+/// "*.log"). Stops at `limit` results; `keep_going` is polled so the UI can
+/// cancel. Returns full remote paths with their entries.
+pub fn find(
+    t: &mut dyn Transport,
+    base: &str,
+    mask: &str,
+    limit: usize,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<Vec<(String, Entry)>> {
+    let mut out = Vec::new();
+    find_inner(t, base, mask, limit, keep_going, &mut out)?;
+    Ok(out)
+}
+
+fn find_inner(
+    t: &mut dyn Transport,
+    base: &str,
+    mask: &str,
+    limit: usize,
+    keep_going: &mut dyn FnMut() -> bool,
+    out: &mut Vec<(String, Entry)>,
+) -> Result<()> {
+    if out.len() >= limit || !keep_going() {
+        return Ok(());
+    }
+    for e in t.list_dir(base)? {
+        if out.len() >= limit || !keep_going() {
+            return Ok(());
+        }
+        let full = join(base, &e.name);
+        if glob_match(mask.as_bytes(), e.name.as_bytes()) {
+            out.push((full.clone(), e.clone()));
+        }
+        if e.is_dir && !e.is_symlink {
+            // Unsearchable subdirectories shouldn't abort the whole search.
+            let _ = find_inner(t, &full, mask, limit, keep_going, out);
+        }
+    }
+    Ok(())
+}
+
 /// Download a remote directory tree into `local` (created if needed).
 pub fn download_dir(
     t: &mut dyn Transport,
     remote: &str,
     local: &Path,
+    filter: &Filter,
     cb: XferCb,
 ) -> Result<u64> {
     fs::create_dir_all(local)?;
     let entries = t.list_dir(remote)?;
     let mut bytes = 0u64;
     for e in entries {
+        if filter.excludes(&e.name, e.is_dir) {
+            continue;
+        }
         if e.is_dir && e.is_symlink {
             // Never recurse through symlinked directories: they can form
             // cycles and point outside the tree being copied.
@@ -63,7 +323,7 @@ pub fn download_dir(
         let child_remote = join(remote, &e.name);
         let child_local = local.join(&e.name);
         if e.is_dir {
-            bytes += download_dir(t, &child_remote, &child_local, cb)?;
+            bytes += download_dir(t, &child_remote, &child_local, filter, cb)?;
         } else {
             bytes += one_file(t, &child_remote, &child_local, e.size, true, cb)?;
         }
@@ -72,7 +332,13 @@ pub fn download_dir(
 }
 
 /// Upload a local directory tree under `remote` (created if needed).
-pub fn upload_dir(t: &mut dyn Transport, local: &Path, remote: &str, cb: XferCb) -> Result<u64> {
+pub fn upload_dir(
+    t: &mut dyn Transport,
+    local: &Path,
+    remote: &str,
+    filter: &Filter,
+    cb: XferCb,
+) -> Result<u64> {
     // Tolerate "already exists" — there is no portable way to distinguish it
     // across protocols, and a genuinely broken connection fails on use anyway.
     let _ = t.mkdir(remote);
@@ -80,10 +346,14 @@ pub fn upload_dir(t: &mut dyn Transport, local: &Path, remote: &str, cb: XferCb)
     for entry in fs::read_dir(local)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        let is_dir = entry.file_type()?.is_dir();
+        if filter.excludes(&name, is_dir) {
+            continue;
+        }
         let child_remote = join(remote, &name);
         let child_local = entry.path();
-        if entry.file_type()?.is_dir() {
-            bytes += upload_dir(t, &child_local, &child_remote, cb)?;
+        if is_dir {
+            bytes += upload_dir(t, &child_local, &child_remote, filter, cb)?;
         } else {
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             bytes += one_file(t, &child_remote, &child_local, size, false, cb)?;
@@ -115,10 +385,11 @@ pub fn sync_dir(
     local: &Path,
     remote: &str,
     direction: SyncDirection,
+    filter: &Filter,
     cb: XferCb,
 ) -> Result<SyncStats> {
     let mut stats = SyncStats::default();
-    sync_inner(t, local, remote, direction, cb, &mut stats)?;
+    sync_inner(t, local, remote, direction, filter, cb, &mut stats)?;
     Ok(stats)
 }
 
@@ -127,6 +398,7 @@ fn sync_inner(
     local: &Path,
     remote: &str,
     direction: SyncDirection,
+    filter: &Filter,
     cb: XferCb,
     stats: &mut SyncStats,
 ) -> Result<()> {
@@ -137,9 +409,13 @@ fn sync_inner(
             for entry in fs::read_dir(local)? {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
+                let is_dir = entry.file_type()?.is_dir();
+                if filter.excludes(&name, is_dir) {
+                    continue;
+                }
                 let child_remote = join(remote, &name);
-                if entry.file_type()?.is_dir() {
-                    sync_inner(t, &entry.path(), &child_remote, direction, cb, stats)?;
+                if is_dir {
+                    sync_inner(t, &entry.path(), &child_remote, direction, filter, cb, stats)?;
                     continue;
                 }
                 let meta = entry.metadata()?;
@@ -157,13 +433,16 @@ fn sync_inner(
         SyncDirection::Download => {
             fs::create_dir_all(local)?;
             for e in t.list_dir(remote)? {
+                if filter.excludes(&e.name, e.is_dir) {
+                    continue;
+                }
                 if e.is_dir && e.is_symlink {
                     continue; // never sync through symlinked directories
                 }
                 let child_remote = join(remote, &e.name);
                 let child_local = local.join(&e.name);
                 if e.is_dir {
-                    sync_inner(t, &child_local, &child_remote, direction, cb, stats)?;
+                    sync_inner(t, &child_local, &child_remote, direction, filter, cb, stats)?;
                     continue;
                 }
                 let dst = fs::metadata(&child_local)
@@ -378,7 +657,7 @@ mod tests {
         );
         let local = tempdir("dl");
         let mut started = Vec::new();
-        let bytes = download_dir(&mut t, "/docs", &local, &mut |ev| {
+        let bytes = download_dir(&mut t, "/docs", &local, &Filter::empty(), &mut |ev| {
             if let XferEvent::Start { name, .. } = ev {
                 started.push(name.to_string());
             }
@@ -400,7 +679,7 @@ mod tests {
         fs::write(local.join("nested/y.bin"), b"67").unwrap();
 
         let mut t = FakeTransport::default();
-        let bytes = upload_dir(&mut t, &local, "/up", &mut |_| true).unwrap();
+        let bytes = upload_dir(&mut t, &local, "/up", &Filter::empty(), &mut |_| true).unwrap();
         assert_eq!(bytes, 7);
         assert_eq!(t.files.get("/up/x.bin").unwrap(), b"12345");
         assert_eq!(t.files.get("/up/nested/y.bin").unwrap(), b"67");
@@ -415,7 +694,7 @@ mod tests {
         );
         let local = tempdir("cancel");
         let mut starts = 0;
-        let err = download_dir(&mut t, "/d", &local, &mut |ev| {
+        let err = download_dir(&mut t, "/d", &local, &Filter::empty(), &mut |ev| {
             if matches!(ev, XferEvent::Start { .. }) {
                 starts += 1;
                 return starts < 2; // cancel at the second file
@@ -446,7 +725,7 @@ mod tests {
         t.dirs.insert("/d/link".into());
         t.symlinks.insert("/d/link".into());
         let local = tempdir("symdl");
-        download_dir(&mut t, "/d", &local, &mut |_| true).unwrap();
+        download_dir(&mut t, "/d", &local, &Filter::empty(), &mut |_| true).unwrap();
         assert!(local.join("real.txt").exists());
         assert!(!local.join("link").exists(), "recursed through a symlink!");
         let _ = fs::remove_dir_all(&local);
@@ -474,7 +753,7 @@ mod tests {
             &[("/r/same.txt", "unchanged"), ("/r/bigger.txt", "short")],
             &["/r"],
         );
-        let stats = sync_dir(&mut t, &local, "/r", SyncDirection::Upload, &mut |_| true).unwrap();
+        let stats = sync_dir(&mut t, &local, "/r", SyncDirection::Upload, &Filter::empty(), &mut |_| true).unwrap();
         assert_eq!(stats.copied, 2); // bigger.txt (size diff) + new.txt (missing)
         assert_eq!(stats.skipped, 1); // same.txt
         assert_eq!(t.files.get("/r/bigger.txt").unwrap(), b"now-longer");
@@ -483,11 +762,73 @@ mod tests {
     }
 
     #[test]
+    fn filter_masks_work() {
+        let f = Filter::parse("*.tmp; .git/; node_modules/");
+        assert!(f.excludes("a.tmp", false));
+        assert!(f.excludes("A.TMP", false));
+        assert!(!f.excludes("a.tmpx", false));
+        assert!(f.excludes(".git", true));
+        assert!(!f.excludes(".git", false)); // dir-only pattern
+        assert!(f.excludes("node_modules", true));
+        assert!(!f.excludes("main.rs", false));
+        assert!(!Filter::empty().excludes("anything", true));
+    }
+
+    #[test]
+    fn upload_dir_respects_filter() {
+        let local = tempdir("flt");
+        fs::write(local.join("keep.rs"), b"k").unwrap();
+        fs::write(local.join("skip.tmp"), b"s").unwrap();
+        fs::create_dir(local.join(".git")).unwrap();
+        fs::write(local.join(".git/config"), b"g").unwrap();
+        let mut t = FakeTransport::default();
+        upload_dir(&mut t, &local, "/up", &Filter::parse("*.tmp; .git/"), &mut |_| true)
+            .unwrap();
+        assert!(t.files.contains_key("/up/keep.rs"));
+        assert!(!t.files.contains_key("/up/skip.tmp"));
+        assert!(!t.files.contains_key("/up/.git/config"));
+        let _ = fs::remove_dir_all(&local);
+    }
+
+    #[test]
+    fn plan_sync_reports_without_copying() {
+        let local = tempdir("plan");
+        fs::write(local.join("same.txt"), b"unchanged").unwrap();
+        fs::write(local.join("new.txt"), b"fresh").unwrap();
+        fs::create_dir(local.join("sub")).unwrap();
+        fs::write(local.join("sub/inner.txt"), b"i").unwrap();
+
+        let mut t = fake_with(&[("/r/same.txt", "unchanged")], &["/r"]);
+        let before = t.files.clone();
+        let plan =
+            plan_sync(&mut t, &local, "/r", SyncDirection::Upload, &Filter::empty()).unwrap();
+        assert_eq!(t.files, before, "plan must not copy anything");
+        let rels: Vec<&str> = plan.items.iter().map(|i| i.rel.as_str()).collect();
+        assert!(rels.contains(&"new.txt"));
+        assert!(rels.contains(&"sub/inner.txt"));
+        assert!(!rels.contains(&"same.txt"));
+        assert!(plan.dirs.contains(&"sub".to_string()));
+        let _ = fs::remove_dir_all(&local);
+    }
+
+    #[test]
+    fn find_matches_masks_recursively() {
+        let mut t = fake_with(
+            &[("/r/a.log", "1"), ("/r/sub/b.log", "2"), ("/r/sub/c.txt", "3")],
+            &["/r", "/r/sub"],
+        );
+        let hits = find(&mut t, "/r", "*.log", 100, &mut || true).unwrap();
+        let mut paths: Vec<&str> = hits.iter().map(|(p, _)| p.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, ["/r/a.log", "/r/sub/b.log"]);
+    }
+
+    #[test]
     fn sync_download_mirror() {
         let mut t = fake_with(&[("/r/only-remote.txt", "hello")], &["/r"]);
         let local = tempdir("sync-dl");
         let stats =
-            sync_dir(&mut t, &local, "/r", SyncDirection::Download, &mut |_| true).unwrap();
+            sync_dir(&mut t, &local, "/r", SyncDirection::Download, &Filter::empty(), &mut |_| true).unwrap();
         assert_eq!(stats.copied, 1);
         assert_eq!(
             fs::read_to_string(local.join("only-remote.txt")).unwrap(),
@@ -495,7 +836,7 @@ mod tests {
         );
         // Second run: nothing to do.
         let stats2 =
-            sync_dir(&mut t, &local, "/r", SyncDirection::Download, &mut |_| true).unwrap();
+            sync_dir(&mut t, &local, "/r", SyncDirection::Download, &Filter::empty(), &mut |_| true).unwrap();
         assert_eq!(stats2.copied, 0);
         assert_eq!(stats2.skipped, 1);
         let _ = fs::remove_dir_all(&local);
