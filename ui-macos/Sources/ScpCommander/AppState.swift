@@ -56,7 +56,12 @@ final class AppState: ObservableObject {
     @Published var busy = false
 
     // Commander state: focused pane, per-pane multi-selection, dotfile toggle.
-    @Published var focusedPane: PaneKind = .local
+    // Plain var — changing focus must not re-render the full ContentView.
+    // localFocused drives only the pane header highlight.
+    var focusedPane: PaneKind = .local {
+        didSet { localFocused = focusedPane == .local }
+    }
+    @Published var localFocused: Bool = true
     @Published var localSelection = Set<FileEntry.ID>()
     @Published var remoteSelection = Set<FileEntry.ID>()
     @Published var showHidden = false

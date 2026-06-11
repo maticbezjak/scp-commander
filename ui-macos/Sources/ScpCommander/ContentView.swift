@@ -9,7 +9,46 @@ struct DraggedFile: Codable, Transferable {
     let name: String
 
     static var transferRepresentation: some TransferRepresentation {
-        CodableRepresentation(contentType: .data)
+        CodableRepresentation(
+            contentType: UTType(exportedAs: "com.manto.scp-commander.dragged-file")
+        )
+    }
+}
+
+/// Installs an NSEvent local monitor on the window that fires `action` on
+/// double-click within the view's bounds. Avoids competing with List's
+/// native selection gesture (which `onTapGesture(count:2)` blocks).
+private struct DoubleClickMonitor: NSViewRepresentable {
+    let action: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(action: action) }
+    func makeNSView(context: Context) -> NSView {
+        context.coordinator.hostView = context.coordinator.hostView ?? NSView()
+        return context.coordinator.hostView!
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.action = action
+    }
+
+    final class Coordinator {
+        var action: () -> Void
+        var hostView: NSView?
+        private var monitor: Any?
+
+        init(action: @escaping () -> Void) {
+            self.action = action
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+                guard event.clickCount == 2,
+                      let view = self?.hostView,
+                      let window = view.window else { return event }
+                let loc = view.convert(event.locationInWindow, from: nil)
+                if view.bounds.contains(loc) {
+                    self?.action()
+                }
+                return event
+            }
+        }
+        deinit { if let m = monitor { NSEvent.removeMonitor(m) } }
     }
 }
 
@@ -49,9 +88,9 @@ struct ContentView: View {
                     entries: state.localEntries,
                     showRights: false,
                     showHidden: state.showHidden,
-                    isFocused: state.focusedPane == .local,
+                    isFocused: state.localFocused,
                     selection: $state.localSelection,
-                    onFocus: { state.focusedPane = .local },
+                    onFocus: { if state.focusedPane != .local { state.focusedPane = .local } },
                     onUp: { state.localUp() },
                     onRefresh: { state.loadLocal() },
                     onNavigate: { state.navigateLocal($0) },
@@ -74,9 +113,9 @@ struct ContentView: View {
                     entries: state.remoteEntries,
                     showRights: true,
                     showHidden: state.showHidden,
-                    isFocused: state.focusedPane == .remote,
+                    isFocused: !state.localFocused,
                     selection: $state.remoteSelection,
-                    onFocus: { state.focusedPane = .remote },
+                    onFocus: { if state.focusedPane != .remote { state.focusedPane = .remote } },
                     onUp: { state.remoteUp() },
                     onRefresh: { state.refreshRemote() },
                     onNavigate: { state.navigateRemote($0) },
@@ -723,26 +762,12 @@ private struct FilePane: View {
     @State private var pathText = ""
     @State private var filterText = ""
 
-    private var visible: [FileEntry] {
+    private var sorted: [FileEntry] {
         var v = showHidden ? entries : entries.filter { !$0.name.hasPrefix(".") }
         if !filterText.isEmpty {
             v = v.filter { $0.name.localizedCaseInsensitiveContains(filterText) }
         }
-        return v
-    }
-
-    private var selectedEntries: [FileEntry] {
-        visible.filter { selection.contains($0.id) }
-    }
-
-    /// The clicked row plus the rest of the selection when it's part of it.
-    private func batchTargets(_ entry: FileEntry) -> [FileEntry] {
-        selection.contains(entry.id) ? selectedEntries : [entry]
-    }
-
-    /// Directories first (always), then the active column sort.
-    private var sorted: [FileEntry] {
-        visible.sorted { a, b in
+        v.sort { a, b in
             if a.isDir != b.isDir { return a.isDir }
             let result: Bool
             switch sortKey {
@@ -759,6 +784,16 @@ private struct FilePane: View {
             }
             return ascending ? result : !result
         }
+        return v
+    }
+
+    private var selectedEntries: [FileEntry] {
+        sorted.filter { selection.contains($0.id) }
+    }
+
+    /// The clicked row plus the rest of the selection when it's part of it.
+    private func batchTargets(_ entry: FileEntry) -> [FileEntry] {
+        selection.contains(entry.id) ? selectedEntries : [entry]
     }
 
     var body: some View {
@@ -782,6 +817,12 @@ private struct FilePane: View {
                 }
             }
             .listStyle(.inset(alternatesRowBackgrounds: true))
+            .background(DoubleClickMonitor {
+                if let entry = sorted.first(where: { selection.contains($0.id) }) {
+                    onOpen(entry)
+                }
+            })
+            .onChange(of: selection) { _ in onFocus() }
             .dropDestination(for: DraggedFile.self) { items, _ in
                 for file in items where file.pane != kind { onDrop(file) }
                 return items.contains { $0.pane != kind }
@@ -849,7 +890,7 @@ private struct FilePane: View {
     private var columnHeader: some View {
         HStack(spacing: 0) {
             headerCell("Name", key: .name, alignment: .leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
             headerCell("Size", key: .size, alignment: .trailing)
                 .frame(width: 76, alignment: .trailing)
             headerCell("Type", key: .type, alignment: .leading)
@@ -906,7 +947,7 @@ private struct FilePane: View {
                     .frame(width: 16)
                 Text(entry.name).lineLimit(1)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
             Text(entry.isDir ? "" : humanSize(entry.size))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
@@ -935,10 +976,9 @@ private struct FilePane: View {
                     .frame(width: 80, alignment: .leading)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .tag(entry.id)
         .contentShape(Rectangle())
-        .simultaneousGesture(TapGesture(count: 1).onEnded { onFocus() })
-        .onTapGesture(count: 2) { onOpen(entry) }
         .draggable(DraggedFile(pane: kind, name: entry.name))
         .contextMenu {
             if entry.isDir {
