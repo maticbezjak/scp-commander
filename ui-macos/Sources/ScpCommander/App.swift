@@ -52,7 +52,7 @@ struct ScpCommanderApp: App {
                     .disabled(state.proto != .sftp || !state.isConnected)
                 Divider()
                 Button("Show Transfer Queue") {
-                    TransferWindowController.shared.show(queue: state.transfers)
+                    TransferWindowController.shared.show(queue: state.transfers, state: state)
                 }
             }
             CommandMenu("Tabs") {

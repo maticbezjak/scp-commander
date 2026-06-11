@@ -71,14 +71,22 @@ struct Pane {
 }
 
 struct TransferRow {
-    container: GtkBox,
+    container: gtk::Frame,
     bar: ProgressBar,
+    /// WinSCP-style "17% Uploading" headline.
+    title: Label,
+    /// "File: <current file>" line (multi-file ops update it per file).
+    file_label: Label,
+    /// "Time left … · Time elapsed … · Speed …" line.
+    detail: Label,
     cancel_btn: Button,
     pause_btn: Button,
     cancel: Arc<AtomicBool>,
     pause: Arc<PauseFlag>,
     finished: bool,
     files_done: u32,
+    download: bool,
+    started: std::time::Instant,
     last_done: u64,
     last_at: Option<std::time::Instant>,
     speed: f64,
@@ -530,7 +538,8 @@ impl App {
         let remote = join_posix(&self.session().remote_path.borrow(), &entry.name);
         let local = self.local_path.borrow().join(&entry.name);
         if entry.is_dir {
-            let (id, cancel, pause) = self.add_transfer(&format!("{}/", entry.name), true, 0);
+            let (id, cancel, pause) = self.add_transfer(
+                &format!("{}/", entry.name), true, 0, &remote, &local.display().to_string());
             let _ = self.session().xfer_pool.send(Cmd::DownloadDir {
                 id,
                 name: entry.name.clone(),
@@ -548,7 +557,8 @@ impl App {
                 .ok()
                 .filter(|len| *len > 0 && *len < entry.size)
                 .unwrap_or(0);
-            let (id, cancel, pause) = self.add_transfer(&entry.name, true, entry.size);
+            let (id, cancel, pause) = self.add_transfer(
+                &entry.name, true, entry.size, &remote, &local.display().to_string());
             let _ = self.session().xfer_pool.send(Cmd::Download {
                 id,
                 name: entry.name.clone(),
@@ -570,7 +580,8 @@ impl App {
         let local = self.local_path.borrow().join(&entry.name);
         let remote = join_posix(&self.session().remote_path.borrow(), &entry.name);
         if entry.is_dir {
-            let (id, cancel, pause) = self.add_transfer(&format!("{}/", entry.name), false, 0);
+            let (id, cancel, pause) = self.add_transfer(
+                &format!("{}/", entry.name), false, 0, &local.display().to_string(), &remote);
             let _ = self.session().xfer_pool.send(Cmd::UploadDir {
                 id,
                 name: entry.name.clone(),
@@ -589,7 +600,8 @@ impl App {
                 .borrow()
                 .iter()
                 .any(|r| !r.is_dir && r.name == entry.name && r.size > 0 && r.size < entry.size);
-            let (id, cancel, pause) = self.add_transfer(&entry.name, false, entry.size);
+            let (id, cancel, pause) = self.add_transfer(
+                &entry.name, false, entry.size, &local.display().to_string(), &remote);
             let _ = self.session().xfer_pool.send(Cmd::Upload {
                 id,
                 name: entry.name.clone(),
@@ -650,7 +662,8 @@ impl App {
                 if let Some(parent) = local.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let (id, cancel, pause) = self.add_transfer(&name, true, size);
+                let (id, cancel, pause) = self.add_transfer(
+                    &name, true, size, &remote, &local.display().to_string());
                 let _ = self.session().xfer_pool.send(Cmd::Download {
                     id,
                     name,
@@ -661,7 +674,8 @@ impl App {
                     pause,
                 });
             } else {
-                let (id, cancel, pause) = self.add_transfer(&name, false, size);
+                let (id, cancel, pause) = self.add_transfer(
+                    &name, false, size, &local.display().to_string(), &remote);
                 let _ = self.session().xfer_pool.send(Cmd::Upload {
                     id,
                     name,
@@ -693,7 +707,12 @@ impl App {
         let local = self.local_path.borrow().clone();
         let remote = self.session().remote_path.borrow().clone();
         let title = format!("Sync {} {}", if download { "⬇" } else { "⬆" }, remote);
-        let (id, cancel, pause) = self.add_transfer(&title, download, 0);
+        let local_str = local.display().to_string();
+        let (id, cancel, pause) = if download {
+            self.add_transfer(&title, true, 0, &remote, &local_str)
+        } else {
+            self.add_transfer(&title, false, 0, &local_str, &remote)
+        };
         let _ = self.session().xfer_pool.send(Cmd::Sync {
             id,
             download,
@@ -705,7 +724,11 @@ impl App {
         });
     }
 
-    fn add_transfer(&self, name: &str, download: bool, total: u64) -> (u64, Arc<AtomicBool>, Arc<PauseFlag>) {
+    /// Add a WinSCP-style progress card to the transfer window:
+    /// "17% Uploading" headline, File:/Target: lines, bar, time/speed detail.
+    fn add_transfer(
+        &self, name: &str, download: bool, total: u64, source: &str, target: &str,
+    ) -> (u64, Arc<AtomicBool>, Arc<PauseFlag>) {
         let id = {
             let mut next = self.next_id.borrow_mut();
             *next += 1;
@@ -713,27 +736,14 @@ impl App {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let pause = PauseFlag::new();
+        let _ = name;
 
-        let arrow = if download { "↓" } else { "↑" };
-        let row = GtkBox::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(8)
-            .build();
-        let name_label = Label::builder()
-            .label(format!("{arrow} {name}"))
+        let title = Label::builder()
+            .label(if download { "Downloading" } else { "Uploading" })
             .xalign(0.0)
-            .width_chars(28)
-            .max_width_chars(28)
-            .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .build();
-        let bar = ProgressBar::builder()
             .hexpand(true)
-            .valign(gtk::Align::Center)
-            .show_text(true)
             .build();
-        if total > 0 {
-            bar.set_text(Some(&human_size(total)));
-        }
+        title.add_css_class("heading");
 
         // Pause / resume toggle
         let pause_icon = gtk::Image::from_icon_name("media-playback-pause-symbolic");
@@ -770,24 +780,76 @@ impl App {
             }
         ));
 
-        row.append(&name_label);
-        row.append(&bar);
-        row.append(&pause_btn);
-        row.append(&cancel_btn);
-        self.transfers_box.prepend(&row);
+        let header = GtkBox::builder().orientation(Orientation::Horizontal).spacing(4).build();
+        header.append(&title);
+        header.append(&pause_btn);
+        header.append(&cancel_btn);
+
+        let path_line = |prefix: &str, text: &str| {
+            let l = Label::builder()
+                .label(format!("{prefix}{text}"))
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::Start)
+                .build();
+            l.add_css_class("caption");
+            l.add_css_class("dim-label");
+            l
+        };
+        let file_label = path_line("File:  ", source);
+        let target_label = path_line("Target:  ", target);
+
+        let bar = ProgressBar::builder()
+            .hexpand(true)
+            .show_text(true)
+            .build();
+        if total > 0 {
+            bar.set_text(Some(&human_size(total)));
+        }
+
+        let detail = Label::builder().label("").xalign(0.0).build();
+        detail.add_css_class("caption");
+        detail.add_css_class("dim-label");
+
+        let vbox = GtkBox::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(3)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(8)
+            .margin_end(8)
+            .build();
+        vbox.append(&header);
+        vbox.append(&file_label);
+        vbox.append(&target_label);
+        vbox.append(&bar);
+        vbox.append(&detail);
+
+        let card = gtk::Frame::builder()
+            .child(&vbox)
+            .margin_top(3)
+            .margin_bottom(3)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        self.transfers_box.prepend(&card);
         self.transfers_window.present();
 
         self.transfer_rows.borrow_mut().insert(
             id,
             TransferRow {
-                container: row,
+                container: card,
                 bar,
+                title,
+                file_label,
+                detail,
                 cancel_btn,
                 pause_btn,
                 cancel: cancel.clone(),
                 pause: pause.clone(),
                 finished: false,
                 files_done: 0,
+                download,
+                started: std::time::Instant::now(),
                 last_done: 0,
                 last_at: None,
                 speed: 0.0,
@@ -869,6 +931,10 @@ impl App {
                 row.bar.set_fraction(1.0);
             }
             row.bar.set_text(Some(text));
+            row.title.set_text(text);
+            let el = row.started.elapsed().as_secs();
+            row.detail.set_text(&format!(
+                "Time elapsed {}:{:02}:{:02}", el / 3600, (el / 60) % 60, el % 60));
             row.finished = true;
             row.cancel_btn.set_visible(false);
             row.pause_btn.set_visible(false);
@@ -1062,7 +1128,8 @@ impl App {
             return;
         }
         let local = dir.join(&entry.name);
-        let (id, cancel, pause) = self.add_transfer(&entry.name, true, entry.size);
+        let (id, cancel, pause) = self.add_transfer(
+            &entry.name, true, entry.size, &remote, &local.display().to_string());
         self.edit_pending
             .borrow_mut()
             .insert(id, (remote.clone(), local.clone()));
@@ -1186,7 +1253,8 @@ impl App {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
-            let (id, cancel, pause) = self.add_transfer(&name, false, size);
+            let (id, cancel, pause) = self.add_transfer(
+                &name, false, size, &local.display().to_string(), &remote);
             let _ = cmd.send(Cmd::Upload { id, name, local, remote, resume: false, cancel, pause });
         }
     }
@@ -1878,28 +1946,38 @@ impl App {
                         row.last_at = Some(now);
                         row.last_done = done;
                     }
-                    let mut text = if total > 0 {
-                        row.bar.set_fraction((done as f64 / total as f64).min(1.0));
-                        format!("{} / {}", human_size(done), human_size(total))
+                    // "17% Uploading" headline + bytes on the bar.
+                    let op = if row.download { "Downloading" } else { "Uploading" };
+                    if total > 0 {
+                        let frac = (done as f64 / total as f64).min(1.0);
+                        row.bar.set_fraction(frac);
+                        row.title.set_text(&format!("{}% {op}", (frac * 100.0).round() as u32));
+                        row.bar.set_text(Some(&format!(
+                            "{} / {}", human_size(done), human_size(total))));
                     } else {
                         row.bar.pulse();
-                        human_size(done)
-                    };
-                    if row.speed > 1.0 {
-                        text.push_str(&format!(" · {}/s", human_size(row.speed as u64)));
-                        if total > done {
-                            let secs = ((total - done) as f64 / row.speed) as u64;
-                            text.push_str(&format!(" · {}:{:02}", secs / 60, secs % 60));
-                        }
+                        row.title.set_text(op);
+                        row.bar.set_text(Some(&human_size(done)));
                     }
-                    row.bar.set_text(Some(&text));
+                    // "Time left … · Time elapsed … · Speed …" detail line.
+                    let el = row.started.elapsed().as_secs();
+                    let mut detail = String::new();
+                    if row.speed > 1.0 && total > done {
+                        let secs = ((total - done) as f64 / row.speed) as u64;
+                        detail.push_str(&format!("Time left {}:{:02}  ·  ", secs / 60, secs % 60));
+                    }
+                    detail.push_str(&format!(
+                        "Time elapsed {}:{:02}:{:02}", el / 3600, (el / 60) % 60, el % 60));
+                    if row.speed > 1.0 {
+                        detail.push_str(&format!("  ·  Speed {}/s", human_size(row.speed as u64)));
+                    }
+                    row.detail.set_text(&detail);
                 }
             }
             Event::FileStart { id, file, total } => {
                 if let Some(row) = self.transfer_rows.borrow().get(&id) {
-                    let short = file.rsplit('/').next().unwrap_or(&file);
                     row.bar.set_fraction(0.0);
-                    row.bar.set_text(Some(short));
+                    row.file_label.set_text(&format!("File:  {file}"));
                     let _ = total;
                 }
             }
@@ -3202,7 +3280,8 @@ fn build_ui(app: &Application) {
                 };
                 let remote = join_posix(&state.session().remote_path.borrow(), &name);
                 if path.is_dir() {
-                    let (id, cancel, pause) = state.add_transfer(&format!("{name}/"), false, 0);
+                    let (id, cancel, pause) = state.add_transfer(
+                        &format!("{name}/"), false, 0, &path.display().to_string(), &remote);
                     let _ = state.session().xfer_pool.send(Cmd::UploadDir {
                         id,
                         name,
@@ -3214,7 +3293,8 @@ fn build_ui(app: &Application) {
                     });
                 } else {
                     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    let (id, cancel, pause) = state.add_transfer(&name, false, size);
+                    let (id, cancel, pause) = state.add_transfer(
+                        &name, false, size, &path.display().to_string(), &remote);
                     let _ = state.session().xfer_pool.send(Cmd::Upload {
                         id,
                         name,

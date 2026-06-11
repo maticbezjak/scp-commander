@@ -29,6 +29,10 @@ final class Transfer: ObservableObject, Identifiable {
     let direction: TransferDirection
     let cancelFlag = CancelFlag()
     let pauseFlag = PauseFlag()
+    let started = Date()
+    /// Source path and destination directory (WinSCP's File:/Target: lines).
+    var source = ""
+    var target = ""
 
     @Published var transferred: UInt64 = 0
     @Published var isPaused: Bool = false
@@ -67,6 +71,12 @@ final class Transfer: ObservableObject, Identifiable {
         guard state == .active, speed > 1, total > transferred else { return nil }
         let secs = Int(Double(total - transferred) / speed)
         return String(format: "%d:%02d", secs / 60, secs % 60)
+    }
+
+    /// "h:mm:ss" wall-clock since the transfer started.
+    var elapsed: String {
+        let secs = Int(Date().timeIntervalSince(started))
+        return String(format: "%d:%02d:%02d", secs / 3600, (secs / 60) % 60, secs % 60)
     }
 
     /// 0…1, or nil when the total size is unknown (shows as indeterminate).

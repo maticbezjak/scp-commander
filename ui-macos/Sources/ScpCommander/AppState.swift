@@ -881,8 +881,12 @@ final class AppState: ObservableObject {
         let transfer = Transfer(name: name, direction: direction)
         transfer.total = size
         transfer.transferred = resumeOffset
+        transfer.source = direction == .download ? remote : local
+        transfer.target = direction == .download
+            ? (local as NSString).deletingLastPathComponent
+            : parentPosix(remote)
         transfers.add(transfer)
-        TransferWindowController.shared.show(queue: transfers)
+        TransferWindowController.shared.show(queue: transfers, state: self)
         let flag = transfer.cancelFlag
         let pause = transfer.pauseFlag
         let offset = resumeOffset
@@ -1040,7 +1044,7 @@ final class AppState: ObservableObject {
         let title = download ? "Sync ⬇ \(remote)" : "Sync ⬆ \(remote)"
         let transfer = Transfer(name: title, direction: download ? .download : .upload)
         transfers.add(transfer)
-        TransferWindowController.shared.show(queue: transfers)
+        TransferWindowController.shared.show(queue: transfers, state: self)
         let flag = transfer.cancelFlag
 
         session.queue.async { [weak self, client = session.client] in
@@ -1077,8 +1081,10 @@ final class AppState: ObservableObject {
         onDone: @escaping () -> Void
     ) {
         let transfer = Transfer(name: "\(name)/", direction: direction)
+        transfer.source = direction == .download ? remote : local
+        transfer.target = direction == .download ? local : remote
         transfers.add(transfer)
-        TransferWindowController.shared.show(queue: transfers)
+        TransferWindowController.shared.show(queue: transfers, state: self)
         let flag = transfer.cancelFlag
 
         let excludes = excludeMasks

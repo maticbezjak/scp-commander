@@ -6,30 +6,37 @@ final class TransferWindowController {
     static let shared = TransferWindowController()
     private var panel: NSPanel?
 
-    func show(queue: TransferQueue) {
+    func show(queue: TransferQueue, state: AppState? = nil) {
         if let panel, panel.isVisible { return }
         let panel = NSPanel(
-            contentRect: .init(x: 0, y: 0, width: 500, height: 320),
+            contentRect: .init(x: 0, y: 0, width: 460, height: 340),
             styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        panel.title = "Transfer Queue"
+        panel.title = "Transfers"
         panel.isReleasedWhenClosed = false
-        panel.contentView = NSHostingView(rootView: TransferQueueView(queue: queue))
+        panel.contentView = NSHostingView(
+            rootView: TransferQueueView(queue: queue, state: state))
         if let screen = NSScreen.main {
             let f = screen.visibleFrame
-            panel.setFrameOrigin(.init(x: f.maxX - 520, y: f.minY + 20))
+            panel.setFrameOrigin(.init(x: f.maxX - 480, y: f.minY + 20))
         } else {
             panel.center()
         }
         panel.makeKeyAndOrderFront(nil)
         self.panel = panel
     }
+
+    /// WinSCP titles the dialog with live progress ("17% Uploading").
+    func setTitle(_ title: String) {
+        panel?.title = title
+    }
 }
 
 struct TransferQueueView: View {
     @ObservedObject var queue: TransferQueue
+    var state: AppState?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -52,41 +59,63 @@ struct TransferQueueView: View {
                 Spacer()
             } else {
                 ScrollView {
-                    VStack(spacing: 0) {
-                        ForEach(queue.items) { TransferQueueRow(transfer: $0) }
+                    VStack(spacing: 6) {
+                        ForEach(queue.items) { transfer in
+                            if transfer.state == .active {
+                                ActiveTransferCard(transfer: transfer)
+                            } else {
+                                FinishedTransferRow(transfer: transfer)
+                            }
+                        }
                     }
-                    .padding(.vertical, 4)
+                    .padding(8)
                 }
             }
+            if let state {
+                Divider()
+                SpeedLimitFooter(state: state)
+            }
         }
-        .frame(minWidth: 420, minHeight: 120)
+        .frame(minWidth: 440, minHeight: 160)
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            if let first = queue.items.first(where: { $0.state == .active }) {
+                let op = first.direction == .upload ? "Uploading" : "Downloading"
+                if let f = first.fraction {
+                    TransferWindowController.shared.setTitle("\(Int((f * 100).rounded()))% \(op)")
+                } else {
+                    TransferWindowController.shared.setTitle(op)
+                }
+            } else {
+                TransferWindowController.shared.setTitle("Transfers")
+            }
+        }
     }
 }
 
-struct TransferQueueRow: View {
+/// WinSCP-style progress card: % header, File/Target, bar, time/bytes grid.
+private struct ActiveTransferCard: View {
     @ObservedObject var transfer: Transfer
 
+    private var percent: Int {
+        Int(((transfer.fraction ?? 0) * 100).rounded())
+    }
+
+    private var operation: String {
+        transfer.direction == .upload ? "Uploading" : "Downloading"
+    }
+
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: transfer.direction.symbol)
-                .foregroundStyle(stateColor)
-            VStack(alignment: .leading, spacing: 0) {
-                Text(transfer.name).lineLimit(1)
-                if let current = transfer.currentFile, transfer.state == .active {
-                    Text(current)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.head)
+        VStack(alignment: .leading, spacing: 6) {
+            // ── "17% Uploading" + pause/cancel ─────────────────────────────
+            HStack {
+                Image(systemName: transfer.direction.symbol)
+                    .foregroundStyle(Color.accentColor)
+                Text(transfer.fraction != nil ? "\(percent)% \(operation)" : operation)
+                    .font(.headline)
+                if transfer.isPaused {
+                    Text("— paused").foregroundStyle(.secondary)
                 }
-            }
-            .frame(width: 180, alignment: .leading)
-            progressView
-            Spacer()
-            Text(rowDetail)
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-            if transfer.state == .active {
+                Spacer()
                 Button {
                     if transfer.isPaused {
                         transfer.isPaused = false
@@ -97,7 +126,6 @@ struct TransferQueueRow: View {
                     }
                 } label: {
                     Image(systemName: transfer.isPaused ? "play.circle.fill" : "pause.circle.fill")
-                        .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.borderless)
                 .help(transfer.isPaused ? "Resume" : "Pause")
@@ -105,66 +133,119 @@ struct TransferQueueRow: View {
                     transfer.pauseFlag.resume()   // unblock worker before cancelling
                     transfer.cancelFlag.cancel()
                 } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
                 }
                 .buttonStyle(.borderless)
                 .help("Cancel")
             }
-        }
-        .padding(.horizontal, 12).padding(.vertical, 5)
-    }
 
-    private var stateColor: Color {
-        switch transfer.state {
-        case .active: return .accentColor
-        case .done: return .green
-        case .cancelled: return .orange
-        case .failed: return .red
-        }
-    }
-
-    @ViewBuilder
-    private var progressView: some View {
-        switch transfer.state {
-        case .active:
-            if let f = transfer.fraction {
-                ProgressView(value: f)
-                    .frame(width: 160)
-                    .opacity(transfer.isPaused ? 0.4 : 1.0)
-            } else if !transfer.isPaused {
-                ProgressView().scaleEffect(0.5).frame(width: 40)
-            } else {
-                Image(systemName: "pause.circle").foregroundStyle(.secondary)
+            // ── File: / Target: ────────────────────────────────────────────
+            Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 2) {
+                GridRow {
+                    Text("File:").foregroundStyle(.secondary)
+                    Text(transfer.currentFile ?? transfer.source)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
+                GridRow {
+                    Text("Target:").foregroundStyle(.secondary)
+                    Text(transfer.target)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
             }
-        case .done:
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-        case .cancelled:
-            Image(systemName: "slash.circle").foregroundStyle(.orange)
-        case .failed:
-            Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
+            .font(.caption)
+
+            ProgressView(value: transfer.fraction ?? 0)
+                .opacity(transfer.isPaused ? 0.4 : 1.0)
+
+            // ── Time left / elapsed · Bytes / Speed ────────────────────────
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 2) {
+                    GridRow {
+                        Text("Time left:").foregroundStyle(.secondary)
+                        Text(transfer.eta ?? "—").monospacedDigit()
+                        Spacer().gridCellUnsizedAxes([.horizontal, .vertical])
+                        Text("Time elapsed:").foregroundStyle(.secondary)
+                        Text(transfer.elapsed).monospacedDigit()
+                    }
+                    GridRow {
+                        Text("Bytes transferred:").foregroundStyle(.secondary)
+                        Text(humanSize(transfer.transferred)).monospacedDigit()
+                        Spacer().gridCellUnsizedAxes([.horizontal, .vertical])
+                        Text("Speed:").foregroundStyle(.secondary)
+                        Text(transfer.speed > 1 ? "\(humanSize(UInt64(transfer.speed)))/s" : "—")
+                            .monospacedDigit()
+                    }
+                }
+                .font(.caption)
+            }
         }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.primary.opacity(0.05))
+        )
+    }
+}
+
+/// Compact one-line row for finished/cancelled/failed transfers.
+private struct FinishedTransferRow: View {
+    @ObservedObject var transfer: Transfer
+
+    var body: some View {
+        HStack(spacing: 8) {
+            switch transfer.state {
+            case .done:
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            case .cancelled:
+                Image(systemName: "slash.circle").foregroundStyle(.orange)
+            case .failed:
+                Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
+            case .active:
+                EmptyView()
+            }
+            Text(transfer.name).lineLimit(1)
+            Spacer()
+            Text(detail)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 4)
     }
 
-    private var rowDetail: String {
+    private var detail: String {
         switch transfer.state {
         case .failed(let msg): return msg
         case .cancelled: return "cancelled"
         case .done:
             let files = transfer.filesDone > 0 ? "\(transfer.filesDone) files · " : ""
             return files + humanSize(max(transfer.total, transfer.transferred))
-        case .active:
-            if transfer.isPaused { return "paused" }
-            var parts: [String] = []
-            if transfer.total > 0 {
-                parts.append("\(humanSize(transfer.transferred)) / \(humanSize(transfer.total))")
-            } else {
-                parts.append(humanSize(transfer.transferred))
-            }
-            if transfer.speed > 1 {
-                parts.append("\(humanSize(UInt64(transfer.speed)))/s")
-            }
-            if let eta = transfer.eta { parts.append(eta) }
-            return parts.joined(separator: " · ")
+        case .active: return ""
         }
+    }
+}
+
+/// WinSCP's bottom-row speed limit dropdown ("Unlimited").
+private struct SpeedLimitFooter: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        HStack {
+            Image(systemName: "speedometer")
+                .foregroundStyle(.secondary)
+            Picker("Speed limit", selection: $state.speedLimitKbs) {
+                Text("Unlimited").tag(0)
+                Text("100 KiB/s").tag(100)
+                Text("500 KiB/s").tag(500)
+                Text("1 MiB/s").tag(1024)
+                Text("5 MiB/s").tag(5120)
+            }
+            .labelsHidden()
+            .fixedSize()
+            Spacer()
+        }
+        .padding(.horizontal, 12).padding(.vertical, 6)
     }
 }

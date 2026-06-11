@@ -1476,7 +1476,7 @@ private struct CommandBar: View {
             Divider().frame(height: 16)
 
             Menu {
-                Button("Show Queue") { TransferWindowController.shared.show(queue: state.transfers) }
+                Button("Show Queue") { TransferWindowController.shared.show(queue: state.transfers, state: state) }
                 Divider()
                 Button("Clear Finished") { state.transfers.clearFinished() }
                 Button("Cancel All", role: .destructive) { state.transfers.cancelAll() }
