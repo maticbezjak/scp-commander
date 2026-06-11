@@ -105,6 +105,38 @@ final class CancelFlag: @unchecked Sendable {
     }
 }
 
+/// Thread-safe pause flag. Worker calls `waitWhilePaused()` inside the
+/// progress callback; UI calls `pause()` / `resume()`.
+final class PauseFlag: @unchecked Sendable {
+    private let cond = NSCondition()
+    private var paused = false
+
+    var isPaused: Bool {
+        cond.lock(); defer { cond.unlock() }
+        return paused
+    }
+
+    func pause() {
+        cond.lock()
+        paused = true
+        cond.unlock()
+    }
+
+    func resume() {
+        cond.lock()
+        paused = false
+        cond.signal()
+        cond.unlock()
+    }
+
+    /// Called by the worker thread — blocks until resumed or the deadline fires.
+    func waitWhilePaused() {
+        cond.lock()
+        while paused { cond.wait() }
+        cond.unlock()
+    }
+}
+
 /// Heap box so a Swift progress closure can ride through C `user_data`.
 /// Returning `false` cancels the transfer.
 private final class ProgressBox {

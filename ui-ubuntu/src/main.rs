@@ -10,6 +10,7 @@
 //!   sudo apt install libgtk-4-dev build-essential
 //!   cargo run -p scp-ubuntu
 
+mod pool;
 mod secrets;
 mod sites;
 mod worker;
@@ -36,7 +37,7 @@ use gtk::{
 
 use scp_core::types::{Auth, Credentials, Entry, HostKeyPolicy, Protocol};
 use sites::{Site, SitesStore};
-use worker::{Cmd, Event};
+use worker::{Cmd, Event, PauseFlag};
 
 const APP_ID: &str = "net.manto.ScpCommander";
 
@@ -73,7 +74,9 @@ struct TransferRow {
     container: GtkBox,
     bar: ProgressBar,
     cancel_btn: Button,
+    pause_btn: Button,
     cancel: Arc<AtomicBool>,
+    pause: Arc<PauseFlag>,
     finished: bool,
     files_done: u32,
     last_done: u64,
@@ -100,9 +103,9 @@ enum MoveSource {
 struct Session {
     /// Browse connection: listings and file management.
     cmd: mpsc::Sender<Cmd>,
-    /// Dedicated transfer connection so a long download never blocks
-    /// browsing (WinSCP's background-transfer model).
-    xfer_cmd: mpsc::Sender<Cmd>,
+    /// Pool of N transfer connections so transfers run in parallel without
+    /// blocking browsing (WinSCP's background-transfer model).
+    xfer_pool: pool::TransferPool,
     creds: RefCell<Option<Credentials>>,
     remote_path: RefCell<String>,
     connected: Cell<bool>,
@@ -125,7 +128,8 @@ struct App {
     remote: Pane,
     local_path: RefCell<PathBuf>,
     status: Label,
-    // Transfers panel
+    // Transfers window
+    transfers_window: gtk::Window,
     transfers_box: GtkBox,
     transfers_panel: GtkBox,
     transfer_rows: RefCell<HashMap<u64, TransferRow>>,
@@ -137,6 +141,7 @@ struct App {
     port_entry: GtkEntry,
     user_entry: GtkEntry,
     pass_entry: PasswordEntry,
+    remember_pw_check: gtk::CheckButton,
     key_entry: GtkEntry,
     bucket_entry: GtkEntry,
     region_entry: GtkEntry,
@@ -304,6 +309,7 @@ impl App {
     }
 
     fn open_local(self: &Rc<Self>, index: u32) {
+        if index == 0 { self.local_up(); return; }
         let Some(entry) = self.local.entry_at(index) else { return };
         if entry.is_dir {
             self.local_path.borrow_mut().push(&entry.name);
@@ -389,7 +395,7 @@ impl App {
         *session.creds.borrow_mut() = Some(creds.clone());
         *self.pending_connect.borrow_mut() = Some((creds.clone(), path.clone()));
         self.set_status("Connecting…");
-        let _ = session.cmd.send(Cmd::Connect { creds, path });
+        let _ = session.cmd.send(Cmd::Connect { creds, path, silent: false });
     }
 
     /// "user@host" (or bucket) label for a set of credentials.
@@ -415,6 +421,7 @@ impl App {
     }
 
     fn open_remote(self: &Rc<Self>, index: u32) {
+        if index == 0 { self.remote_up(); return; }
         let Some(entry) = self.remote.entry_at(index) else { return };
         if entry.is_dir {
             let path = join_posix(&self.session().remote_path.borrow(), &entry.name);
@@ -448,14 +455,15 @@ impl App {
         let remote = join_posix(&self.session().remote_path.borrow(), &entry.name);
         let local = self.local_path.borrow().join(&entry.name);
         if entry.is_dir {
-            let (id, cancel) = self.add_transfer(&format!("{}/", entry.name), true, 0);
-            let _ = self.session().xfer_cmd.send(Cmd::DownloadDir {
+            let (id, cancel, pause) = self.add_transfer(&format!("{}/", entry.name), true, 0);
+            let _ = self.session().xfer_pool.send(Cmd::DownloadDir {
                 id,
                 name: entry.name.clone(),
                 remote,
                 local,
                 excludes: self.exclude_masks(),
                 cancel,
+                pause,
             });
             return Some(id);
         } else {
@@ -465,14 +473,15 @@ impl App {
                 .ok()
                 .filter(|len| *len > 0 && *len < entry.size)
                 .unwrap_or(0);
-            let (id, cancel) = self.add_transfer(&entry.name, true, entry.size);
-            let _ = self.session().xfer_cmd.send(Cmd::Download {
+            let (id, cancel, pause) = self.add_transfer(&entry.name, true, entry.size);
+            let _ = self.session().xfer_pool.send(Cmd::Download {
                 id,
                 name: entry.name.clone(),
                 remote,
                 local,
                 resume,
                 cancel,
+                pause,
             });
             return Some(id);
         }
@@ -486,14 +495,15 @@ impl App {
         let local = self.local_path.borrow().join(&entry.name);
         let remote = join_posix(&self.session().remote_path.borrow(), &entry.name);
         if entry.is_dir {
-            let (id, cancel) = self.add_transfer(&format!("{}/", entry.name), false, 0);
-            let _ = self.session().xfer_cmd.send(Cmd::UploadDir {
+            let (id, cancel, pause) = self.add_transfer(&format!("{}/", entry.name), false, 0);
+            let _ = self.session().xfer_pool.send(Cmd::UploadDir {
                 id,
                 name: entry.name.clone(),
                 local,
                 remote,
                 excludes: self.exclude_masks(),
                 cancel,
+                pause,
             });
             return Some(id);
         } else {
@@ -504,14 +514,15 @@ impl App {
                 .borrow()
                 .iter()
                 .any(|r| !r.is_dir && r.name == entry.name && r.size > 0 && r.size < entry.size);
-            let (id, cancel) = self.add_transfer(&entry.name, false, entry.size);
-            let _ = self.session().xfer_cmd.send(Cmd::Upload {
+            let (id, cancel, pause) = self.add_transfer(&entry.name, false, entry.size);
+            let _ = self.session().xfer_pool.send(Cmd::Upload {
                 id,
                 name: entry.name.clone(),
                 local,
                 remote,
                 resume,
                 cancel,
+                pause,
             });
             return Some(id);
         }
@@ -564,24 +575,26 @@ impl App {
                 if let Some(parent) = local.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let (id, cancel) = self.add_transfer(&name, true, size);
-                let _ = self.session().xfer_cmd.send(Cmd::Download {
+                let (id, cancel, pause) = self.add_transfer(&name, true, size);
+                let _ = self.session().xfer_pool.send(Cmd::Download {
                     id,
                     name,
                     remote,
                     local,
                     resume: 0,
                     cancel,
+                    pause,
                 });
             } else {
-                let (id, cancel) = self.add_transfer(&name, false, size);
-                let _ = self.session().xfer_cmd.send(Cmd::Upload {
+                let (id, cancel, pause) = self.add_transfer(&name, false, size);
+                let _ = self.session().xfer_pool.send(Cmd::Upload {
                     id,
                     name,
                     local,
                     remote,
                     resume: false,
                     cancel,
+                    pause,
                 });
             }
         }
@@ -605,24 +618,26 @@ impl App {
         let local = self.local_path.borrow().clone();
         let remote = self.session().remote_path.borrow().clone();
         let title = format!("Sync {} {}", if download { "⬇" } else { "⬆" }, remote);
-        let (id, cancel) = self.add_transfer(&title, download, 0);
-        let _ = self.session().xfer_cmd.send(Cmd::Sync {
+        let (id, cancel, pause) = self.add_transfer(&title, download, 0);
+        let _ = self.session().xfer_pool.send(Cmd::Sync {
             id,
             download,
             local,
             remote,
             excludes: self.exclude_masks(),
             cancel,
+            pause,
         });
     }
 
-    fn add_transfer(&self, name: &str, download: bool, total: u64) -> (u64, Arc<AtomicBool>) {
+    fn add_transfer(&self, name: &str, download: bool, total: u64) -> (u64, Arc<AtomicBool>, Arc<PauseFlag>) {
         let id = {
             let mut next = self.next_id.borrow_mut();
             *next += 1;
             *next
         };
         let cancel = Arc::new(AtomicBool::new(false));
+        let pause = PauseFlag::new();
 
         let arrow = if download { "↓" } else { "↑" };
         let row = GtkBox::builder()
@@ -644,17 +659,48 @@ impl App {
         if total > 0 {
             bar.set_text(Some(&human_size(total)));
         }
+
+        // Pause / resume toggle
+        let pause_icon = gtk::Image::from_icon_name("media-playback-pause-symbolic");
+        let pause_btn = Button::new();
+        pause_btn.set_child(Some(&pause_icon));
+        pause_btn.add_css_class("flat");
+        pause_btn.set_tooltip_text(Some("Pause"));
+        pause_btn.connect_clicked(glib::clone!(
+            #[strong] pause_icon,
+            #[strong] pause,
+            move |btn| {
+                if pause.is_paused() {
+                    pause.resume();
+                    pause_icon.set_icon_name(Some("media-playback-pause-symbolic"));
+                    btn.set_tooltip_text(Some("Pause"));
+                } else {
+                    pause.pause();
+                    pause_icon.set_icon_name(Some("media-playback-start-symbolic"));
+                    btn.set_tooltip_text(Some("Resume"));
+                }
+            }
+        ));
+
+        // Cancel — also resumes pause so worker can observe the cancel flag
         let cancel_btn = Button::from_icon_name("process-stop-symbolic");
         cancel_btn.add_css_class("flat");
         cancel_btn.set_tooltip_text(Some("Cancel"));
-        let flag = cancel.clone();
-        cancel_btn.connect_clicked(move |_| flag.store(true, Ordering::Relaxed));
+        cancel_btn.connect_clicked(glib::clone!(
+            #[strong] cancel,
+            #[strong] pause,
+            move |_| {
+                pause.resume();
+                cancel.store(true, Ordering::Relaxed);
+            }
+        ));
 
         row.append(&name_label);
         row.append(&bar);
+        row.append(&pause_btn);
         row.append(&cancel_btn);
         self.transfers_box.prepend(&row);
-        self.transfers_panel.set_visible(true);
+        self.transfers_window.present();
 
         self.transfer_rows.borrow_mut().insert(
             id,
@@ -662,7 +708,9 @@ impl App {
                 container: row,
                 bar,
                 cancel_btn,
+                pause_btn,
                 cancel: cancel.clone(),
+                pause: pause.clone(),
                 finished: false,
                 files_done: 0,
                 last_done: 0,
@@ -670,7 +718,7 @@ impl App {
                 speed: 0.0,
             },
         );
-        (id, cancel)
+        (id, cancel, pause)
     }
 
     fn clear_finished(&self) {
@@ -684,13 +732,14 @@ impl App {
             }
         });
         if rows.is_empty() {
-            self.transfers_panel.set_visible(false);
+            self.transfers_window.hide();
         }
     }
 
     fn cancel_all(&self) {
         for row in self.transfer_rows.borrow().values() {
             if !row.finished {
+                row.pause.resume();
                 row.cancel.store(true, Ordering::Relaxed);
             }
         }
@@ -747,6 +796,8 @@ impl App {
             row.bar.set_text(Some(text));
             row.finished = true;
             row.cancel_btn.set_visible(false);
+            row.pause_btn.set_visible(false);
+            row.pause.resume(); // unblock worker if it was paused
         }
     }
 
@@ -765,6 +816,7 @@ impl App {
         self.selected_indices(local_pane)
             .into_iter()
             .filter_map(|i| entries.get(i as usize).cloned())
+            .filter(|e| e.name != "..")
             .collect()
     }
 
@@ -935,17 +987,18 @@ impl App {
             return;
         }
         let local = dir.join(&entry.name);
-        let (id, cancel) = self.add_transfer(&entry.name, true, entry.size);
+        let (id, cancel, pause) = self.add_transfer(&entry.name, true, entry.size);
         self.edit_pending
             .borrow_mut()
             .insert(id, (remote.clone(), local.clone()));
-        let _ = self.session().xfer_cmd.send(Cmd::Download {
+        let _ = self.session().xfer_pool.send(Cmd::Download {
             id,
             name: entry.name.clone(),
             remote,
             local,
             resume: 0,
             cancel,
+            pause,
         });
     }
 
@@ -1058,8 +1111,8 @@ impl App {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
-            let (id, cancel) = self.add_transfer(&name, false, size);
-            let _ = cmd.send(Cmd::Upload { id, name, local, remote, resume: false, cancel });
+            let (id, cancel, pause) = self.add_transfer(&name, false, size);
+            let _ = cmd.send(Cmd::Upload { id, name, local, remote, resume: false, cancel, pause });
         }
     }
 
@@ -1626,14 +1679,10 @@ impl App {
                 let first_connect = !session.connected.get();
                 session.connected.set(true);
                 if first_connect && !from_transfer {
-                    // Bring up the dedicated transfer connection. Commands
-                    // sent later queue behind this Connect in the channel,
-                    // so ordering guarantees it's ready before any transfer.
+                    // Connect all pool workers. They establish their own
+                    // independent connections in the background.
                     if let Some(creds) = session.creds.borrow().clone() {
-                        let _ = session.xfer_cmd.send(Cmd::Connect {
-                            creds,
-                            path: "/".to_string(),
-                        });
+                        session.xfer_pool.connect(creds);
                     }
                 }
                 let mut entries = entries;
@@ -1652,6 +1701,22 @@ impl App {
                 if !title.is_empty() && *session.title.borrow() != title {
                     *session.title.borrow_mut() = title;
                     self.refresh_tabs();
+                }
+                if first_connect && self.remember_pw_check.is_active() {
+                    if let Some(creds) = session.creds.borrow().clone() {
+                        if let Auth::Password(ref pw) = creds.auth {
+                            if !pw.is_empty() {
+                                let proto_label = PROTO_LABELS[creds.protocol as usize % PROTO_LABELS.len()];
+                                let account = secrets::account(
+                                    proto_label,
+                                    &creds.username,
+                                    &creds.host,
+                                    &creds.port.to_string(),
+                                );
+                                let _ = secrets::save(&account, pw);
+                            }
+                        }
+                    }
                 }
                 if is_active {
                     self.remote.show(&entries, &path, self.show_hidden.get());
@@ -1848,11 +1913,23 @@ impl Pane {
     fn show(&self, entries: &[Entry], path: &str, show_hidden: bool) {
         self.path_entry.set_text(path);
         self.model.remove_all();
-        let visible: Vec<Entry> = entries
-            .iter()
-            .filter(|e| show_hidden || !e.name.starts_with('.'))
-            .cloned()
-            .collect();
+        let parent_entry = Entry {
+            name: "..".into(),
+            is_dir: true,
+            size: 0,
+            mtime: None::<i64>,
+            perms: None,
+            is_symlink: false,
+            uid: None,
+            gid: None,
+        };
+        let mut visible: Vec<Entry> = vec![parent_entry.clone()];
+        visible.extend(
+            entries
+                .iter()
+                .filter(|e| show_hidden || !e.name.starts_with('.'))
+                .cloned(),
+        );
         for e in &visible {
             self.model.append(&glib::BoxedAnyObject::new(e.clone()));
         }
@@ -1869,10 +1946,10 @@ fn create_session(state: &Rc<App>) -> Rc<Session> {
     let (event_tx, event_rx) = async_channel::unbounded::<Event>();
     let cmd = worker::spawn(event_tx);
     let (xfer_tx, xfer_rx) = async_channel::unbounded::<Event>();
-    let xfer_cmd = worker::spawn(xfer_tx);
+    let xfer_pool = pool::TransferPool::new(xfer_tx);
     let session = Rc::new(Session {
         cmd,
-        xfer_cmd,
+        xfer_pool,
         creds: RefCell::new(None),
         remote_path: RefCell::new("/".to_string()),
         connected: Cell::new(false),
@@ -1915,6 +1992,7 @@ fn build_ui(app: &Application) {
     let host_entry = GtkEntry::builder().hexpand(true).build();
     let port_entry = GtkEntry::builder().text("22").max_width_chars(6).width_chars(6).build();
     let pass_entry = PasswordEntry::builder().show_peek_icon(true).hexpand(true).build();
+    let remember_pw_check = gtk::CheckButton::with_label("Remember password");
     let key_entry = GtkEntry::builder().hexpand(true).build();
     let key_browse = Button::from_icon_name("document-open-symbolic");
     key_browse.set_tooltip_text(Some("Choose a private key"));
@@ -1962,12 +2040,13 @@ fn build_ui(app: &Application) {
     form.attach(&user_entry, 1, 3, 1, 1);
     form.attach(&pass_label, 0, 4, 1, 1);
     form.attach(&pass_entry, 1, 4, 2, 1);
-    form.attach(&key_label, 0, 5, 1, 1);
-    form.attach(&key_row, 1, 5, 2, 1);
-    form.attach(&bucket_label, 0, 6, 1, 1);
-    form.attach(&bucket_entry, 1, 6, 1, 1);
-    form.attach(&region_label, 0, 7, 1, 1);
-    form.attach(&region_entry, 1, 7, 1, 1);
+    form.attach(&remember_pw_check, 1, 5, 2, 1);
+    form.attach(&key_label, 0, 6, 1, 1);
+    form.attach(&key_row, 1, 6, 2, 1);
+    form.attach(&bucket_label, 0, 7, 1, 1);
+    form.attach(&bucket_entry, 1, 7, 1, 1);
+    form.attach(&region_label, 0, 8, 1, 1);
+    form.attach(&region_entry, 1, 8, 1, 1);
     let insecure_label = Label::builder()
         .label("\u{26a0} Plain FTP sends your password and data unencrypted \u{2014} prefer SFTP or FTPS.")
         .xalign(0.0)
@@ -1975,7 +2054,7 @@ fn build_ui(app: &Application) {
         .visible(false)
         .build();
     insecure_label.add_css_class("warning");
-    form.attach(&insecure_label, 0, 8, 5, 1);
+    form.attach(&insecure_label, 0, 9, 5, 1);
 
     // The pickers drive the default port, field visibility, and label text.
     let update_form = {
@@ -2050,6 +2129,38 @@ fn build_ui(app: &Application) {
     let hook = update_form.clone();
     host_entry.connect_changed(move |_| hook());
 
+    // Auto-fill password from keyring when credentials are fully typed.
+    {
+        let host_e = host_entry.clone();
+        let user_e = user_entry.clone();
+        let port_e = port_entry.clone();
+        let proto_d = proto_dd.clone();
+        let auth_d = auth_dd.clone();
+        let pass_e = pass_entry.clone();
+        let remember = remember_pw_check.clone();
+        let try_fill = Rc::new(move || {
+            let proto_idx = proto_d.selected() as usize;
+            let is_password_auth = proto_idx != 0 || auth_d.selected() == 0;
+            if !is_password_auth { return; }
+            let account = secrets::account(
+                PROTO_LABELS[proto_idx % PROTO_LABELS.len()],
+                &user_e.text(),
+                &host_e.text(),
+                &port_e.text(),
+            );
+            if let Some(pw) = secrets::load(&account) {
+                pass_e.set_text(&pw);
+                remember.set_active(true);
+            }
+        });
+        let f = try_fill.clone();
+        host_entry.connect_changed(move |_| f());
+        let f = try_fill.clone();
+        user_entry.connect_changed(move |_| f());
+        let f = try_fill.clone();
+        port_entry.connect_changed(move |_| f());
+    }
+
     // Login dialog buttons + main-window toolbar ------------------------------
     let login_btn = Button::with_label("Login");
     login_btn.add_css_class("suggested-action");
@@ -2092,6 +2203,9 @@ fn build_ui(app: &Application) {
     hint.add_css_class("dim-label");
     hint.add_css_class("caption");
 
+    let help_btn = Button::from_icon_name("help-browser-symbolic");
+    help_btn.set_tooltip_text(Some("Help"));
+
     main_toolbar.append(&new_session_btn);
     main_toolbar.append(&gtk::Separator::new(Orientation::Vertical));
     main_toolbar.append(&sync_up_btn);
@@ -2104,6 +2218,7 @@ fn build_ui(app: &Application) {
     main_toolbar.append(&hidden_btn);
     main_toolbar.append(&exclude_entry);
     main_toolbar.append(&hint);
+    main_toolbar.append(&help_btn);
 
     // Panes ------------------------------------------------------------------
     let local_hook: MenuHook = Rc::new(RefCell::new(None));
@@ -2178,11 +2293,20 @@ fn build_ui(app: &Application) {
     let transfers_panel = GtkBox::builder()
         .orientation(Orientation::Vertical)
         .spacing(2)
-        .visible(false)
         .build();
-    transfers_panel.append(&gtk::Separator::new(Orientation::Horizontal));
     transfers_panel.append(&transfers_header);
+    transfers_panel.append(&gtk::Separator::new(Orientation::Horizontal));
     transfers_panel.append(&transfers_scroll);
+
+    let transfers_window = gtk::Window::builder()
+        .title("Transfer Queue")
+        .transient_for(&window)
+        .default_width(500)
+        .default_height(260)
+        .hide_on_close(true)
+        .child(&transfers_panel)
+        .build();
+    transfers_window.set_visible(false);
 
     let status = Label::builder()
         .xalign(0.0)
@@ -2298,7 +2422,6 @@ fn build_ui(app: &Application) {
     content.append(&tabs_box);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
     content.append(&panes);
-    content.append(&transfers_panel);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
     content.append(&status);
 
@@ -2314,6 +2437,7 @@ fn build_ui(app: &Application) {
         remote: remote_pane,
         local_path: RefCell::new(glib::home_dir()),
         status,
+        transfers_window,
         transfers_box,
         transfers_panel,
         transfer_rows: RefCell::new(HashMap::new()),
@@ -2324,6 +2448,7 @@ fn build_ui(app: &Application) {
         port_entry,
         user_entry,
         pass_entry,
+        remember_pw_check,
         key_entry,
         bucket_entry,
         region_entry,
@@ -2432,6 +2557,10 @@ fn build_ui(app: &Application) {
     mirror_check.connect_toggled(glib::clone!(
         #[strong] state,
         move |btn| state.mirror_sync.set(btn.is_active())
+    ));
+    help_btn.connect_clicked(glib::clone!(
+        #[strong] window,
+        move |_| show_help_dialog(&window)
     ));
     cancel_all_btn.connect_clicked(glib::clone!(
         #[strong] state,
@@ -2752,25 +2881,27 @@ fn build_ui(app: &Application) {
                 };
                 let remote = join_posix(&state.session().remote_path.borrow(), &name);
                 if path.is_dir() {
-                    let (id, cancel) = state.add_transfer(&format!("{name}/"), false, 0);
-                    let _ = state.session().xfer_cmd.send(Cmd::UploadDir {
+                    let (id, cancel, pause) = state.add_transfer(&format!("{name}/"), false, 0);
+                    let _ = state.session().xfer_pool.send(Cmd::UploadDir {
                         id,
                         name,
                         local: path,
                         remote,
                         excludes: state.exclude_masks(),
                         cancel,
+                        pause,
                     });
                 } else {
                     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    let (id, cancel) = state.add_transfer(&name, false, size);
-                    let _ = state.session().xfer_cmd.send(Cmd::Upload {
+                    let (id, cancel, pause) = state.add_transfer(&name, false, size);
+                    let _ = state.session().xfer_pool.send(Cmd::Upload {
                         id,
                         name,
                         local: path,
                         remote,
                         resume: false,
                         cancel,
+                        pause,
                     });
                 }
                 any = true;
@@ -3102,28 +3233,49 @@ fn make_pane(
 
     view.set_single_click_activate(false);
 
-    // WinSCP-style pane toolbar strip; build_ui appends the action buttons.
+    // ── Row 1: title + action buttons (built_ui appends buttons to `header`) ─
     let header = GtkBox::builder()
         .orientation(Orientation::Horizontal)
         .spacing(2)
+        .margin_top(2)
+        .margin_start(4)
+        .margin_end(4)
         .build();
     let title_label = Label::builder().label(title).xalign(0.0).build();
     title_label.add_css_class("heading");
-    title_label.set_margin_end(8);
+    title_label.set_margin_end(6);
     header.append(&title_label);
 
-    // Editable path bar (WinSCP's "open directory"): type a path, press Enter.
+    // ── Row 2: WinSCP-style address bar ──────────────────────────────────────
     let path_entry = GtkEntry::builder().hexpand(true).build();
-    path_entry.add_css_class("flat");
+    path_entry.add_css_class("monospace");
+
+    let folder_icon = gtk::Image::builder()
+        .icon_name("folder-symbolic")
+        .icon_size(gtk::IconSize::Normal)
+        .build();
+    folder_icon.add_css_class("dim-label");
+
+    let addr_bar = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(4)
+        .margin_top(2)
+        .margin_bottom(2)
+        .margin_start(4)
+        .margin_end(4)
+        .build();
+    addr_bar.append(&folder_icon);
+    addr_bar.append(&path_entry);
+    addr_bar.add_css_class("card");
 
     let scroller = ScrolledWindow::builder().vexpand(true).child(&view).build();
 
     let pane_box = GtkBox::builder()
         .orientation(Orientation::Vertical)
-        .spacing(2)
+        .spacing(0)
         .build();
     pane_box.append(&header);
-    pane_box.append(&path_entry);
+    pane_box.append(&addr_bar);
     pane_box.append(&scroller);
 
     let pane = Pane {
@@ -3630,6 +3782,255 @@ fn exec_result_dialog(parent: &ApplicationWindow, exit_code: i32, stdout: &str, 
     }
     vbox.append(&close);
     win.set_child(Some(&vbox));
+    win.present();
+}
+
+/// In-app help window.
+fn show_help_dialog(parent: &ApplicationWindow) {
+    let win = gtk::Window::builder()
+        .transient_for(parent)
+        .title("SCP Commander — Help")
+        .default_width(620)
+        .default_height(560)
+        .modal(false)
+        .build();
+
+    let vbox = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(0)
+        .build();
+
+    // ── Interface overview ────────────────────────────────────────────────────
+    let overview_label = Label::builder()
+        .label("Interface overview")
+        .xalign(0.0)
+        .margin_top(12)
+        .margin_bottom(4)
+        .margin_start(16)
+        .margin_end(16)
+        .build();
+    overview_label.add_css_class("heading");
+    vbox.append(&overview_label);
+
+    let diagram_text = "\
+① Toolbar      New Session · Show hidden · Sync · Execute · Find · Terminal · Exclude · Help
+② Session tabs  Each tab = independent connection.  Click + for a new session, × to close.
+③ Pane header   Title · ↑ parent · ↻ refresh · ↑/↓ transfer · ✏ edit · 📁 new folder · 🗑 delete
+④ Address bar   Shows the current path. Click to edit, press Enter to navigate.
+⑤ Column header Name · Size · Type · Changed · (Owner · Rights on remote pane)";
+
+    let diagram = Label::builder()
+        .label(diagram_text)
+        .xalign(0.0)
+        .margin_start(16)
+        .margin_end(16)
+        .margin_bottom(8)
+        .build();
+    diagram.add_css_class("monospace");
+    vbox.append(&diagram);
+
+    // ── Icons reference ───────────────────────────────────────────────────────
+    let icons_label = Label::builder()
+        .label("Icons reference")
+        .xalign(0.0)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(16)
+        .margin_end(16)
+        .build();
+    icons_label.add_css_class("heading");
+    vbox.append(&icons_label);
+
+    let icon_sections: &[(&str, &[(&str, &str, &str)])] = &[
+        ("Main toolbar", &[
+            ("network-server-symbolic",          "New Session",      "Open the Login dialog to connect to a server or switch sites."),
+            ("view-reveal-symbolic",             "Show hidden",      "Toggle files whose names start with a dot (hidden files)."),
+            ("go-up-symbolic",                   "Sync upload",      "Synchronise local → remote (upload changes)."),
+            ("go-down-symbolic",                 "Sync download",    "Synchronise remote → local (download changes)."),
+            ("system-search-symbolic",           "Find files",       "Search the remote directory recursively by name mask (e.g. *.log)."),
+            ("utilities-terminal-symbolic",      "Open terminal",    "Open an SSH session to the current host in your system terminal."),
+            ("utilities-terminal-symbolic",      "Execute command",  "Run a shell command on the remote server (SFTP only)."),
+            ("help-browser-symbolic",            "Help",             "Open this help window."),
+        ]),
+        ("Pane header — both panes", &[
+            ("go-up-symbolic",                   "Parent directory", "Navigate up one level (same as the .. row or Backspace)."),
+            ("view-refresh-symbolic",            "Refresh",          "Reload the current directory listing."),
+            ("folder-new-symbolic",              "New folder",       "Create a new folder in the current directory."),
+            ("edit-delete-symbolic",             "Delete",           "Delete selected file(s) or folder(s). Folders removed recursively."),
+        ]),
+        ("Pane header — local pane only", &[
+            ("go-up-symbolic",                   "Upload (F5)",      "Copy selected local items to the current remote directory."),
+        ]),
+        ("Pane header — remote pane only", &[
+            ("go-down-symbolic",                 "Download (F5)",    "Copy selected remote items to the current local directory."),
+            ("document-edit-symbolic",           "Edit",             "Download the file, open in your editor, auto-upload on every save."),
+        ]),
+        ("File list — row icons", &[
+            ("folder-symbolic",                  "Directory",        "A folder — double-click to navigate into it."),
+            ("text-x-generic-symbolic",          "File",             "A regular file — double-click to transfer it."),
+            ("emblem-symbolic-link",             "Symlink",          "A symbolic link."),
+            ("go-up-symbolic",                   ".. (parent)",      "Top row in every listing — double-click to go up one level."),
+        ]),
+    ];
+
+    let icons_grid = gtk::Grid::builder()
+        .row_spacing(4)
+        .column_spacing(10)
+        .margin_start(16)
+        .margin_end(16)
+        .margin_bottom(8)
+        .build();
+
+    let mut row_idx = 0i32;
+    for (group_title, rows) in icon_sections {
+        let grp_lbl = Label::builder().label(*group_title).xalign(0.0).margin_top(6).build();
+        grp_lbl.add_css_class("dim-label");
+        icons_grid.attach(&grp_lbl, 0, row_idx, 4, 1);
+        row_idx += 1;
+        for (icon_name, name, desc) in *rows {
+            let img = gtk::Image::builder()
+                .icon_name(*icon_name)
+                .icon_size(gtk::IconSize::Normal)
+                .halign(gtk::Align::Center)
+                .build();
+            let name_lbl = Label::builder().label(*name).xalign(0.0).build();
+            name_lbl.add_css_class("caption");
+            let desc_lbl = Label::builder()
+                .label(*desc)
+                .xalign(0.0)
+                .hexpand(true)
+                .wrap(true)
+                .build();
+            desc_lbl.add_css_class("dim-label");
+            icons_grid.attach(&img,      0, row_idx, 1, 1);
+            icons_grid.attach(&name_lbl, 1, row_idx, 1, 1);
+            icons_grid.attach(&desc_lbl, 2, row_idx, 1, 1);
+            row_idx += 1;
+        }
+    }
+    vbox.append(&icons_grid);
+
+    let sep = gtk::Separator::new(Orientation::Horizontal);
+    sep.set_margin_top(4);
+    sep.set_margin_bottom(4);
+    vbox.append(&sep);
+
+    let sections: &[(&str, &[(&str, &str)])] = &[
+        ("Connecting", &[
+            ("1. Open the Login dialog", "It appears on launch or via the Login button in the toolbar."),
+            ("2. Fill in credentials", "Choose protocol (SFTP · FTP · FTPS · S3), host, port, and credentials. SFTP supports password, key file, or ssh-agent auth."),
+            ("3. Remember password", "Tick the checkbox to store the password in the system keyring. Next time you type the same host + user, it fills in automatically."),
+            ("4. Click Login", "If the server's host key is new, review the fingerprint and click Trust & Connect."),
+        ]),
+        ("Saving sites", &[
+            ("Save site…", "Click in the Login dialog to bookmark credentials. Use Folder/Name to group them. Double-click a saved site to connect instantly. Right-click to rename or delete."),
+        ]),
+        ("Browsing", &[
+            ("Left pane", "Your local filesystem."),
+            ("Right pane", "The remote server."),
+            ("Double-click folder", "Navigate into it."),
+            (".. row / Backspace", "Go up one level."),
+            ("Path bar", "Type a path and press Enter to jump directly."),
+            ("Column header", "Click to sort by Name, Size, Type, Changed, or Rights."),
+            ("Eye icon", "Toggle hidden files (names starting with .)."),
+            ("Filter box", "Type to narrow the visible listing by name."),
+        ]),
+        ("Transferring files", &[
+            ("F5 or toolbar button", "Copy selected items to the other pane."),
+            ("F6", "Move selected items (copy then delete source)."),
+            ("Drag and drop", "Drag files between the two panes."),
+            ("Overwrite prompt", "If the destination has a file with the same name you get Overwrite / Skip / Cancel."),
+        ]),
+        ("Keyboard shortcuts", &[
+            ("F5", "Copy (transfer) selected items."),
+            ("F6", "Move selected items."),
+            ("F2", "Rename selected item."),
+            ("Delete", "Delete selected item(s)."),
+            ("Backspace", "Navigate to parent directory."),
+            ("Tab", "Switch focus between left and right pane."),
+            ("Enter", "Open folder / transfer file."),
+        ]),
+        ("Directory sync", &[
+            ("↑ / ↓ sync buttons", "Synchronise a local/remote directory pair. A preview checklist shows what will be copied or deleted. Tick Mirror to also delete destination items with no source counterpart."),
+        ]),
+        ("Find files", &[
+            ("🔍 button", "Search the current remote directory recursively by name mask (e.g. *.log). Double-click a result to navigate to its directory."),
+        ]),
+        ("Remote editing", &[
+            ("Right-click → Edit", "Downloads the file to a temp location and opens it in your editor. Every save auto-uploads."),
+        ]),
+        ("Transfer queue", &[
+            ("Bottom panel", "Shows all active and completed transfers with progress, speed, and ETA. Each transfer has its own × cancel button. Cancel All stops everything at once."),
+        ]),
+    ];
+
+    let scroll = ScrolledWindow::builder().vexpand(true).build();
+    let content = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(0)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(16)
+        .margin_end(16)
+        .build();
+
+    for (section_title, rows) in sections {
+        let section_label = Label::builder()
+            .label(*section_title)
+            .xalign(0.0)
+            .margin_top(12)
+            .margin_bottom(4)
+            .build();
+        section_label.add_css_class("heading");
+        content.append(&section_label);
+
+        let grid = gtk::Grid::builder()
+            .row_spacing(4)
+            .column_spacing(12)
+            .build();
+        for (i, (key, val)) in rows.iter().enumerate() {
+            let key_lbl = Label::builder()
+                .label(*key)
+                .xalign(0.0)
+                .valign(gtk::Align::Start)
+                .build();
+            key_lbl.add_css_class("dim-label");
+            let val_lbl = Label::builder()
+                .label(*val)
+                .xalign(0.0)
+                .hexpand(true)
+                .wrap(true)
+                .build();
+            grid.attach(&key_lbl, 0, i as i32, 1, 1);
+            grid.attach(&val_lbl, 1, i as i32, 1, 1);
+        }
+        content.append(&grid);
+        let sep = gtk::Separator::new(Orientation::Horizontal);
+        sep.set_margin_top(8);
+        content.append(&sep);
+    }
+
+    scroll.set_child(Some(&content));
+    vbox.append(&scroll);
+
+    let close_btn = Button::with_label("Close");
+    close_btn.add_css_class("suggested-action");
+    let btn_row = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .halign(gtk::Align::End)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_end(12)
+        .spacing(8)
+        .build();
+    btn_row.append(&close_btn);
+    vbox.append(&btn_row);
+
+    win.set_child(Some(&vbox));
+
+    let win_clone = win.clone();
+    close_btn.connect_clicked(move |_| win_clone.close());
+
     win.present();
 }
 

@@ -8,16 +8,41 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
+
+/// Thread-safe pause flag shared between the UI pause button and the worker
+/// progress callback. The worker calls `wait_while_paused()` on each tick.
+pub struct PauseFlag(Mutex<bool>, Condvar);
+
+impl PauseFlag {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(false), Condvar::new()))
+    }
+    pub fn pause(&self) {
+        *self.0.lock().unwrap() = true;
+    }
+    pub fn resume(&self) {
+        let mut p = self.0.lock().unwrap();
+        *p = false;
+        self.1.notify_one();
+    }
+    pub fn is_paused(&self) -> bool {
+        *self.0.lock().unwrap()
+    }
+    pub fn wait_while_paused(&self) {
+        let mut p = self.0.lock().unwrap();
+        while *p { p = self.1.wait(p).unwrap(); }
+    }
+}
 
 use scp_core::ops::{self, Filter, SyncDirection, SyncOptions, SyncPlan, XferEvent};
 use scp_core::types::{Credentials, Entry, Error};
 use scp_core::{connect, Transport};
 
 pub enum Cmd {
-    Connect { creds: Credentials, path: String },
+    /// `silent = true` suppresses the Event::Connected reply (used by pool workers).
+    Connect { creds: Credentials, path: String, silent: bool },
     List { path: String },
     Download {
         id: u64,
@@ -27,6 +52,7 @@ pub enum Cmd {
         /// Resume from this byte offset (0 = fresh download).
         resume: u64,
         cancel: Arc<AtomicBool>,
+        pause: Arc<PauseFlag>,
     },
     Upload {
         id: u64,
@@ -36,10 +62,11 @@ pub enum Cmd {
         /// Append after the remote file's current size instead of replacing.
         resume: bool,
         cancel: Arc<AtomicBool>,
+        pause: Arc<PauseFlag>,
     },
-    DownloadDir { id: u64, name: String, remote: String, local: PathBuf, excludes: String, cancel: Arc<AtomicBool> },
-    UploadDir { id: u64, name: String, local: PathBuf, remote: String, excludes: String, cancel: Arc<AtomicBool> },
-    Sync { id: u64, download: bool, local: PathBuf, remote: String, excludes: String, cancel: Arc<AtomicBool> },
+    DownloadDir { id: u64, name: String, remote: String, local: PathBuf, excludes: String, cancel: Arc<AtomicBool>, pause: Arc<PauseFlag> },
+    UploadDir { id: u64, name: String, local: PathBuf, remote: String, excludes: String, cancel: Arc<AtomicBool>, pause: Arc<PauseFlag> },
+    Sync { id: u64, download: bool, local: PathBuf, remote: String, excludes: String, cancel: Arc<AtomicBool>, pause: Arc<PauseFlag> },
     /// Sync dry run; result arrives as Event::SyncPlanReady.
     SyncPlan { download: bool, local: PathBuf, remote: String, excludes: String, delete_extraneous: bool },
     /// Execute a remote command (SFTP only); result arrives as Event::ExecResult.
@@ -104,20 +131,27 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             match cmd {
-                Cmd::Connect { creds, path } => match connect(&creds) {
-                    Ok(mut t) => match t.list_dir(&path) {
-                        Ok(entries) => {
+                Cmd::Connect { creds, path, silent } => match connect(&creds) {
+                    Ok(mut t) => {
+                        if silent {
                             session = Some(t);
-                            send(Event::Connected { path, entries });
+                        } else {
+                            match t.list_dir(&path) {
+                                Ok(entries) => {
+                                    session = Some(t);
+                                    send(Event::Connected { path, entries });
+                                }
+                                Err(e) => send(Event::Error(format!("list failed: {e}"))),
+                            }
                         }
-                        Err(e) => send(Event::Error(format!("list failed: {e}"))),
-                    },
-                    Err(Error::UnknownHostKey { fingerprint }) => {
-                        send(Event::HostKeyUnknown { fingerprint });
                     }
-                    Err(e) => send(Event::Error(format!("connect failed: {e}"))),
+                    Err(Error::UnknownHostKey { fingerprint }) => {
+                        if !silent { send(Event::HostKeyUnknown { fingerprint }); }
+                    }
+                    Err(e) => {
+                        if !silent { send(Event::Error(format!("connect failed: {e}"))); }
+                    }
                 },
-
                 Cmd::List { path } => {
                     with_session(&mut session, &send, |t| match t.list_dir(&path) {
                         Ok(entries) => send(Event::Listed { path: path.clone(), entries }),
@@ -125,8 +159,8 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                     });
                 }
 
-                Cmd::Download { id, name, remote, local, resume, cancel } => {
-                    transfer(&mut session, &send, id, name, cancel, true, |t, progress| {
+                Cmd::Download { id, name, remote, local, resume, cancel, pause } => {
+                    transfer(&mut session, &send, id, name, cancel, pause, true, |t, progress| {
                         if resume > 0 {
                             t.download_resume(&remote, &local, resume, progress)
                         } else {
@@ -135,8 +169,8 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                     });
                 }
 
-                Cmd::Upload { id, name, local, remote, resume, cancel } => {
-                    transfer(&mut session, &send, id, name, cancel, false, |t, progress| {
+                Cmd::Upload { id, name, local, remote, resume, cancel, pause } => {
+                    transfer(&mut session, &send, id, name, cancel, pause, false, |t, progress| {
                         if resume {
                             t.upload_resume(&local, &remote, progress)
                         } else {
@@ -145,25 +179,25 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                     });
                 }
 
-                Cmd::DownloadDir { id, name, remote, local, excludes, cancel } => {
+                Cmd::DownloadDir { id, name, remote, local, excludes, cancel, pause } => {
                     let filter = Filter::parse(&excludes);
-                    multi(&mut session, &send, id, name, cancel, true, |t, cb| {
+                    multi(&mut session, &send, id, name, cancel, pause, true, |t, cb| {
                         ops::download_dir(t, &remote, &local, &filter, cb)
                     });
                 }
 
-                Cmd::UploadDir { id, name, local, remote, excludes, cancel } => {
+                Cmd::UploadDir { id, name, local, remote, excludes, cancel, pause } => {
                     let filter = Filter::parse(&excludes);
-                    multi(&mut session, &send, id, name, cancel, false, |t, cb| {
+                    multi(&mut session, &send, id, name, cancel, pause, false, |t, cb| {
                         ops::upload_dir(t, &local, &remote, &filter, cb)
                     });
                 }
 
-                Cmd::Sync { id, download, local, remote, excludes, cancel } => {
+                Cmd::Sync { id, download, local, remote, excludes, cancel, pause } => {
                     let filter = Filter::parse(&excludes);
                     let dir = if download { SyncDirection::Download } else { SyncDirection::Upload };
                     let name = format!("Sync {}", if download { "⬇" } else { "⬆" });
-                    multi(&mut session, &send, id, name, cancel, download, |t, cb| {
+                    multi(&mut session, &send, id, name, cancel, pause, download, |t, cb| {
                         ops::sync_dir(t, &local, &remote, dir, &filter, cb)
                             .map(|s| s.copied as u64)
                     });
@@ -283,13 +317,14 @@ fn with_session(
     }
 }
 
-/// Single-file transfer with throttled progress + cancellation.
+/// Single-file transfer with throttled progress, pause, and cancellation.
 fn transfer(
     session: &mut Option<Box<dyn Transport>>,
     send: &impl Fn(Event),
     id: u64,
     name: String,
     cancel: Arc<AtomicBool>,
+    pause: Arc<PauseFlag>,
     download: bool,
     op: impl FnOnce(&mut dyn Transport, scp_core::transport::Progress) -> scp_core::Result<u64>,
 ) {
@@ -302,6 +337,7 @@ fn transfer(
         if cancel.load(Ordering::Relaxed) {
             return false;
         }
+        pause.wait_while_paused();
         if throttle.should_send(done, total) {
             send(Event::Progress { id, done, total });
         }
@@ -321,6 +357,7 @@ fn multi(
     id: u64,
     name: String,
     cancel: Arc<AtomicBool>,
+    pause: Arc<PauseFlag>,
     download: bool,
     op: impl FnOnce(&mut dyn Transport, ops::XferCb) -> scp_core::Result<u64>,
 ) {
@@ -333,6 +370,7 @@ fn multi(
         if cancel.load(Ordering::Relaxed) {
             return false;
         }
+        pause.wait_while_paused();
         match ev {
             XferEvent::Start { name, total, .. } => {
                 throttle = Throttle::new();
@@ -371,6 +409,80 @@ impl Throttle {
             true
         } else {
             false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transfer connection pool
+
+/// Spawn `n` dedicated transfer workers that share the same event channel.
+/// Each worker maintains its own independent Transport connection and handles
+/// only transfer-related commands (Connect/Disconnect/Download/Upload/…).
+/// Browse commands (List, Mkdir, Delete, …) are silently ignored.
+pub fn spawn_pool(n: usize, events: async_channel::Sender<Event>) -> Vec<mpsc::Sender<Cmd>> {
+    (0..n)
+        .map(|_| {
+            let (tx, rx) = mpsc::channel::<Cmd>();
+            let ev = events.clone();
+            thread::spawn(move || pool_run(rx, ev));
+            tx
+        })
+        .collect()
+}
+
+fn pool_run(rx: mpsc::Receiver<Cmd>, events: async_channel::Sender<Event>) {
+    let mut session: Option<Box<dyn Transport>> = None;
+    let send = move |ev: Event| {
+        let _ = events.send_blocking(ev);
+    };
+
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(cmd) => match cmd {
+                Cmd::Connect { creds, .. } => {
+                    // Silent connect — no Event::Connected, errors silently retried by next use.
+                    session = connect(&creds).ok();
+                }
+                Cmd::Download { id, name, remote, local, resume, cancel, pause } => {
+                    transfer(&mut session, &send, id, name, cancel, pause, true, |t, p| {
+                        if resume > 0 { t.download_resume(&remote, &local, resume, p) }
+                        else { t.download_progress(&remote, &local, p) }
+                    });
+                }
+                Cmd::Upload { id, name, local, remote, resume, cancel, pause } => {
+                    transfer(&mut session, &send, id, name, cancel, pause, false, |t, p| {
+                        if resume { t.upload_resume(&local, &remote, p) }
+                        else { t.upload_progress(&local, &remote, p) }
+                    });
+                }
+                Cmd::DownloadDir { id, name, remote, local, excludes, cancel, pause } => {
+                    let filter = Filter::parse(&excludes);
+                    multi(&mut session, &send, id, name, cancel, pause, true, |t, cb| {
+                        ops::download_dir(t, &remote, &local, &filter, cb)
+                    });
+                }
+                Cmd::UploadDir { id, name, local, remote, excludes, cancel, pause } => {
+                    let filter = Filter::parse(&excludes);
+                    multi(&mut session, &send, id, name, cancel, pause, false, |t, cb| {
+                        ops::upload_dir(t, &local, &remote, &filter, cb)
+                    });
+                }
+                Cmd::Sync { id, download, local, remote, excludes, cancel, pause } => {
+                    let filter = Filter::parse(&excludes);
+                    let dir = if download { SyncDirection::Download } else { SyncDirection::Upload };
+                    let name = format!("Sync {}", if download { "⬇" } else { "⬆" });
+                    multi(&mut session, &send, id, name, cancel, pause, download, |t, cb| {
+                        ops::sync_dir(t, &local, &remote, dir, &filter, cb)
+                            .map(|s| s.copied as u64)
+                    });
+                }
+                _ => {} // browse/management commands don't belong on the xfer pool
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(ref mut t) = session { let _ = t.keepalive(); }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }

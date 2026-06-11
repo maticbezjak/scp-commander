@@ -235,7 +235,7 @@ pub(crate) fn copy_with_progress<R: Read + ?Sized, W: Write + ?Sized>(
     total: u64,
     progress: Progress,
 ) -> Result<u64> {
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; 512 * 1024];
     let mut done: u64 = 0;
     loop {
         let n = reader.read(&mut buf)?;

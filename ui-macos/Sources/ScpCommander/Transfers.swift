@@ -28,8 +28,10 @@ final class Transfer: ObservableObject, Identifiable {
     let name: String
     let direction: TransferDirection
     let cancelFlag = CancelFlag()
+    let pauseFlag = PauseFlag()
 
     @Published var transferred: UInt64 = 0
+    @Published var isPaused: Bool = false
     @Published var total: UInt64 = 0
     @Published var state: TransferState = .active
     /// For multi-file operations: the file currently being copied.

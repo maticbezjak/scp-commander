@@ -11,10 +11,9 @@ final class SessionHandle: Identifiable {
     /// Browse connection: listings and file management.
     let client = CoreClient()
     let queue = DispatchQueue(label: "net.manto.ScpCommander.session")
-    /// Dedicated transfer connection so a long download never blocks
-    /// browsing (WinSCP's background-transfer model).
-    let transferClient = CoreClient()
-    let transferQueue = DispatchQueue(label: "net.manto.ScpCommander.transfer")
+    /// Pool of N parallel transfer connections so concurrent transfers never
+    /// block browsing (WinSCP's background-transfer model).
+    let transferPool = TransferClientPool()
     var remotePath = "/"
     var remoteEntries: [FileEntry] = []
     var connected = false
@@ -31,6 +30,7 @@ final class AppState: ObservableObject {
     @Published var port = "22"
     @Published var user = ""
     @Published var password = ""
+    @Published var rememberPassword = false
     @Published var authMode: AuthMode = .password
     @Published var keyPath = ""
     // S3 only
@@ -68,6 +68,7 @@ final class AppState: ObservableObject {
 
     /// WinSCP-style Login dialog; shown at startup and via "New Session".
     @Published var showLogin = true
+    @Published var showHelp = false
 
     /// Exclusion masks for folder transfers and sync ("*.tmp; .git/").
     @Published var excludeMasks =
@@ -503,6 +504,17 @@ final class AppState: ObservableObject {
         return (attrs?[.posixPermissions] as? NSNumber).map { UInt32(truncating: $0) & 0o777 }
     }
 
+    /// Try to fill `password` + set `rememberPassword` from Keychain when the
+    /// user edits the host/user/port/proto fields.
+    func tryFillSavedPassword() {
+        guard authMode == .password || proto != .sftp else { return }
+        let account = Keychain.account(proto: proto, user: user, host: host, port: port)
+        if let stored = Keychain.load(account: account) {
+            password = stored
+            rememberPassword = true
+        }
+    }
+
     // MARK: - Remote: connect & browse
 
     /// Connect the active tab with the current form values. After an "unknown
@@ -540,16 +552,17 @@ final class AppState: ObservableObject {
             if session === self.active { self.activeConnected = true }
             self.status = "Connected — \(path) (\(entries.count) items)"
             self.showLogin = false
-            // Bring up the dedicated transfer connection; later transfers
-            // queue behind this on the serial transferQueue, so ordering
-            // guarantees it's connected first.
-            session.transferQueue.async { [client = session.transferClient] in
-                try? client.connect(
-                    proto: p, host: h, port: portNum, user: u, password: pw,
-                    bucket: bkt, region: rgn,
-                    hostKeyMode: .strict, trustedFingerprint: "",
-                    authMode: p == .sftp ? auth : .password, keyPath: key)
+            if self.rememberPassword && !pw.isEmpty && (auth == .password || p != .sftp) {
+                let account = Keychain.account(proto: p, user: u, host: h, port: String(portNum))
+                Keychain.save(account: account, password: pw)
             }
+            // Connect all pool workers in parallel; later transfers queue
+            // behind this on each worker's serial queue.
+            session.transferPool.connectAll(
+                proto: p, host: h, port: portNum, user: u, password: pw,
+                bucket: bkt, region: rgn,
+                authMode: p == .sftp ? auth : .password, keyPath: key,
+                trustedFingerprint: trusted ?? "")
         } onFailure: { [weak self] error in
             guard let self else { return }
             if let core = error as? CoreError, core.isUnknownHostKey,
@@ -721,12 +734,15 @@ final class AppState: ObservableObject {
         transfer.total = size
         transfer.transferred = resumeOffset
         transfers.add(transfer)
+        TransferWindowController.shared.show(queue: transfers)
         let flag = transfer.cancelFlag
+        let pause = transfer.pauseFlag
         let offset = resumeOffset
 
-        session.transferQueue.async { [weak self, client = session.transferClient] in
+        session.transferPool.submit { [weak self] client in
             let progress: (UInt64, UInt64) -> Bool = { done, total in
                 DispatchQueue.main.async { transfer.note(done, total: total) }
+                pause.waitWhilePaused()
                 return !flag.isCancelled
             }
             let result = Result {
@@ -876,6 +892,7 @@ final class AppState: ObservableObject {
         let title = download ? "Sync ⬇ \(remote)" : "Sync ⬆ \(remote)"
         let transfer = Transfer(name: title, direction: download ? .download : .upload)
         transfers.add(transfer)
+        TransferWindowController.shared.show(queue: transfers)
         let flag = transfer.cancelFlag
 
         session.queue.async { [weak self, client = session.client] in
@@ -913,10 +930,11 @@ final class AppState: ObservableObject {
     ) {
         let transfer = Transfer(name: "\(name)/", direction: direction)
         transfers.add(transfer)
+        TransferWindowController.shared.show(queue: transfers)
         let flag = transfer.cancelFlag
 
         let excludes = excludeMasks
-        session.transferQueue.async { [weak self, client = session.transferClient] in
+        session.transferPool.submit { [weak self] client in
             let handler = Self.folderEventHandler(transfer: transfer, flag: flag)
             let result = Result {
                 direction == .download
@@ -948,6 +966,7 @@ final class AppState: ObservableObject {
     private nonisolated static func folderEventHandler(transfer: Transfer, flag: CancelFlag)
         -> (Int32, String?, UInt64, UInt64) -> Bool
     {
+        let pause = transfer.pauseFlag
         return { kind, file, done, total in
             DispatchQueue.main.async {
                 switch kind {
@@ -963,6 +982,7 @@ final class AppState: ObservableObject {
                     break
                 }
             }
+            pause.waitWhilePaused()
             return !flag.isCancelled
         }
     }
@@ -1308,11 +1328,15 @@ final class AppState: ObservableObject {
     // MARK: - Drag-and-drop entry points
 
     func uploadByName(_ name: String) {
-        if let e = localEntries.first(where: { $0.name == name }) { upload(e) }
+        if let e = localEntries.first(where: { $0.name == name }) {
+            requestTransfers([e], from: .local)
+        }
     }
 
     func downloadByName(_ name: String) {
-        if let e = remoteEntries.first(where: { $0.name == name }) { download(e) }
+        if let e = remoteEntries.first(where: { $0.name == name }) {
+            requestTransfers([e], from: .remote)
+        }
     }
 
     // MARK: - Plumbing
