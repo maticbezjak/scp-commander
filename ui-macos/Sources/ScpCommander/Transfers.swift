@@ -86,4 +86,10 @@ final class TransferQueue: ObservableObject {
     func clearFinished() {
         items.removeAll { $0.state != .active }
     }
+
+    func cancelAll() {
+        for item in items where item.state == .active {
+            item.cancelFlag.cancel()
+        }
+    }
 }

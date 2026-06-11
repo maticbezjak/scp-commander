@@ -8,6 +8,9 @@ struct ScpCommanderApp: App {
         WindowGroup("SCP Commander") {
             ContentView()
                 .environmentObject(state)
+                .onOpenURL { url in
+                    Task { @MainActor in state.openURL(url) }
+                }
         }
         .windowStyle(.titleBar)
     }

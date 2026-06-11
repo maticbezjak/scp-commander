@@ -49,7 +49,10 @@ int scp_last_error_code(void);
 /* Fingerprint from the last host-key error, or NULL. Borrowed - do not free. */
 const char *scp_last_fingerprint(void);
 
-/* Returns a JSON array string (free with scp_string_free), or NULL on error. */
+/* Returns a JSON array string (free with scp_string_free), or NULL on error.
+ * Each entry: {"name":...,"is_dir":bool,"size":N,"mtime":N|null,
+ *              "perms":"rwxr-xr-x"|null,"is_symlink":bool,
+ *              "uid":N|null,"gid":N|null} */
 char *scp_list_dir(ScpSession *session, const char *path);
 
 /* Returns bytes transferred, or -1 on error. */
@@ -82,15 +85,18 @@ int64_t scp_upload_dir(ScpSession *session, const char *local, const char *remot
                        const char *excludes, ScpXferCb cb, void *user_data);
 
 /* One-way directory sync. direction: 0 = local->remote, 1 = remote->local.
- * Copies files that are missing, differ in size, or are newer on the source.
- * Returns the number of files copied, or -1 on error. */
+ * delete_extraneous: non-zero enables mirror mode (removes destination items
+ * that have no source counterpart). Returns files copied, or -1 on error. */
 int64_t scp_sync_dir(ScpSession *session, const char *local, const char *remote,
-                     int direction, const char *excludes, ScpXferCb cb, void *user_data);
+                     int direction, const char *excludes, int delete_extraneous,
+                     ScpXferCb cb, void *user_data);
 
-/* Sync dry run: returns JSON {"dirs":[...],"items":[{"rel","size","reason"}]}
- * (free with scp_string_free) or NULL on error. Copies nothing. */
+/* Sync dry run: returns JSON
+ * {"dirs":[...],"items":[{"rel","size","reason"}],"deletes":[...]}
+ * (free with scp_string_free) or NULL on error. Copies nothing.
+ * delete_extraneous: non-zero populates the "deletes" array. */
 char *scp_sync_plan(ScpSession *session, const char *local, const char *remote,
-                    int direction, const char *excludes);
+                    int direction, const char *excludes, int delete_extraneous);
 
 /* Recursive remote search by mask ("*.log"). Returns JSON
  * [{"path","is_dir","size"}] (free with scp_string_free), or NULL. */
@@ -118,6 +124,14 @@ int64_t scp_download_resume_cb(ScpSession *session, const char *remote,
 /* Liveness probe / NAT keepalive. 0 = alive, -1 = session appears dead
  * (the next operation will transparently reconnect and retry once). */
 int scp_keepalive(ScpSession *session);
+
+/* Execute a remote command (SFTP/SSH sessions only). Returns a JSON string
+ * {"exit_code":N,"stdout":"...","stderr":"..."} (free with scp_string_free),
+ * or NULL on error. */
+char *scp_exec_command(ScpSession *session, const char *cmd);
+
+/* Server-side file copy. Returns bytes copied, or -1 on error. */
+int64_t scp_copy_file(ScpSession *session, const char *src, const char *dst);
 
 /* Closes the session and frees the handle. Safe to pass NULL. */
 void scp_disconnect_free(ScpSession *session);

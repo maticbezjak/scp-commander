@@ -449,6 +449,8 @@ pub extern "C" fn scp_upload_dir(
 }
 
 /// One-way directory sync. `direction`: 0 = local→remote, 1 = remote→local.
+/// `delete_extraneous`: non-zero enables mirror mode (removes destination
+/// items that have no source counterpart).
 /// Returns the number of files copied, or -1 on error.
 #[no_mangle]
 pub extern "C" fn scp_sync_dir(
@@ -457,6 +459,7 @@ pub extern "C" fn scp_sync_dir(
     remote: *const c_char,
     direction: c_int,
     excludes: *const c_char,
+    delete_extraneous: c_int,
     cb: Option<XferCb>,
     user_data: *mut c_void,
 ) -> i64 {
@@ -478,15 +481,17 @@ pub extern "C" fn scp_sync_dir(
         }
     };
     let filter = parse_filter(excludes);
+    let opts = crate::ops::SyncOptions { delete: delete_extraneous != 0 };
     let user = UserData(user_data);
     let mut adapter = xfer_adapter(cb, &user);
-    match crate::ops::sync_dir(
+    match crate::ops::sync_dir_opts(
         session.inner.as_mut(),
         Path::new(local),
         remote,
         dir,
         &filter,
         &mut adapter,
+        &opts,
     ) {
         Ok(stats) => stats.copied as i64,
         Err(e) => {
@@ -497,8 +502,9 @@ pub extern "C" fn scp_sync_dir(
 }
 
 /// Sync dry run. Returns a JSON object the caller frees with scp_string_free:
-/// {"dirs":["sub"],"items":[{"rel":"sub/a.txt","size":12,"reason":"missing"}]}
+/// {"dirs":[...],"items":[{"rel":...,"size":N,"reason":...}],"deletes":[...]}
 /// or null on error. `direction`: 0 = local→remote, 1 = remote→local.
+/// `delete_extraneous`: non-zero includes items to remove in mirror mode.
 #[no_mangle]
 pub extern "C" fn scp_sync_plan(
     session: *mut ScpSession,
@@ -506,6 +512,7 @@ pub extern "C" fn scp_sync_plan(
     remote: *const c_char,
     direction: c_int,
     excludes: *const c_char,
+    delete_extraneous: c_int,
 ) -> *mut c_char {
     clear_error();
     let (Some(session), Some(local), Some(remote)) = (
@@ -525,7 +532,15 @@ pub extern "C" fn scp_sync_plan(
         }
     };
     let filter = parse_filter(excludes);
-    match crate::ops::plan_sync(session.inner.as_mut(), Path::new(local), remote, dir, &filter) {
+    let opts = crate::ops::SyncOptions { delete: delete_extraneous != 0 };
+    match crate::ops::plan_sync_opts(
+        session.inner.as_mut(),
+        Path::new(local),
+        remote,
+        dir,
+        &filter,
+        &opts,
+    ) {
         Ok(plan) => match CString::new(plan_to_json(&plan)) {
             Ok(s) => s.into_raw(),
             Err(_) => {
@@ -619,6 +634,13 @@ fn plan_to_json(plan: &crate::ops::SyncPlan) -> String {
         out.push_str(",\"reason\":");
         json_str(&mut out, item.reason.label());
         out.push('}');
+    }
+    out.push_str("],\"deletes\":[");
+    for (i, d) in plan.deletes.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json_str(&mut out, d);
     }
     out.push_str("]}");
     out
@@ -787,6 +809,70 @@ fn simple_op(
     }
 }
 
+/// Execute a remote command on the server (SFTP/SSH sessions only). Returns a
+/// JSON string `{"exit_code":N,"stdout":"...","stderr":"..."}` (free with
+/// scp_string_free), or null on error.
+#[no_mangle]
+pub extern "C" fn scp_exec_command(
+    session: *mut ScpSession,
+    cmd: *const c_char,
+) -> *mut c_char {
+    clear_error();
+    let (Some(session), Some(cmd)) =
+        (unsafe { session.as_mut() }, unsafe { cstr(cmd) })
+    else {
+        set_error("invalid arguments to scp_exec_command");
+        return ptr::null_mut();
+    };
+    match session.inner.exec_command(cmd) {
+        Ok(r) => {
+            let mut out = String::from("{\"exit_code\":");
+            out.push_str(&r.exit_code.to_string());
+            out.push_str(",\"stdout\":");
+            json_str(&mut out, &r.stdout);
+            out.push_str(",\"stderr\":");
+            json_str(&mut out, &r.stderr);
+            out.push('}');
+            match CString::new(out) {
+                Ok(s) => s.into_raw(),
+                Err(_) => {
+                    set_error("exec output contained NUL byte");
+                    ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            set_error_typed(&e);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Server-side file copy (same session). Returns bytes copied, or -1 on error.
+#[no_mangle]
+pub extern "C" fn scp_copy_file(
+    session: *mut ScpSession,
+    src: *const c_char,
+    dst: *const c_char,
+) -> i64 {
+    clear_error();
+    let (Some(session), Some(src), Some(dst)) = (
+        unsafe { session.as_mut() },
+        unsafe { cstr(src) },
+        unsafe { cstr(dst) },
+    ) else {
+        set_error("invalid arguments to scp_copy_file");
+        return -1;
+    };
+    match session.inner.copy_file(src, dst) {
+        Ok(n) => n as i64,
+        Err(e) => {
+            set_error_typed(&e);
+            -1
+        }
+    }
+}
+
 /// Wrapper so the opaque `user_data` pointer can be moved into the progress
 /// closure without tripping the borrow checker on the raw pointer.
 struct UserData(*mut c_void);
@@ -845,6 +931,16 @@ fn entries_to_json(entries: &[crate::types::Entry]) -> String {
         }
         s.push_str(",\"is_symlink\":");
         s.push_str(if e.is_symlink { "true" } else { "false" });
+        s.push_str(",\"uid\":");
+        match e.uid {
+            Some(u) => s.push_str(&u.to_string()),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"gid\":");
+        match e.gid {
+            Some(g) => s.push_str(&g.to_string()),
+            None => s.push_str("null"),
+        }
         s.push('}');
     }
     s.push(']');

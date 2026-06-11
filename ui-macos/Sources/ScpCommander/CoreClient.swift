@@ -29,6 +29,9 @@ struct FileEntry: Identifiable, Hashable {
     var mtime: Date? = nil
     var perms: String?
     var isSymlink: Bool = false
+    /// Owner/group numeric IDs (SFTP only; nil for FTP/S3).
+    var uid: UInt32? = nil
+    var gid: UInt32? = nil
 
     /// WinSCP-style "Type" column, from the system's type database.
     var typeDescription: String {
@@ -218,6 +221,7 @@ final class CoreClient: @unchecked Sendable {
     @discardableResult
     func syncDir(
         local: String, remote: String, download: Bool, excludes: String = "",
+        deleteExtraneous: Bool = false,
         onEvent: @escaping (Int32, String?, UInt64, UInt64) -> Bool
     ) throws -> Int64 {
         guard let session else { throw CoreError(message: "not connected") }
@@ -225,15 +229,17 @@ final class CoreClient: @unchecked Sendable {
         let ud = Unmanaged.passRetained(box).toOpaque()
         defer { Unmanaged<XferBox>.fromOpaque(ud).release() }
         let n = scp_sync_dir(
-            session, local, remote, download ? 1 : 0, excludes, Self.xferTrampoline, ud)
+            session, local, remote, download ? 1 : 0, excludes,
+            deleteExtraneous ? 1 : 0, Self.xferTrampoline, ud)
         if n < 0 { throw Self.lastError() }
         return n
     }
 
-    /// Sync dry run: what would copy, without copying.
+    /// Sync dry run: what would copy (and delete in mirror mode), without copying.
     struct SyncPlan: Codable {
         var dirs: [String]
         var items: [SyncPlanItem]
+        var deletes: [String] = []
     }
 
     struct SyncPlanItem: Codable, Identifiable {
@@ -243,14 +249,47 @@ final class CoreClient: @unchecked Sendable {
         var id: String { rel }
     }
 
-    func syncPlan(local: String, remote: String, download: Bool, excludes: String = "")
-        throws -> SyncPlan
-    {
+    func syncPlan(
+        local: String, remote: String, download: Bool, excludes: String = "",
+        deleteExtraneous: Bool = false
+    ) throws -> SyncPlan {
         guard let session else { throw CoreError(message: "not connected") }
-        guard let raw = scp_sync_plan(session, local, remote, download ? 1 : 0, excludes)
+        guard let raw = scp_sync_plan(
+            session, local, remote, download ? 1 : 0, excludes,
+            deleteExtraneous ? 1 : 0)
         else { throw Self.lastError() }
         defer { scp_string_free(raw) }
         return try JSONDecoder().decode(SyncPlan.self, from: Data(String(cString: raw).utf8))
+    }
+
+    /// Execute a remote command (SFTP/SSH sessions only).
+    struct ExecResult {
+        var exitCode: Int32
+        var stdout: String
+        var stderr: String
+    }
+
+    private struct ExecWire: Decodable {
+        let exit_code: Int32
+        let stdout: String
+        let stderr: String
+    }
+
+    func execCommand(_ cmd: String) throws -> ExecResult {
+        guard let session else { throw CoreError(message: "not connected") }
+        guard let raw = scp_exec_command(session, cmd) else { throw Self.lastError() }
+        defer { scp_string_free(raw) }
+        let wire = try JSONDecoder().decode(ExecWire.self, from: Data(String(cString: raw).utf8))
+        return ExecResult(exitCode: wire.exit_code, stdout: wire.stdout, stderr: wire.stderr)
+    }
+
+    /// Server-side file copy (same session). Returns bytes copied.
+    @discardableResult
+    func copyFile(src: String, dst: String) throws -> Int64 {
+        guard let session else { throw CoreError(message: "not connected") }
+        let n = scp_copy_file(session, src, dst)
+        if n < 0 { throw Self.lastError() }
+        return n
     }
 
     struct FindHit: Codable, Identifiable {
@@ -370,6 +409,8 @@ final class CoreClient: @unchecked Sendable {
         let mtime: Int64?
         let perms: String?
         let is_symlink: Bool?
+        let uid: UInt32?
+        let gid: UInt32?
     }
 
     private static func decode(_ json: String) throws -> [FileEntry] {
@@ -380,7 +421,9 @@ final class CoreClient: @unchecked Sendable {
                 name: $0.name, isDir: $0.is_dir, size: $0.size,
                 mtime: $0.mtime.map { Date(timeIntervalSince1970: TimeInterval($0)) },
                 perms: $0.perms,
-                isSymlink: $0.is_symlink ?? false)
+                isSymlink: $0.is_symlink ?? false,
+                uid: $0.uid,
+                gid: $0.gid)
         }
     }
 }

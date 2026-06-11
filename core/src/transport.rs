@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::ftp::FtpTransport;
 use crate::s3::S3Transport;
 use crate::sftp::SftpTransport;
-use crate::types::{Credentials, Entry, Error, Protocol, Result};
+use crate::types::{Credentials, Entry, Error, ExecResult, Protocol, Result};
 
 /// Progress callback: `(bytes_transferred, total_bytes)`. `total` is 0 when the
 /// size is unknown up front. Return `false` to cancel the transfer (it fails
@@ -86,6 +86,25 @@ pub trait Transport: Send {
     /// Upload without progress reporting.
     fn upload(&mut self, local: &Path, remote: &str) -> Result<u64> {
         self.upload_progress(local, remote, &mut |_, _| true)
+    }
+
+    /// Execute a command on the remote server (SSH/SFTP sessions only).
+    /// Returns exit code, stdout, and stderr. Default refuses.
+    fn exec_command(&mut self, _cmd: &str) -> Result<ExecResult> {
+        Err(Error::NotImplemented(
+            "exec is not supported on this protocol".into(),
+        ))
+    }
+
+    /// Server-side copy of a remote file to another remote path.
+    /// The default falls through to a download+upload round-trip via the
+    /// same session, which works on all protocols but is slow for large files.
+    /// Backends that support efficient server-side copy (S3 copy_object)
+    /// override this.
+    fn copy_file(&mut self, _src: &str, _dst: &str) -> Result<u64> {
+        Err(Error::NotImplemented(
+            "copy is not supported on this protocol".into(),
+        ))
     }
 
     /// Close the session. Default is a no-op; backends override if needed.
@@ -193,6 +212,14 @@ impl Transport for AutoReconnect {
 
     fn keepalive(&mut self) -> Result<()> {
         self.inner.keepalive()
+    }
+
+    fn exec_command(&mut self, cmd: &str) -> Result<ExecResult> {
+        self.run(|t| t.exec_command(cmd))
+    }
+
+    fn copy_file(&mut self, src: &str, dst: &str) -> Result<u64> {
+        self.run(|t| t.copy_file(src, dst))
     }
 
     fn disconnect(&mut self) {

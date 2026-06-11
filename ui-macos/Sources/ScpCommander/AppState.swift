@@ -71,6 +71,27 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(excludeMasks, forKey: "excludeMasks") }
     }
 
+    /// Mirror mode: delete destination items that have no source counterpart.
+    @Published var mirrorSync =
+        UserDefaults.standard.bool(forKey: "mirrorSync")
+    {
+        didSet { UserDefaults.standard.set(mirrorSync, forKey: "mirrorSync") }
+    }
+
+    /// Speed limit in KiB/s (0 = unlimited) — stored but not yet wired into
+    /// core callbacks (placeholder for the preferences window).
+    @Published var speedLimitKbs: Int =
+        UserDefaults.standard.integer(forKey: "speedLimitKbs")
+    {
+        didSet { UserDefaults.standard.set(speedLimitKbs, forKey: "speedLimitKbs") }
+    }
+
+    /// Output of the last Execute Command run.
+    @Published var execResult: CoreClient.ExecResult?
+    @Published var showExecResult = false
+    @Published var showExecDialog = false
+    @Published var execCmd = ""
+
     /// Files awaiting an overwrite decision (destination already exists).
     @Published var overwritePrompt: (pane: PaneKind, entries: [FileEntry])?
 
@@ -767,10 +788,12 @@ final class AppState: ObservableObject {
         let local = localPath
         let remote = session.remotePath
         let excludes = excludeMasks
+        let mirror = mirrorSync
         status = "Computing sync preview…"
         runBusy(on: session, "Computing sync preview…") { [client = session.client] in
             try client.syncPlan(
-                local: local, remote: remote, download: download, excludes: excludes)
+                local: local, remote: remote, download: download, excludes: excludes,
+                deleteExtraneous: mirror)
         } onSuccess: { [weak self] plan in
             guard let self else { return }
             if plan.items.isEmpty && plan.dirs.isEmpty {
@@ -817,7 +840,27 @@ final class AppState: ObservableObject {
                 if download { self?.loadLocal() } else { self?.refreshSession(session) }
             }
         }
-        status = "Synchronizing \(selected.count) file(s)"
+        // Mirror-mode: delete destination items that have no source counterpart.
+        let deletes = preview.plan.deletes
+        if !deletes.isEmpty {
+            if download {
+                for rel in deletes {
+                    let p = (localRoot as NSString).appendingPathComponent(rel)
+                    try? FileManager.default.removeItem(atPath: p)
+                }
+                loadLocal()
+            } else {
+                session.queue.async { [client = session.client] in
+                    for rel in deletes {
+                        let p = remoteRoot + (remoteRoot.hasSuffix("/") ? "" : "/") + rel
+                        try? client.removeFile(p)
+                    }
+                }
+                refreshSession(session)
+            }
+        }
+        let deleteNote = deletes.isEmpty ? "" : " · deleting \(deletes.count) extraneous"
+        status = "Synchronizing \(selected.count) file(s)\(deleteNote)"
     }
 
     @available(*, deprecated, message: "kept for reference; sync is preview-first now")
@@ -1062,6 +1105,79 @@ final class AppState: ObservableObject {
         } onSuccess: { [weak self] hits in
             self?.findResults = (mask, hits)
             self?.status = "Find: \(hits.count) match(es) for \(mask)"
+        }
+    }
+
+    /// Open a new tab and connect from an sftp://, ftp://, ftps://, or s3:// URL.
+    func openURL(_ url: URL) {
+        guard let scheme = url.scheme?.lowercased() else { return }
+        let p: Proto
+        switch scheme {
+        case "sftp": p = .sftp
+        case "ftp": p = .ftp
+        case "ftps": p = .ftps
+        case "s3": p = .s3
+        default: return
+        }
+        newTab()
+        proto = p
+        host = url.host ?? ""
+        user = url.user ?? ""
+        port = url.port.map(String.init) ?? String(Credentials_defaultPort(p))
+        if p == .s3 {
+            let parts = url.pathComponents.filter { $0 != "/" }
+            bucket = parts.first ?? ""
+        } else {
+            let path = url.path.isEmpty ? "/" : url.path
+            active.remotePath = path
+            remotePath = path
+        }
+        let account = Keychain.account(proto: p, user: user, host: host, port: port)
+        if let stored = Keychain.load(account: account) {
+            password = stored
+            showLogin = false
+            connect()
+        } else {
+            status = "Loaded from URL — enter password and Connect"
+        }
+    }
+
+    /// Show the Execute Command dialog (SFTP sessions only).
+    func beginExecCommand() {
+        guard active.connected, proto == .sftp else {
+            status = "Execute Command is only available on connected SFTP sessions"
+            return
+        }
+        execCmd = ""
+        showExecDialog = true
+    }
+
+    /// Run `execCmd` on the active session and surface the result.
+    func runExecCommand() {
+        let session = active
+        guard session.connected, proto == .sftp, !execCmd.isEmpty else { return }
+        let cmd = execCmd
+        showExecDialog = false
+        runBusy(on: session, "Executing: \(cmd)…") { [client = session.client] in
+            try client.execCommand(cmd)
+        } onSuccess: { [weak self] result in
+            self?.execResult = result
+            self?.showExecResult = true
+            self?.status = "Command exited \(result.exitCode)"
+        }
+    }
+
+    /// Server-side duplicate of a remote file (same directory, new name).
+    func copyRemoteFile(_ entry: FileEntry, toName: String) {
+        let session = active
+        guard session.connected, !entry.isDir, !toName.isEmpty else { return }
+        let src = pathJoinPosix(session.remotePath, entry.name)
+        let dst = pathJoinPosix(session.remotePath, toName)
+        runBusy(on: session, "Copying \(entry.name)…") { [client = session.client] in
+            try client.copyFile(src: src, dst: dst)
+        } onSuccess: { [weak self] _ in
+            self?.status = "Copied \(entry.name) → \(toName)"
+            self?.refreshSession(session)
         }
     }
 

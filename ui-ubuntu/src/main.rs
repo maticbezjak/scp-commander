@@ -73,6 +73,7 @@ struct TransferRow {
     container: GtkBox,
     bar: ProgressBar,
     cancel_btn: Button,
+    cancel: Arc<AtomicBool>,
     finished: bool,
     files_done: u32,
     last_done: u64,
@@ -147,6 +148,7 @@ struct App {
     // Commander state
     exclude_entry: GtkEntry,
     show_hidden: Cell<bool>,
+    mirror_sync: Cell<bool>,
     focused_local: Cell<bool>,
     /// Transfer id -> source to delete once the move-transfer succeeds.
     pending_move: RefCell<HashMap<u64, MoveSource>>,
@@ -290,6 +292,8 @@ impl App {
                             mtime,
                             perms: None,
                             is_symlink: e.path().symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false),
+                            uid: None,
+                            gid: None,
                         }
                     })
                     .collect()
@@ -528,6 +532,7 @@ impl App {
             local,
             remote,
             excludes: self.exclude_masks(),
+            delete_extraneous: self.mirror_sync.get(),
         });
     }
 
@@ -539,6 +544,7 @@ impl App {
         remote_root: &str,
         dirs: Vec<String>,
         items: Vec<(String, u64)>,
+        deletes: Vec<String>,
     ) {
         for d in &dirs {
             if download {
@@ -578,6 +584,19 @@ impl App {
                     cancel,
                 });
             }
+        }
+        // Mirror-mode: delete destination items with no source counterpart.
+        for rel in &deletes {
+            if download {
+                let _ = std::fs::remove_file(local_root.join(rel))
+                    .or_else(|_| std::fs::remove_dir_all(local_root.join(rel)));
+            } else {
+                let path = join_posix(remote_root, rel);
+                let _ = self.session().cmd.send(Cmd::Delete { path, is_dir: false });
+            }
+        }
+        if !deletes.is_empty() {
+            self.set_status(&format!("Sync: deleting {} extraneous item(s)", deletes.len()));
         }
     }
 
@@ -643,6 +662,7 @@ impl App {
                 container: row,
                 bar,
                 cancel_btn,
+                cancel: cancel.clone(),
                 finished: false,
                 files_done: 0,
                 last_done: 0,
@@ -666,6 +686,57 @@ impl App {
         if rows.is_empty() {
             self.transfers_panel.set_visible(false);
         }
+    }
+
+    fn cancel_all(&self) {
+        for row in self.transfer_rows.borrow().values() {
+            if !row.finished {
+                row.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Show a prompt to execute a command on the remote (SFTP only).
+    fn menu_exec_command(self: &Rc<Self>) {
+        let session = self.session();
+        if !session.connected.get() {
+            self.set_status("Connect first");
+            return;
+        }
+        let creds = session.creds.borrow().clone();
+        if creds.map(|c| c.protocol) != Some(scp_core::types::Protocol::Sftp) {
+            self.set_status("Execute command is only available on SFTP sessions");
+            return;
+        }
+        let state = self.clone();
+        prompt(&self.window, "Execute remote command", "", move |cmd| {
+            if cmd.is_empty() {
+                return;
+            }
+            state.set_status(&format!("Executing: {cmd}…"));
+            let _ = state.session().cmd.send(Cmd::Exec { cmd });
+        });
+    }
+
+    /// Show a prompt for the duplicate (server-side copy) name.
+    fn menu_copy_file(self: &Rc<Self>) {
+        let Some(entry) = self.menu_entry(false) else { return };
+        if entry.is_dir {
+            self.set_status("Server-side copy works on files only");
+            return;
+        }
+        let state = self.clone();
+        let src = join_posix(&self.session().remote_path.borrow(), &entry.name);
+        let base = self.session().remote_path.borrow().clone();
+        let initial_name = entry.name.clone();
+        let initial_name2 = initial_name.clone();
+        prompt(&self.window, "Duplicate as…", &initial_name, move |new_name| {
+            if new_name.is_empty() || new_name == initial_name2 {
+                return;
+            }
+            let dst = join_posix(&base, &new_name);
+            let _ = state.session().cmd.send(Cmd::CopyFile { src: src.clone(), dst });
+        });
     }
 
     fn finish_row(&self, id: u64, text: &str, full: bool) {
@@ -1751,6 +1822,10 @@ impl App {
                 self.set_status(&format!("Find: {} match(es) for {mask}", hits.len()));
                 find_results_dialog(self, &base, &mask, hits);
             }
+            Event::ExecResult { exit_code, stdout, stderr } => {
+                self.set_status(&format!("Command exited {exit_code}"));
+                exec_result_dialog(&self.window, exit_code, &stdout, &stderr);
+            }
             Event::Error(message) => {
                 self.set_status(&format!("Error: {message}"));
                 // A failed typed navigation must not leave the path bar
@@ -2002,6 +2077,10 @@ fn build_ui(app: &Application) {
     find_btn.set_tooltip_text(Some("Find remote files (mask, e.g. *.log)"));
     let terminal_btn = Button::from_icon_name("utilities-terminal-symbolic");
     terminal_btn.set_tooltip_text(Some("Open SSH session in a terminal"));
+    let exec_btn = Button::from_icon_name("utilities-terminal-symbolic");
+    exec_btn.set_tooltip_text(Some("Execute remote command (SFTP)"));
+    let mirror_check = gtk::CheckButton::with_label("Mirror");
+    mirror_check.set_tooltip_text(Some("Mirror mode: delete destination items with no source counterpart on sync"));
     let hidden_btn = gtk::ToggleButton::new();
     hidden_btn.set_icon_name("view-reveal-symbolic");
     hidden_btn.set_tooltip_text(Some("Show hidden files"));
@@ -2019,6 +2098,9 @@ fn build_ui(app: &Application) {
     main_toolbar.append(&sync_down_btn);
     main_toolbar.append(&find_btn);
     main_toolbar.append(&terminal_btn);
+    main_toolbar.append(&exec_btn);
+    main_toolbar.append(&mirror_check);
+    main_toolbar.append(&gtk::Separator::new(Orientation::Vertical));
     main_toolbar.append(&hidden_btn);
     main_toolbar.append(&exclude_entry);
     main_toolbar.append(&hint);
@@ -2082,7 +2164,10 @@ fn build_ui(app: &Application) {
     transfers_title.add_css_class("heading");
     let clear_btn = Button::with_label("Clear finished");
     clear_btn.add_css_class("flat");
+    let cancel_all_btn = Button::with_label("Cancel all");
+    cancel_all_btn.add_css_class("flat");
     transfers_header.append(&transfers_title);
+    transfers_header.append(&cancel_all_btn);
     transfers_header.append(&clear_btn);
 
     let transfers_scroll = ScrolledWindow::builder()
@@ -2248,6 +2333,7 @@ fn build_ui(app: &Application) {
         pending_fingerprint: RefCell::new(None),
         exclude_entry,
         show_hidden: Cell::new(false),
+        mirror_sync: Cell::new(false),
         focused_local: Cell::new(true),
         pending_move: RefCell::new(HashMap::new()),
         local_menu_target: RefCell::new(None),
@@ -2338,6 +2424,18 @@ fn build_ui(app: &Application) {
     terminal_btn.connect_clicked(glib::clone!(
         #[strong] state,
         move |_| state.open_terminal()
+    ));
+    exec_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| state.menu_exec_command()
+    ));
+    mirror_check.connect_toggled(glib::clone!(
+        #[strong] state,
+        move |btn| state.mirror_sync.set(btn.is_active())
+    ));
+    cancel_all_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| state.cancel_all()
     ));
     clear_btn.connect_clicked(glib::clone!(
         #[strong] state,
@@ -2710,6 +2808,48 @@ fn build_ui(app: &Application) {
     if !state.restore_workspace() {
         login_window.present();
     }
+
+    // Connect to a URL passed on the command line (e.g. sftp://host/path).
+    for arg in std::env::args().skip(1) {
+        if let Some(rest) = arg.strip_prefix("sftp://").map(|r| ("sftp", r))
+            .or_else(|| arg.strip_prefix("ftps://").map(|r| ("ftps", r)))
+            .or_else(|| arg.strip_prefix("ftp://").map(|r| ("ftp", r)))
+            .or_else(|| arg.strip_prefix("s3://").map(|r| ("s3", r)))
+        {
+            let (scheme, authority) = rest;
+            let proto_idx: u32 = match scheme {
+                "sftp" => 0,
+                "ftp" => 1,
+                "ftps" => 2,
+                "s3" => 3,
+                _ => 0,
+            };
+            state.proto_dd.set_selected(proto_idx);
+            // authority is [user[:pass]@]host[:port][/path]
+            let authority = authority.split('/').next().unwrap_or("");
+            let (userinfo, hostport) = if let Some(at) = authority.rfind('@') {
+                (&authority[..at], &authority[at + 1..])
+            } else {
+                ("", authority)
+            };
+            let (host, port) = if let Some(c) = hostport.rfind(':') {
+                (&hostport[..c], &hostport[c + 1..])
+            } else {
+                (hostport, "")
+            };
+            let (user, pass) = if let Some(c) = userinfo.find(':') {
+                (&userinfo[..c], &userinfo[c + 1..])
+            } else {
+                (userinfo, "")
+            };
+            state.host_entry.set_text(host);
+            if !port.is_empty() { state.port_entry.set_text(port); }
+            if !user.is_empty() { state.user_entry.set_text(user); }
+            if !pass.is_empty() { state.pass_entry.set_text(pass); }
+            state.connect_clicked();
+            break;
+        }
+    }
 }
 
 /// WinSCP-style per-pane command toolbar appended to the pane header:
@@ -2929,6 +3069,26 @@ fn make_pane(
     view.append_column(&changed_col);
 
     if show_rights {
+        let owner_col = text_column(
+            "Owner",
+            1.0,
+            &view,
+            hook,
+            Rc::new(|e: &Entry| e.uid.map(|u| u.to_string()).unwrap_or_default()),
+        );
+        owner_col.set_fixed_width(54);
+        view.append_column(&owner_col);
+
+        let group_col = text_column(
+            "Group",
+            1.0,
+            &view,
+            hook,
+            Rc::new(|e: &Entry| e.gid.map(|g| g.to_string()).unwrap_or_default()),
+        );
+        group_col.set_fixed_width(54);
+        view.append_column(&group_col);
+
         let rights_col = text_column(
             "Rights",
             0.0,
@@ -3018,6 +3178,10 @@ fn setup_context_menu(state: &Rc<App>, view: &ColumnView, hook: &MenuHook, local
             false,
             Box::new(move || s.menu_edit()),
         );
+        let s = state.clone();
+        add_item("Duplicate…", false, Box::new(move || s.menu_copy_file()));
+        let s = state.clone();
+        add_item("Execute command…", false, Box::new(move || s.menu_exec_command()));
         let s = state.clone();
         add_item("Copy URL", false, Box::new(move || s.copy_remote_url()));
     }
@@ -3301,9 +3465,14 @@ fn sync_preview_dialog(
     }
     let scroller = ScrolledWindow::builder().vexpand(true).child(&list).build();
 
+    let delete_note = if plan.deletes.is_empty() {
+        String::new()
+    } else {
+        format!(", {} to delete (mirror)", plan.deletes.len())
+    };
     let summary = Label::builder()
         .label(format!(
-            "{} file(s) to copy, {} folder(s) to create",
+            "{} file(s) to copy, {} folder(s) to create{delete_note}",
             plan.items.len(),
             plan.dirs.len()
         ))
@@ -3343,13 +3512,16 @@ fn sync_preview_dialog(
         let state = state.clone();
         let win = win.clone();
         let dirs = plan.dirs.clone();
+        let deletes = plan.deletes.clone();
         apply.connect_clicked(move |_| {
             let selected: Vec<(String, u64)> = checks
                 .iter()
                 .filter(|(c, _, _)| c.is_active())
                 .map(|(_, rel, size)| (rel.clone(), *size))
                 .collect();
-            state.run_sync_items(download, &local_root, &remote_root, dirs.clone(), selected);
+            state.run_sync_items(
+                download, &local_root, &remote_root, dirs.clone(), selected, deletes.clone(),
+            );
             win.close();
         });
     }
@@ -3403,6 +3575,61 @@ fn find_results_dialog(state: &Rc<App>, base: &str, mask: &str, hits: Vec<(Strin
     content.append(&hint);
     content.append(&ScrolledWindow::builder().vexpand(true).child(&list).build());
     win.set_child(Some(&content));
+    win.present();
+}
+
+/// Show the output of a remote exec command.
+fn exec_result_dialog(parent: &ApplicationWindow, exit_code: i32, stdout: &str, stderr: &str) {
+    let win = gtk::Window::builder()
+        .transient_for(parent)
+        .title(format!("Command result — exit {exit_code}"))
+        .default_width(600)
+        .default_height(400)
+        .build();
+
+    let vbox = GtkBox::builder().orientation(Orientation::Vertical).spacing(6).margin_top(8).margin_bottom(8).margin_start(8).margin_end(8).build();
+
+    let add_section = |label_text: &str, body: &str| -> GtkBox {
+        let section = GtkBox::builder().orientation(Orientation::Vertical).spacing(2).build();
+        let lbl = Label::builder().label(label_text).xalign(0.0).build();
+        lbl.add_css_class("heading");
+        let tv = gtk::TextView::builder()
+            .editable(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .vexpand(true)
+            .build();
+        tv.buffer().set_text(body);
+        let sw = ScrolledWindow::builder().vexpand(true).min_content_height(80).child(&tv).build();
+        section.append(&lbl);
+        section.append(&sw);
+        section
+    };
+
+    let exit_label_text = if exit_code == 0 {
+        "Exit code: 0 (success)".to_string()
+    } else {
+        format!("Exit code: {exit_code}")
+    };
+    let exit_lbl = Label::builder().label(&exit_label_text).xalign(0.0).build();
+    if exit_code != 0 { exit_lbl.add_css_class("error"); }
+    vbox.append(&exit_lbl);
+    if !stdout.is_empty() { vbox.append(&add_section("stdout", stdout)); }
+    if !stderr.is_empty() { vbox.append(&add_section("stderr", stderr)); }
+    if stdout.is_empty() && stderr.is_empty() {
+        let empty = Label::builder().label("(no output)").xalign(0.0).build();
+        empty.add_css_class("dim-label");
+        vbox.append(&empty);
+    }
+    let close = Button::with_label("Close");
+    close.add_css_class("suggested-action");
+    close.set_halign(gtk::Align::End);
+    {
+        let win = win.clone();
+        close.connect_clicked(move |_| win.close());
+    }
+    vbox.append(&close);
+    win.set_child(Some(&vbox));
     win.present();
 }
 

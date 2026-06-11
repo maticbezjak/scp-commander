@@ -171,6 +171,8 @@ mod imp {
                             mtime: None,
                             perms: None,
                             is_symlink: false,
+                            uid: None,
+                            gid: None,
                         });
                     }
                 }
@@ -197,6 +199,8 @@ mod imp {
                         mtime,
                         perms: None,
                         is_symlink: false,
+                        uid: None,
+                        gid: None,
                     });
                 }
             }

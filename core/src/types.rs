@@ -100,6 +100,17 @@ pub struct Entry {
     /// Unix-style permission string, e.g. "rwxr-xr-x", when available.
     pub perms: Option<String>,
     pub is_symlink: bool,
+    /// Owner and group numeric IDs, when available (SFTP only).
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+}
+
+/// Result of running a remote command via [`Transport::exec_command`].
+#[derive(Debug, Clone)]
+pub struct ExecResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

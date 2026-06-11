@@ -107,6 +107,8 @@ impl Transport for FtpTransport {
                     mtime,
                     perms: None,
                     is_symlink: f.is_symlink(),
+                    uid: None,
+                    gid: None,
                 });
             }
         }

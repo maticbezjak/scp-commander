@@ -31,6 +31,8 @@ struct ContentView: View {
     @State private var newFolderText = ""
     @State private var deleteTarget: (pane: PaneKind, entries: [FileEntry])?
     @State private var propertiesTarget: (pane: PaneKind, entry: FileEntry)?
+    @State private var copyTarget: FileEntry?
+    @State private var copyNameText = ""
     @State private var keyMonitor: Any?
 
     var body: some View {
@@ -88,7 +90,9 @@ struct ContentView: View {
                     onEdit: { state.editRemote($0) },
                     onCopyURL: { state.copyRemoteURL($0) },
                     onProperties: { propertiesTarget = (.remote, $0) },
-                    onExternalDrop: { state.uploadExternal($0) }
+                    onExternalDrop: { state.uploadExternal($0) },
+                    onCopyFile: { e in copyNameText = e.name; copyTarget = e },
+                    onExec: state.proto == .sftp ? { _ in state.beginExecCommand() } : nil
                 )
             }
             TransfersPanel(queue: state.transfers)
@@ -181,6 +185,26 @@ struct ContentView: View {
             }
             Button("Cancel", role: .cancel) { newFolderPane = nil }
         }
+        .sheet(isPresented: $state.showExecDialog) {
+            ExecCommandSheet().environmentObject(state)
+        }
+        .sheet(isPresented: $state.showExecResult) {
+            ExecResultSheet().environmentObject(state)
+        }
+        .alert(
+            "Duplicate as…",
+            isPresented: Binding(
+                get: { copyTarget != nil },
+                set: { if !$0 { copyTarget = nil } }
+            )
+        ) {
+            TextField("New name", text: $copyNameText)
+            Button("Duplicate") {
+                if let e = copyTarget { state.copyRemoteFile(e, toName: copyNameText) }
+                copyTarget = nil
+            }
+            Button("Cancel", role: .cancel) { copyTarget = nil }
+        }
         .alert(
             deleteTarget.map { t in
                 t.entries.count == 1
@@ -231,6 +255,7 @@ struct ContentView: View {
         // Don't steal keys from dialogs or while a text field is being edited.
         if state.showLogin || state.saveSitePrompt || renameTarget != nil
             || newFolderPane != nil || deleteTarget != nil || propertiesTarget != nil
+            || copyTarget != nil || state.showExecDialog || state.showExecResult
         {
             return false
         }
@@ -344,11 +369,22 @@ private struct TopBar: View {
                 Menu {
                     Button("Local → Remote (upload changes)") { state.sync(download: false) }
                     Button("Remote → Local (download changes)") { state.sync(download: true) }
+                    Divider()
+                    Toggle("Mirror mode (delete extraneous)", isOn: $state.mirrorSync)
                 } label: {
                     Label("Synchronize", systemImage: "arrow.triangle.2.circlepath")
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
+
+                if state.proto == .sftp {
+                    Button {
+                        state.beginExecCommand()
+                    } label: {
+                        Image(systemName: "terminal.fill")
+                    }
+                    .help("Execute remote command (SFTP)")
+                }
 
                 Button {
                     state.showFind = true
@@ -679,6 +715,8 @@ private struct FilePane: View {
     let onCopyURL: ((FileEntry) -> Void)?
     let onProperties: (FileEntry) -> Void
     let onExternalDrop: (([URL]) -> Void)?
+    var onCopyFile: ((FileEntry) -> Void)? = nil
+    var onExec: ((FileEntry) -> Void)? = nil
 
     @State private var sortKey: SortKey = .name
     @State private var ascending = true
@@ -819,6 +857,14 @@ private struct FilePane: View {
             headerCell("Changed", key: .mtime, alignment: .leading)
                 .frame(width: 118, alignment: .leading)
             if showRights {
+                Text("Owner")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 48, alignment: .trailing)
+                Text("Group")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 48, alignment: .trailing)
                 Text("Rights")
                     .font(.caption.bold())
                     .foregroundStyle(.secondary)
@@ -875,6 +921,14 @@ private struct FilePane: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 118, alignment: .leading)
             if showRights {
+                Text(entry.uid.map { String($0) } ?? "")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 48, alignment: .trailing)
+                Text(entry.gid.map { String($0) } ?? "")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 48, alignment: .trailing)
                 Text(entry.perms ?? "")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
@@ -899,9 +953,15 @@ private struct FilePane: View {
                 if let onEdit {
                     Button("Edit (auto-upload on save)") { onEdit(entry) }
                 }
+                if let onCopyFile {
+                    Button("Duplicate…") { onCopyFile(entry) }
+                }
                 if let onCopyURL {
                     Button("Copy URL") { onCopyURL(entry) }
                 }
+            }
+            if let onExec {
+                Button("Execute command…") { onExec(entry) }
             }
             Divider()
             Button("Rename…") { onRename(entry) }
@@ -1041,11 +1101,18 @@ private struct SyncPreviewSheet: View {
             )
             .font(.headline)
             if let preview {
-                Text(
-                    "\(preview.plan.items.count) file(s) to copy, \(preview.plan.dirs.count) folder(s) to create"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                HStack {
+                    Text(
+                        "\(preview.plan.items.count) file(s) to copy, \(preview.plan.dirs.count) folder(s) to create"
+                        + (preview.plan.deletes.isEmpty ? "" : ", \(preview.plan.deletes.count) to delete")
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Spacer()
+                    Toggle("Mirror (delete extraneous)", isOn: $state.mirrorSync)
+                        .toggleStyle(.checkbox)
+                        .font(.caption)
+                }
                 List(preview.plan.items) { item in
                     Toggle(isOn: binding(for: item.rel)) {
                         HStack {
@@ -1138,6 +1205,87 @@ private struct FindSheet: View {
     }
 }
 
+// MARK: - Execute command dialogs
+
+private struct ExecCommandSheet: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Execute command on \(state.host)").font(.headline)
+            TextField("command, e.g. ls -la /tmp", text: $state.execCmd)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { state.runExecCommand() }
+            HStack {
+                Spacer()
+                Button("Cancel") { state.showExecDialog = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Execute") { state.runExecCommand() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(state.execCmd.isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 420)
+    }
+}
+
+private struct ExecResultSheet: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let result = state.execResult {
+                HStack {
+                    Text("Command output").font(.headline)
+                    Spacer()
+                    Text("Exit \(result.exitCode)")
+                        .font(.caption.monospaced())
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(result.exitCode == 0 ? Color.green.opacity(0.15) : Color.red.opacity(0.15))
+                        )
+                        .foregroundStyle(result.exitCode == 0 ? .green : .red)
+                }
+                if !result.stdout.isEmpty {
+                    Text("stdout").font(.caption.bold()).foregroundStyle(.secondary)
+                    ScrollView {
+                        Text(result.stdout)
+                            .font(.caption.monospaced())
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .background(Color.secondary.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .frame(minHeight: 80, maxHeight: 220)
+                }
+                if !result.stderr.isEmpty {
+                    Text("stderr").font(.caption.bold()).foregroundStyle(.red)
+                    ScrollView {
+                        Text(result.stderr)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .background(Color.red.opacity(0.07))
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .frame(minHeight: 40, maxHeight: 120)
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Close") { state.showExecResult = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(14)
+        .frame(width: 560)
+        .frame(minHeight: 160)
+    }
+}
+
 // MARK: - Transfers panel
 
 private struct TransfersPanel: View {
@@ -1151,6 +1299,10 @@ private struct TransfersPanel: View {
                 HStack {
                     Text("Transfers").font(.caption).bold()
                     Spacer()
+                    Button("Cancel all") { queue.cancelAll() }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                        .disabled(queue.items.allSatisfy { $0.state != .active })
                     Button("Clear finished") { queue.clearFinished() }
                         .buttonStyle(.borderless)
                         .font(.caption)

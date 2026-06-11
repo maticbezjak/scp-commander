@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-use scp_core::ops::{self, Filter, SyncDirection, SyncPlan, XferEvent};
+use scp_core::ops::{self, Filter, SyncDirection, SyncOptions, SyncPlan, XferEvent};
 use scp_core::types::{Credentials, Entry, Error};
 use scp_core::{connect, Transport};
 
@@ -41,7 +41,11 @@ pub enum Cmd {
     UploadDir { id: u64, name: String, local: PathBuf, remote: String, excludes: String, cancel: Arc<AtomicBool> },
     Sync { id: u64, download: bool, local: PathBuf, remote: String, excludes: String, cancel: Arc<AtomicBool> },
     /// Sync dry run; result arrives as Event::SyncPlanReady.
-    SyncPlan { download: bool, local: PathBuf, remote: String, excludes: String },
+    SyncPlan { download: bool, local: PathBuf, remote: String, excludes: String, delete_extraneous: bool },
+    /// Execute a remote command (SFTP only); result arrives as Event::ExecResult.
+    Exec { cmd: String },
+    /// Server-side file copy; success arrives as Event::OpOk.
+    CopyFile { src: String, dst: String },
     /// Recursive remote search; result arrives as Event::FindResults.
     Find { base: String, mask: String },
     Mkdir { path: String },
@@ -70,6 +74,8 @@ pub enum Event {
     SyncPlanReady { download: bool, local: PathBuf, remote: String, plan: SyncPlan },
     /// Result of Cmd::Find.
     FindResults { base: String, mask: String, hits: Vec<(String, Entry)> },
+    /// Result of Cmd::Exec.
+    ExecResult { exit_code: i32, stdout: String, stderr: String },
     Error(String),
 }
 
@@ -163,15 +169,16 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                     });
                 }
 
-                Cmd::SyncPlan { download, local, remote, excludes } => {
+                Cmd::SyncPlan { download, local, remote, excludes, delete_extraneous } => {
                     let dir = if download {
                         SyncDirection::Download
                     } else {
                         SyncDirection::Upload
                     };
                     let filter = Filter::parse(&excludes);
+                    let opts = SyncOptions { delete: delete_extraneous };
                     with_session(&mut session, &send, |t| {
-                        match ops::plan_sync(t, &local, &remote, dir, &filter) {
+                        match ops::plan_sync_opts(t, &local, &remote, dir, &filter, &opts) {
                             Ok(plan) => send(Event::SyncPlanReady {
                                 download,
                                 local: local.clone(),
@@ -180,6 +187,26 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                             }),
                             Err(e) => send(Event::Error(format!("sync preview failed: {e}"))),
                         }
+                    });
+                }
+
+                Cmd::Exec { cmd } => {
+                    with_session(&mut session, &send, |t| {
+                        match t.exec_command(&cmd) {
+                            Ok(r) => send(Event::ExecResult {
+                                exit_code: r.exit_code,
+                                stdout: r.stdout,
+                                stderr: r.stderr,
+                            }),
+                            Err(e) => send(Event::Error(format!("exec failed: {e}"))),
+                        }
+                    });
+                }
+
+                Cmd::CopyFile { src, dst } => {
+                    with_session(&mut session, &send, |t| match t.copy_file(&src, &dst) {
+                        Ok(_) => send(Event::OpOk { message: format!("Copied to {dst}") }),
+                        Err(e) => send(Event::Error(e.to_string())),
                     });
                 }
 

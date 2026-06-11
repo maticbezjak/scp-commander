@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::Read;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
@@ -7,7 +8,7 @@ use ssh2::{
 };
 
 use crate::transport::{copy_with_progress, Progress, Transport};
-use crate::types::{Auth, Credentials, Entry, Error, HostKeyPolicy, Result};
+use crate::types::{Auth, Credentials, Entry, Error, ExecResult, HostKeyPolicy, Result};
 
 /// SFTP backend backed by libssh2 (synchronous).
 pub struct SftpTransport {
@@ -98,6 +99,8 @@ impl Transport for SftpTransport {
                 mtime: stat.mtime.map(|m| m as i64),
                 perms: stat.perm.map(perm_string),
                 is_symlink,
+                uid: stat.uid,
+                gid: stat.gid,
             });
         }
         Ok(out)
@@ -249,9 +252,38 @@ impl Transport for SftpTransport {
     }
 
     fn disconnect(&mut self) {
-        let _ = self
+        let _ = self.session.disconnect(None, "bye", None);
+    }
+
+    fn exec_command(&mut self, cmd: &str) -> Result<ExecResult> {
+        let mut channel = self
             .session
-            .disconnect(None, "bye", None);
+            .channel_session()
+            .map_err(|e| Error::Protocol(e.to_string()))?;
+        channel.exec(cmd).map_err(|e| Error::Protocol(e.to_string()))?;
+        let mut stdout = String::new();
+        channel.read_to_string(&mut stdout)?;
+        let mut stderr = String::new();
+        channel.stderr().read_to_string(&mut stderr)?;
+        channel.wait_close().map_err(|e| Error::Protocol(e.to_string()))?;
+        let exit_code = channel.exit_status().unwrap_or(-1);
+        Ok(ExecResult { exit_code, stdout, stderr })
+    }
+
+    fn copy_file(&mut self, src: &str, dst: &str) -> Result<u64> {
+        // Server-side copy via read+write on the same SFTP session.
+        let mut remote_src = self
+            .sftp
+            .open(Path::new(src))
+            .map_err(|e| Error::Protocol(e.to_string()))?;
+        let stat = remote_src.stat().ok();
+        let size = stat.as_ref().and_then(|s| s.size).unwrap_or(0);
+        let mut remote_dst = self
+            .sftp
+            .create(Path::new(dst))
+            .map_err(|e| Error::Protocol(e.to_string()))?;
+        let mut noop = |_, _| true;
+        copy_with_progress(&mut remote_src, &mut remote_dst, size, &mut noop)
     }
 }
 

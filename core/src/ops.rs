@@ -37,6 +37,15 @@ pub enum SyncDirection {
     Download,
 }
 
+/// Extra flags for sync operations.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SyncOptions {
+    /// Mirror mode: delete destination files that have no source counterpart.
+    /// Upload: removes remote files not present locally.
+    /// Download: removes local files not present on the remote.
+    pub delete: bool,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SyncStats {
     pub copied: usize,
@@ -123,10 +132,13 @@ impl PlanReason {
 
 /// A sync dry run: the files that would be copied and the destination
 /// directories that must exist first (both relative to the roots).
+/// In mirror mode, `deletes` holds destination-relative paths to remove.
 #[derive(Debug, Clone, Default)]
 pub struct SyncPlan {
     pub items: Vec<PlanItem>,
     pub dirs: Vec<String>,
+    /// Paths at the destination that would be deleted (mirror mode only).
+    pub deletes: Vec<String>,
 }
 
 /// Compute what [`sync_dir`] would copy, without copying anything.
@@ -137,8 +149,23 @@ pub fn plan_sync(
     direction: SyncDirection,
     filter: &Filter,
 ) -> Result<SyncPlan> {
+    plan_sync_opts(t, local, remote, direction, filter, &SyncOptions::default())
+}
+
+/// Like [`plan_sync`] but with extra options (e.g. mirror delete).
+pub fn plan_sync_opts(
+    t: &mut dyn Transport,
+    local: &Path,
+    remote: &str,
+    direction: SyncDirection,
+    filter: &Filter,
+    opts: &SyncOptions,
+) -> Result<SyncPlan> {
     let mut plan = SyncPlan::default();
     plan_inner(t, local, remote, direction, filter, "", &mut plan)?;
+    if opts.delete {
+        collect_deletes(t, local, remote, direction, filter, "", &mut plan)?;
+    }
     Ok(plan)
 }
 
@@ -388,8 +415,24 @@ pub fn sync_dir(
     filter: &Filter,
     cb: XferCb,
 ) -> Result<SyncStats> {
+    sync_dir_opts(t, local, remote, direction, filter, cb, &SyncOptions::default())
+}
+
+/// Like [`sync_dir`] but with extra options (mirror delete mode).
+pub fn sync_dir_opts(
+    t: &mut dyn Transport,
+    local: &Path,
+    remote: &str,
+    direction: SyncDirection,
+    filter: &Filter,
+    cb: XferCb,
+    opts: &SyncOptions,
+) -> Result<SyncStats> {
     let mut stats = SyncStats::default();
     sync_inner(t, local, remote, direction, filter, cb, &mut stats)?;
+    if opts.delete {
+        delete_extraneous(t, local, remote, direction, filter)?;
+    }
     Ok(stats)
 }
 
@@ -499,6 +542,98 @@ fn one_file(
     Ok(n)
 }
 
+/// Remove destination items that have no counterpart on the source side.
+/// Called only in mirror mode; errors deleting a single file are non-fatal.
+fn delete_extraneous(
+    t: &mut dyn Transport,
+    local: &Path,
+    remote: &str,
+    direction: SyncDirection,
+    filter: &Filter,
+) -> Result<()> {
+    match direction {
+        SyncDirection::Upload => {
+            // Delete remote files not present locally.
+            for entry in t.list_dir(remote).unwrap_or_default() {
+                if filter.excludes(&entry.name, entry.is_dir) {
+                    continue;
+                }
+                let child_remote = join(remote, &entry.name);
+                let child_local = local.join(&entry.name);
+                if entry.is_dir && !entry.is_symlink {
+                    if child_local.is_dir() {
+                        delete_extraneous(t, &child_local, &child_remote, direction, filter)?;
+                    } else {
+                        let _ = remove_dir_all(t, &child_remote);
+                    }
+                } else if !child_local.exists() {
+                    let _ = t.remove_file(&child_remote);
+                }
+            }
+        }
+        SyncDirection::Download => {
+            // Delete local files not present on the remote.
+            let remote_entries = t.list_dir(remote).unwrap_or_default();
+            let Ok(rd) = fs::read_dir(local) else { return Ok(()); };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if filter.excludes(&name, is_dir) {
+                    continue;
+                }
+                if !remote_entries.iter().any(|e| e.name == name) {
+                    let path = entry.path();
+                    if is_dir {
+                        let _ = fs::remove_dir_all(&path);
+                    } else {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collect delete candidates for the plan dry-run (mirror mode).
+fn collect_deletes(
+    t: &mut dyn Transport,
+    local: &Path,
+    remote: &str,
+    direction: SyncDirection,
+    filter: &Filter,
+    rel: &str,
+    plan: &mut SyncPlan,
+) -> Result<()> {
+    let rel_join = |name: &str| {
+        if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") }
+    };
+    match direction {
+        SyncDirection::Upload => {
+            for entry in t.list_dir(remote).unwrap_or_default() {
+                if filter.excludes(&entry.name, entry.is_dir) { continue; }
+                let child_local = local.join(&entry.name);
+                if !child_local.exists() {
+                    plan.deletes.push(rel_join(&entry.name));
+                }
+            }
+        }
+        SyncDirection::Download => {
+            let remote_entries = t.list_dir(remote).unwrap_or_default();
+            let Ok(rd) = fs::read_dir(local) else { return Ok(()); };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if filter.excludes(&name, is_dir) { continue; }
+                if !remote_entries.iter().any(|e| e.name == name) {
+                    plan.deletes.push(rel_join(&name));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn mtime_unix(meta: &fs::Metadata) -> Option<i64> {
     meta.modified()
         .ok()
@@ -554,6 +689,8 @@ mod tests {
                             mtime: None,
                             perms: None,
                             is_symlink: self.symlinks.contains(d),
+                            uid: None,
+                            gid: None,
                         });
                     }
                 }
@@ -568,6 +705,8 @@ mod tests {
                             mtime: None,
                             perms: None,
                             is_symlink: false,
+                            uid: None,
+                            gid: None,
                         });
                     }
                 }
