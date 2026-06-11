@@ -10,7 +10,7 @@
 ///   docker compose -f tests/integration/docker-compose.yml up -d sftp
 ///
 /// Run:
-///   cargo test -p scp-core --test parallel_connections -- --nocapture
+///   cargo test -p scp-core --test parallel_connections -- --ignored --nocapture
 use std::path::Path;
 use std::thread;
 use std::time::Instant;
@@ -48,6 +48,7 @@ fn make_temp_file(n: usize, seed: u8) -> tempfile::TempPath {
 }
 
 #[test]
+#[ignore = "needs the docker test rig: docker compose -f tests/integration/docker-compose.yml up -d sftp"]
 fn three_parallel_uploads_correct_and_fast() {
     let tmp_dir = tempfile::tempdir().expect("tmpdir");
 

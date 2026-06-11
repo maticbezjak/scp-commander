@@ -104,7 +104,12 @@ struct ContentView: View {
                     onEdit: nil,
                     onCopyURL: nil,
                     onProperties: { propertiesTarget = (.local, $0) },
-                    onExternalDrop: nil
+                    onExternalDrop: nil,
+                    onBack: { state.goBack(.local) },
+                    onForward: { state.goForward(.local) },
+                    onHome: { state.goHome(.local) },
+                    canBack: state.canGoBack(.local),
+                    canForward: state.canGoForward(.local)
                 )
                 FilePane(
                     kind: "remote",
@@ -131,7 +136,12 @@ struct ContentView: View {
                     onProperties: { propertiesTarget = (.remote, $0) },
                     onExternalDrop: { state.uploadExternal($0) },
                     onCopyFile: { e in copyNameText = e.name; copyTarget = e },
-                    onExec: state.proto == .sftp ? { _ in state.beginExecCommand() } : nil
+                    onExec: state.proto == .sftp ? { _ in state.beginExecCommand() } : nil,
+                    onBack: { state.goBack(.remote) },
+                    onForward: { state.goForward(.remote) },
+                    onHome: { state.goHome(.remote) },
+                    canBack: state.canGoBack(.remote),
+                    canForward: state.canGoForward(.remote)
                 )
             }
             Divider()
@@ -145,6 +155,11 @@ struct ContentView: View {
                 ? "\(state.user.isEmpty ? "" : "\(state.user)@")\(state.host) — SCP Commander"
                 : "SCP Commander")
         .onAppear { installKeyMonitor() }
+        .onChange(of: state.pendingMenuAction) { action in
+            guard let action else { return }
+            state.pendingMenuAction = nil
+            handleMenuAction(action)
+        }
         .sheet(isPresented: $state.showLogin) {
             LoginSheet().environmentObject(state)
         }
@@ -287,6 +302,28 @@ struct ContentView: View {
     private func beginNewFolder(_ pane: PaneKind) {
         newFolderText = ""
         newFolderPane = pane
+    }
+
+    /// Dispatch a Files-menu action onto the focused pane's selection.
+    private func handleMenuAction(_ action: AppState.MenuAction) {
+        let pane = state.focusedPane
+        let selected = state.selectedEntries(in: pane)
+        switch action {
+        case .rename:
+            if let entry = selected.first { beginRename(pane, entry) }
+        case .newFolder:
+            beginNewFolder(pane)
+        case .delete:
+            if !selected.isEmpty { deleteTarget = (pane, selected) }
+        case .properties:
+            if let entry = selected.first { propertiesTarget = (pane, entry) }
+        case .duplicate:
+            // Server-side duplicate is remote-only.
+            if pane == .remote, let entry = selected.first, !entry.isDir {
+                copyNameText = entry.name
+                copyTarget = entry
+            }
+        }
     }
 
     // MARK: Keyboard commander (F5 copy, F6 move, F2 rename, Del, Tab, ⌫)
@@ -785,6 +822,12 @@ private struct FilePane: View {
     let onExternalDrop: (([URL]) -> Void)?
     var onCopyFile: ((FileEntry) -> Void)? = nil
     var onExec: ((FileEntry) -> Void)? = nil
+    // Navigation history (WinSCP back/forward/home)
+    var onBack: (() -> Void)? = nil
+    var onForward: (() -> Void)? = nil
+    var onHome: (() -> Void)? = nil
+    var canBack: Bool = false
+    var canForward: Bool = false
 
     @State private var sortKey: SortKey = .name
     @State private var ascending = true
@@ -870,7 +913,16 @@ private struct FilePane: View {
                     .font(.subheadline.bold())
                     .foregroundStyle(isFocused ? Color.accentColor : Color.primary)
                     .padding(.trailing, 2)
+                if let onBack {
+                    toolButton("chevron.left", "Back", disabled: !canBack, action: onBack)
+                }
+                if let onForward {
+                    toolButton("chevron.right", "Forward", disabled: !canForward, action: onForward)
+                }
                 toolButton("arrow.up", "Parent directory", action: onUp)
+                if let onHome {
+                    toolButton("house", "Home directory", action: onHome)
+                }
                 toolButton("arrow.clockwise", "Refresh", action: onRefresh)
                 Divider().frame(height: 14).padding(.horizontal, 2)
                 toolButton(
@@ -889,6 +941,9 @@ private struct FilePane: View {
                 toolButton("folder.badge.plus", "New folder", action: onNewFolder)
                 toolButton("trash", "Delete", disabled: selectedEntries.isEmpty) {
                     onDelete(selectedEntries)
+                }
+                toolButton("info.circle", "Properties (F9)", disabled: selectedEntries.isEmpty) {
+                    if let e = selectedEntries.first { onProperties(e) }
                 }
                 Spacer()
                 TextField("filter", text: $filterText)

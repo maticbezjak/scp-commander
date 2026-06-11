@@ -111,6 +111,8 @@ struct Session {
     connected: Cell<bool>,
     cache: RefCell<Vec<Entry>>,
     title: RefCell<String>,
+    /// Initial directory at connect time — target of the Home button.
+    home_path: RefCell<String>,
 }
 
 /// Late-bound hook the row factories use to open the context menu.
@@ -155,6 +157,12 @@ struct App {
     show_hidden: Cell<bool>,
     mirror_sync: Cell<bool>,
     focused_local: Cell<bool>,
+    // Navigation history per pane: (back stack, forward stack).
+    local_hist: RefCell<(Vec<PathBuf>, Vec<PathBuf>)>,
+    remote_hist: RefCell<(Vec<String>, Vec<String>)>,
+    /// Set while a remote Back/Forward listing is in flight so the resulting
+    /// Listed event isn't re-recorded as a new navigation.
+    remote_hist_suppress: Cell<bool>,
     /// Transfer id -> source to delete once the move-transfer succeeds.
     pending_move: RefCell<HashMap<u64, MoveSource>>,
     // Context menus: the clicked/selected Entry is captured at popup time so
@@ -312,6 +320,7 @@ impl App {
         if index == 0 { self.local_up(); return; }
         let Some(entry) = self.local.entry_at(index) else { return };
         if entry.is_dir {
+            self.record_local_history();
             self.local_path.borrow_mut().push(&entry.name);
             self.load_local();
         } else {
@@ -320,8 +329,63 @@ impl App {
     }
 
     fn local_up(&self) {
+        self.record_local_history();
         self.local_path.borrow_mut().pop();
         self.load_local();
+    }
+
+    // -- Navigation history (back / forward / home) ---------------------------
+
+    fn record_local_history(&self) {
+        let cur = self.local_path.borrow().clone();
+        let mut hist = self.local_hist.borrow_mut();
+        hist.0.push(cur);
+        hist.1.clear();
+    }
+
+    fn go_back_local(&self) {
+        let Some(prev) = self.local_hist.borrow_mut().0.pop() else { return };
+        self.local_hist.borrow_mut().1.push(self.local_path.borrow().clone());
+        *self.local_path.borrow_mut() = prev;
+        self.load_local();
+    }
+
+    fn go_forward_local(&self) {
+        let Some(next) = self.local_hist.borrow_mut().1.pop() else { return };
+        self.local_hist.borrow_mut().0.push(self.local_path.borrow().clone());
+        *self.local_path.borrow_mut() = next;
+        self.load_local();
+    }
+
+    fn go_home_local(&self) {
+        let home = glib::home_dir();
+        if *self.local_path.borrow() != home {
+            self.record_local_history();
+            *self.local_path.borrow_mut() = home;
+        }
+        self.load_local();
+    }
+
+    fn go_back_remote(&self) {
+        if !self.session().connected.get() { return; }
+        let Some(prev) = self.remote_hist.borrow_mut().0.pop() else { return };
+        self.remote_hist.borrow_mut().1.push(self.session().remote_path.borrow().clone());
+        self.remote_hist_suppress.set(true);
+        let _ = self.session().cmd.send(Cmd::List { path: prev });
+    }
+
+    fn go_forward_remote(&self) {
+        if !self.session().connected.get() { return; }
+        let Some(next) = self.remote_hist.borrow_mut().1.pop() else { return };
+        self.remote_hist.borrow_mut().0.push(self.session().remote_path.borrow().clone());
+        self.remote_hist_suppress.set(true);
+        let _ = self.session().cmd.send(Cmd::List { path: next });
+    }
+
+    fn go_home_remote(&self) {
+        if !self.session().connected.get() { return; }
+        let home = self.session().home_path.borrow().clone();
+        let _ = self.session().cmd.send(Cmd::List { path: home });
     }
 
     // -- Remote pane --------------------------------------------------------
@@ -1237,6 +1301,9 @@ impl App {
             PathBuf::from(text)
         };
         if expanded.is_dir() {
+            if *self.local_path.borrow() != expanded {
+                self.record_local_history();
+            }
             *self.local_path.borrow_mut() = expanded;
             self.load_local();
         } else {
@@ -1254,6 +1321,34 @@ impl App {
 
     fn set_focus(self: &Rc<Self>, local: bool) {
         self.focused_local.set(local);
+    }
+
+    // -- Mark menu: selection commands on the focused pane --------------------
+
+    fn focused_pane(&self) -> &Pane {
+        if self.focused_local.get() { &self.local } else { &self.remote }
+    }
+
+    fn mark_select_all(&self) {
+        let pane = self.focused_pane();
+        pane.selection.select_all();
+        pane.selection.unselect_item(0); // skip the ".." parent row
+    }
+
+    fn mark_unselect_all(&self) {
+        self.focused_pane().selection.unselect_all();
+    }
+
+    fn mark_invert(&self) {
+        let pane = self.focused_pane();
+        let n = pane.selection.n_items();
+        for i in 1..n { // skip the ".." parent row
+            if pane.selection.is_selected(i) {
+                pane.selection.unselect_item(i);
+            } else {
+                pane.selection.select_item(i, false);
+            }
+        }
     }
 
     /// Open an interactive SSH session to the current server in a terminal.
@@ -1695,6 +1790,19 @@ impl App {
                     if let Some(creds) = session.creds.borrow().clone() {
                         session.xfer_pool.connect(creds);
                     }
+                    *session.home_path.borrow_mut() = path.clone();
+                }
+                // Record navigation history (skip refreshes, initial connect,
+                // and Back/Forward moves which manage the stacks themselves).
+                {
+                    let old = session.remote_path.borrow().clone();
+                    if self.remote_hist_suppress.get() {
+                        self.remote_hist_suppress.set(false);
+                    } else if !first_connect && old != path && is_active {
+                        let mut hist = self.remote_hist.borrow_mut();
+                        hist.0.push(old);
+                        hist.1.clear();
+                    }
                 }
                 let mut entries = entries;
                 sort_entries(&mut entries);
@@ -1970,6 +2078,7 @@ fn create_session(state: &Rc<App>) -> Rc<Session> {
         connected: Cell::new(false),
         cache: RefCell::new(Vec::new()),
         title: RefCell::new("New Session".to_string()),
+        home_path: RefCell::new("/".to_string()),
     });
     glib::spawn_future_local({
         let state = state.clone();
@@ -2477,7 +2586,66 @@ fn build_ui(app: &Application) {
         .margin_bottom(2)
         .build();
 
+    // Menu bar (WinSCP layout: Left, Mark, Files, Commands, Tabs, Options, Right, Help)
+    let menubar_model = gio::Menu::new();
+    {
+        let pane_menu = |prefix: &str| {
+            let m = gio::Menu::new();
+            m.append(Some("Go Up"), Some(&format!("win.{prefix}-up")));
+            m.append(Some("Back"), Some(&format!("win.{prefix}-back")));
+            m.append(Some("Forward"), Some(&format!("win.{prefix}-forward")));
+            m.append(Some("Home"), Some(&format!("win.{prefix}-home")));
+            m.append(Some("Refresh"), Some(&format!("win.{prefix}-refresh")));
+            m
+        };
+        menubar_model.append_submenu(Some("Left"), &pane_menu("left"));
+
+        let mark = gio::Menu::new();
+        mark.append(Some("Select All"), Some("win.mark-all"));
+        mark.append(Some("Unselect All"), Some("win.mark-none"));
+        mark.append(Some("Invert Selection"), Some("win.mark-invert"));
+        menubar_model.append_submenu(Some("Mark"), &mark);
+
+        let files = gio::Menu::new();
+        files.append(Some("Transfer (F5)"), Some("win.files-transfer"));
+        files.append(Some("Move (F6)"), Some("win.files-move"));
+        files.append(Some("Rename (F2)"), Some("win.files-rename"));
+        files.append(Some("Edit"), Some("win.files-edit"));
+        files.append(Some("Delete (F8)"), Some("win.files-delete"));
+        files.append(Some("New Folder (F7)"), Some("win.files-newfolder"));
+        files.append(Some("Properties (F9)"), Some("win.files-properties"));
+        menubar_model.append_submenu(Some("Files"), &files);
+
+        let commands = gio::Menu::new();
+        commands.append(Some("Synchronize Local → Remote"), Some("win.sync-up"));
+        commands.append(Some("Synchronize Remote → Local"), Some("win.sync-down"));
+        commands.append(Some("Find Files…"), Some("win.cmd-find"));
+        commands.append(Some("Execute Command…"), Some("win.cmd-exec"));
+        commands.append(Some("Open Terminal"), Some("win.cmd-terminal"));
+        commands.append(Some("Show Transfer Queue"), Some("win.cmd-queue"));
+        menubar_model.append_submenu(Some("Commands"), &commands);
+
+        let tabs = gio::Menu::new();
+        tabs.append(Some("New Tab"), Some("win.tab-new"));
+        tabs.append(Some("Close Tab"), Some("win.tab-close"));
+        menubar_model.append_submenu(Some("Tabs"), &tabs);
+
+        let options = gio::Menu::new();
+        options.append(Some("Toggle Hidden Files"), Some("win.opt-hidden"));
+        options.append(Some("Toggle Mirror Mode"), Some("win.opt-mirror"));
+        menubar_model.append_submenu(Some("Options"), &options);
+
+        menubar_model.append_submenu(Some("Right"), &pane_menu("right"));
+
+        let help = gio::Menu::new();
+        help.append(Some("SCP Commander Help"), Some("win.help-show"));
+        menubar_model.append_submenu(Some("Help"), &help);
+    }
+    let menubar = gtk::PopoverMenuBar::from_model(Some(&menubar_model));
+
     let content = GtkBox::builder().orientation(Orientation::Vertical).build();
+    content.append(&menubar);
+    content.append(&gtk::Separator::new(Orientation::Horizontal));
     content.append(&main_toolbar);
     content.append(&gtk::Separator::new(Orientation::Horizontal));
     content.append(&tabs_box);
@@ -2523,6 +2691,9 @@ fn build_ui(app: &Application) {
         show_hidden: Cell::new(false),
         mirror_sync: Cell::new(false),
         focused_local: Cell::new(true),
+        local_hist: RefCell::new((Vec::new(), Vec::new())),
+        remote_hist: RefCell::new((Vec::new(), Vec::new())),
+        remote_hist_suppress: Cell::new(false),
         pending_move: RefCell::new(HashMap::new()),
         local_menu_target: RefCell::new(None),
         remote_menu_target: RefCell::new(None),
@@ -2633,20 +2804,88 @@ fn build_ui(app: &Application) {
         #[strong] state,
         move |_| state.transfers_window.present()
     ));
-    // Sync menu actions for the bottom command bar
+    // Window actions: bottom command bar + menu bar
     {
-        let sync_up = gio::SimpleAction::new("sync-up", None);
-        sync_up.connect_activate(glib::clone!(
-            #[strong] state,
-            move |_, _| state.sync(false)
-        ));
-        window.add_action(&sync_up);
-        let sync_down = gio::SimpleAction::new("sync-down", None);
-        sync_down.connect_activate(glib::clone!(
-            #[strong] state,
-            move |_, _| state.sync(true)
-        ));
-        window.add_action(&sync_down);
+        let act = |name: &str, f: Box<dyn Fn() + 'static>| {
+            let a = gio::SimpleAction::new(name, None);
+            a.connect_activate(move |_, _| f());
+            window.add_action(&a);
+        };
+        macro_rules! action {
+            ($name:expr, $state:ident, $body:expr) => {{
+                let $state = state.clone();
+                act($name, Box::new(move || $body));
+            }};
+        }
+
+        action!("sync-up", st, st.sync(false));
+        action!("sync-down", st, st.sync(true));
+
+        // Left / Right pane navigation
+        action!("left-up", st, st.local_up());
+        action!("left-back", st, st.go_back_local());
+        action!("left-forward", st, st.go_forward_local());
+        action!("left-home", st, st.go_home_local());
+        action!("left-refresh", st, st.load_local());
+        action!("right-up", st, st.remote_up());
+        action!("right-back", st, st.go_back_remote());
+        action!("right-forward", st, st.go_forward_remote());
+        action!("right-home", st, st.go_home_remote());
+        action!("right-refresh", st, st.refresh_remote());
+
+        // Mark
+        action!("mark-all", st, st.mark_select_all());
+        action!("mark-none", st, st.mark_unselect_all());
+        action!("mark-invert", st, st.mark_invert());
+
+        // Files (act on the focused pane's selection)
+        action!("files-transfer", st, st.transfer_selected());
+        action!("files-move", st, st.move_selected());
+        action!("files-rename", st, {
+            let local = st.focused_local.get();
+            if st.select_for_menu(local) { st.menu_rename(local); }
+        });
+        action!("files-edit", st, {
+            if st.select_for_menu(false) { st.menu_edit(); }
+        });
+        action!("files-delete", st, {
+            let local = st.focused_local.get();
+            if st.select_for_menu(local) { st.menu_delete(local); }
+        });
+        action!("files-newfolder", st, st.new_folder(st.focused_local.get()));
+        action!("files-properties", st, {
+            let local = st.focused_local.get();
+            if st.select_for_menu(local) { st.menu_properties(local); }
+        });
+
+        // Commands
+        action!("cmd-exec", st, st.menu_exec_command());
+        action!("cmd-terminal", st, st.open_terminal());
+        action!("cmd-queue", st, st.transfers_window.present());
+        {
+            let find_btn = find_btn.clone();
+            act("cmd-find", Box::new(move || find_btn.emit_clicked()));
+        }
+
+        // Tabs
+        action!("tab-new", st, st.new_tab());
+        action!("tab-close", st, st.close_tab(st.active_tab.get()));
+
+        // Options: flip the existing toggle widgets so their handlers run.
+        {
+            let hidden_btn = hidden_btn.clone();
+            act("opt-hidden", Box::new(move || hidden_btn.set_active(!hidden_btn.is_active())));
+        }
+        {
+            let mirror_check = mirror_check.clone();
+            act("opt-mirror", Box::new(move || mirror_check.set_active(!mirror_check.is_active())));
+        }
+
+        // Help
+        {
+            let window = window.clone();
+            act("help-show", Box::new(move || show_help_dialog(&window)));
+        }
     }
     clear_btn.connect_clicked(glib::clone!(
         #[strong] state,
@@ -3076,10 +3315,28 @@ fn build_pane_toolbar(state: &Rc<App>, header: &GtkBox, local_pane: bool) {
         b
     };
 
+    let back = tool("go-previous-symbolic", "Back");
+    back.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| if local_pane { state.go_back_local() } else { state.go_back_remote() }
+    ));
+
+    let forward = tool("go-next-symbolic", "Forward");
+    forward.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| if local_pane { state.go_forward_local() } else { state.go_forward_remote() }
+    ));
+
     let up = tool("go-up-symbolic", "Parent directory");
     up.connect_clicked(glib::clone!(
         #[strong] state,
         move |_| if local_pane { state.local_up() } else { state.remote_up() }
+    ));
+
+    let home = tool("go-home-symbolic", "Home directory");
+    home.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| if local_pane { state.go_home_local() } else { state.go_home_remote() }
     ));
 
     let refresh = tool("view-refresh-symbolic", "Refresh");
@@ -3127,6 +3384,16 @@ fn build_pane_toolbar(state: &Rc<App>, header: &GtkBox, local_pane: bool) {
         move |_| {
             if state.select_for_menu(local_pane) {
                 state.menu_delete(local_pane);
+            }
+        }
+    ));
+
+    let props = tool("document-properties-symbolic", "Properties");
+    props.connect_clicked(glib::clone!(
+        #[strong] state,
+        move |_| {
+            if state.select_for_menu(local_pane) {
+                state.menu_properties(local_pane);
             }
         }
     ));

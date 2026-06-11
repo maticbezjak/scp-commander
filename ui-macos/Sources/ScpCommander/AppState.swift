@@ -18,6 +18,8 @@ final class SessionHandle: Identifiable {
     var remoteEntries: [FileEntry] = []
     var connected = false
     var title = "New Session"
+    /// Initial directory at connect time — target of the Home button.
+    var homePath = "/"
 }
 
 /// Observable state for the whole window. Blocking core calls run on the
@@ -113,6 +115,21 @@ final class AppState: ObservableObject {
     @Published var reconnectMessage: String? = nil
     @Published var reconnectCountdown = 30
     private var reconnectTimer: Timer?
+
+    // Navigation history (back/forward, per pane). Published so the toolbar
+    // buttons enable/disable as the stacks change.
+    @Published private(set) var localBackStack: [String] = []
+    @Published private(set) var localForwardStack: [String] = []
+    @Published private(set) var remoteBackStack: [String] = []
+    @Published private(set) var remoteForwardStack: [String] = []
+    /// Set while navigating via Back/Forward so the move isn't re-recorded.
+    private var suppressHistory = false
+
+    /// Menu-bar actions that need a ContentView dialog (rename prompt, delete
+    /// confirm, …). The menu sets this; ContentView observes and opens the
+    /// matching dialog for the focused pane's selection.
+    enum MenuAction { case rename, newFolder, delete, properties, duplicate }
+    @Published var pendingMenuAction: MenuAction?
 
     let transfers = TransferQueue()
     let sites = SitesStore()
@@ -444,6 +461,7 @@ final class AppState: ObservableObject {
 
     func openLocal(_ entry: FileEntry) {
         if entry.isDir {
+            recordLocalHistory()
             localPath = pathJoin(localPath, entry.name)
             loadLocal()
         } else {
@@ -452,9 +470,100 @@ final class AppState: ObservableObject {
     }
 
     func localUp() {
+        recordLocalHistory()
         localPath = (localPath as NSString).deletingLastPathComponent
         if localPath.isEmpty { localPath = "/" }
         loadLocal()
+    }
+
+    // MARK: - Navigation history
+
+    private func recordLocalHistory() {
+        guard !suppressHistory else { return }
+        localBackStack.append(localPath)
+        localForwardStack.removeAll()
+    }
+
+    private func recordRemoteHistory() {
+        guard !suppressHistory else { return }
+        remoteBackStack.append(remotePath)
+        remoteForwardStack.removeAll()
+    }
+
+    func canGoBack(_ pane: PaneKind) -> Bool {
+        pane == .local ? !localBackStack.isEmpty : !remoteBackStack.isEmpty
+    }
+
+    func canGoForward(_ pane: PaneKind) -> Bool {
+        pane == .local ? !localForwardStack.isEmpty : !remoteForwardStack.isEmpty
+    }
+
+    func goBack(_ pane: PaneKind) {
+        switch pane {
+        case .local:
+            guard let prev = localBackStack.popLast() else { return }
+            localForwardStack.append(localPath)
+            suppressHistory = true
+            navigateLocal(prev)
+            suppressHistory = false
+        case .remote:
+            guard let prev = remoteBackStack.popLast() else { return }
+            remoteForwardStack.append(remotePath)
+            suppressHistory = true
+            navigateRemote(prev)
+            suppressHistory = false
+        }
+    }
+
+    func goForward(_ pane: PaneKind) {
+        switch pane {
+        case .local:
+            guard let next = localForwardStack.popLast() else { return }
+            localBackStack.append(localPath)
+            suppressHistory = true
+            navigateLocal(next)
+            suppressHistory = false
+        case .remote:
+            guard let next = remoteForwardStack.popLast() else { return }
+            remoteBackStack.append(remotePath)
+            suppressHistory = true
+            navigateRemote(next)
+            suppressHistory = false
+        }
+    }
+
+    func goHome(_ pane: PaneKind) {
+        switch pane {
+        case .local:
+            navigateLocal(FileManager.default.homeDirectoryForCurrentUser.path)
+        case .remote:
+            navigateRemote(active.homePath)
+        }
+    }
+
+    // MARK: - Mark menu (selection commands on the focused pane)
+
+    private var focusedVisibleEntries: [FileEntry] {
+        let entries = focusedPane == .local ? localEntries : remoteEntries
+        return entries.filter { showHidden || !$0.name.hasPrefix(".") }
+    }
+
+    func selectAll() {
+        let ids = Set(focusedVisibleEntries.map(\.id))
+        if focusedPane == .local { localSelection = ids } else { remoteSelection = ids }
+    }
+
+    func unselectAll() {
+        if focusedPane == .local { localSelection = [] } else { remoteSelection = [] }
+    }
+
+    func invertSelection() {
+        let all = Set(focusedVisibleEntries.map(\.id))
+        if focusedPane == .local {
+            localSelection = all.subtracting(localSelection)
+        } else {
+            remoteSelection = all.subtracting(remoteSelection)
+        }
     }
 
     func newLocalFolder(named name: String) {
@@ -548,6 +657,7 @@ final class AppState: ObservableObject {
         } onSuccess: { [weak self] entries in
             guard let self else { return }
             session.connected = true
+            session.homePath = path
             let target = h.isEmpty ? bkt : h
             session.title = u.isEmpty ? target : "\(u)@\(target)"
             if let idx = self.sessions.firstIndex(where: { $0 === session }) {
@@ -628,6 +738,7 @@ final class AppState: ObservableObject {
     func listRemote(_ path: String) {
         let session = active
         guard session.connected else { return }
+        if path != remotePath { recordRemoteHistory() }
         runBusy(on: session, "Listing \(path)…") { [client = session.client] in
             try client.listDir(path)
         } onSuccess: { [weak self] entries in
@@ -1102,6 +1213,7 @@ final class AppState: ObservableObject {
             loadLocal()
             return
         }
+        if expanded != localPath { recordLocalHistory() }
         localPath = expanded
         loadLocal()
     }
