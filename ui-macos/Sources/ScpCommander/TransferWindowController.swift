@@ -211,6 +211,16 @@ private struct FinishedTransferRow: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+            if transfer.state != .done, let retry = transfer.retry {
+                Button {
+                    retry()
+                } label: {
+                    Image(systemName: "arrow.clockwise.circle.fill")
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.borderless)
+                .help("Retry this transfer")
+            }
         }
         .padding(.horizontal, 10).padding(.vertical, 4)
     }

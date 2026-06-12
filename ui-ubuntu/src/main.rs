@@ -18,7 +18,7 @@ mod workspace;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -54,8 +54,17 @@ fn proto_from_index(i: u32) -> Protocol {
 }
 
 fn main() -> glib::ExitCode {
-    let app = Application::builder().application_id(APP_ID).build();
-    app.connect_activate(build_ui);
+    let app = Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_OPEN)
+        .build();
+    app.connect_activate(|app| build_ui(app, None));
+    // `scp-ubuntu sftp://user@host:port/path` (or a registered URL handler)
+    // prefills the Login dialog from the first URI.
+    app.connect_open(|app, files, _| {
+        let uri = files.first().map(|f| f.uri().to_string());
+        build_ui(app, uri.as_deref());
+    });
     app.run()
 }
 
@@ -81,6 +90,9 @@ struct TransferRow {
     detail: Label,
     cancel_btn: Button,
     pause_btn: Button,
+    retry_btn: Button,
+    /// Re-runs the same transfer; set by the dispatch sites after sending.
+    retry: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     cancel: Arc<AtomicBool>,
     pause: Arc<PauseFlag>,
     finished: bool,
@@ -165,6 +177,9 @@ struct App {
     show_hidden: Cell<bool>,
     mirror_sync: Cell<bool>,
     focused_local: Cell<bool>,
+    // Type-ahead: letters typed within 1s jump to the first matching row.
+    type_buf: RefCell<String>,
+    type_at: Cell<Option<std::time::Instant>>,
     // Navigation history per pane: (back stack, forward stack).
     local_hist: RefCell<(Vec<PathBuf>, Vec<PathBuf>)>,
     remote_hist: RefCell<(Vec<String>, Vec<String>)>,
@@ -181,14 +196,29 @@ struct App {
     // Edit-in-editor
     edit_pending: RefCell<HashMap<u64, (String, PathBuf)>>,
     edits: RefCell<Vec<EditWatch>>,
+    /// View (F3): transfer id -> (file name, temp path) awaiting the viewer.
+    view_pending: RefCell<HashMap<u64, (String, PathBuf)>>,
     // Sites
     sites: RefCell<SitesStore>,
     sites_list: ListBox,
+    /// Session log: timestamped copy of every status line (ring buffer).
+    log_buf: RefCell<Vec<String>>,
 }
 
 impl App {
     fn set_status(&self, text: &str) {
         self.status.set_text(text);
+        let stamp = glib::DateTime::now_local()
+            .ok()
+            .and_then(|dt| dt.format("%H:%M:%S").ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut buf = self.log_buf.borrow_mut();
+        buf.push(format!("{stamp}  {text}"));
+        let extra = buf.len().saturating_sub(500);
+        if extra > 0 {
+            buf.drain(..extra);
+        }
     }
 
     /// The active tab's session.
@@ -532,6 +562,16 @@ impl App {
     // -- Transfers ----------------------------------------------------------
 
     fn download(self: &Rc<Self>, entry: &Entry) -> Option<u64> {
+        let id = self.download_inner(entry);
+        if let Some(id) = id {
+            let st = self.clone();
+            let e = entry.clone();
+            self.set_retry(id, Rc::new(move || { st.download(&e); }));
+        }
+        id
+    }
+
+    fn download_inner(self: &Rc<Self>, entry: &Entry) -> Option<u64> {
         if !self.session().connected.get() {
             return None;
         }
@@ -573,6 +613,16 @@ impl App {
     }
 
     fn upload(self: &Rc<Self>, entry: &Entry) -> Option<u64> {
+        let id = self.upload_inner(entry);
+        if let Some(id) = id {
+            let st = self.clone();
+            let e = entry.clone();
+            self.set_retry(id, Rc::new(move || { st.upload(&e); }));
+        }
+        id
+    }
+
+    fn upload_inner(self: &Rc<Self>, entry: &Entry) -> Option<u64> {
         if !self.session().connected.get() {
             self.set_status("Connect first to upload");
             return None;
@@ -780,8 +830,24 @@ impl App {
             }
         ));
 
+        // Retry — hidden until the transfer fails/cancels with a retry hook.
+        let retry: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let retry_btn = Button::from_icon_name("view-refresh-symbolic");
+        retry_btn.add_css_class("flat");
+        retry_btn.set_tooltip_text(Some("Retry this transfer"));
+        retry_btn.set_visible(false);
+        retry_btn.connect_clicked(glib::clone!(
+            #[strong] retry,
+            move |btn| {
+                btn.set_visible(false);
+                let f = retry.borrow().clone();
+                if let Some(f) = f { f(); }
+            }
+        ));
+
         let header = GtkBox::builder().orientation(Orientation::Horizontal).spacing(4).build();
         header.append(&title);
+        header.append(&retry_btn);
         header.append(&pause_btn);
         header.append(&cancel_btn);
 
@@ -844,6 +910,8 @@ impl App {
                 detail,
                 cancel_btn,
                 pause_btn,
+                retry_btn,
+                retry,
                 cancel: cancel.clone(),
                 pause: pause.clone(),
                 finished: false,
@@ -938,7 +1006,18 @@ impl App {
             row.finished = true;
             row.cancel_btn.set_visible(false);
             row.pause_btn.set_visible(false);
+            // Failed/cancelled transfers with a retry hook get a retry button.
+            if !full && row.retry.borrow().is_some() {
+                row.retry_btn.set_visible(true);
+            }
             row.pause.resume(); // unblock worker if it was paused
+        }
+    }
+
+    /// Attach a retry closure to a transfer row (shows the ↻ button on failure).
+    fn set_retry(&self, id: u64, f: Rc<dyn Fn()>) {
+        if let Some(row) = self.transfer_rows.borrow().get(&id) {
+            *row.retry.borrow_mut() = Some(f);
         }
     }
 
@@ -1144,6 +1223,48 @@ impl App {
         });
     }
 
+    /// View (F3): read-only text preview. Local files read directly; remote
+    /// ones download to a throwaway temp copy first.
+    fn menu_view(self: &Rc<Self>, local_pane: bool) {
+        let Some(entry) = self.menu_entry(local_pane) else { return };
+        if entry.is_dir {
+            self.set_status("Only files can be viewed");
+            return;
+        }
+        if local_pane {
+            let path = self.local_path.borrow().join(&entry.name);
+            viewer_dialog(&self.window, &entry.name, &read_preview(&path));
+            return;
+        }
+        if !self.session().connected.get() {
+            return;
+        }
+        let remote = join_posix(&self.session().remote_path.borrow(), &entry.name);
+        let base = glib::user_runtime_dir().join("scp-commander-view");
+        if std::fs::create_dir_all(&base).is_err() {
+            self.set_status("Could not create temp directory");
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
+        }
+        let local = base.join(glib::uuid_string_random().as_str());
+        let (id, cancel, pause) = self.add_transfer(
+            &entry.name, true, entry.size, &remote, &local.display().to_string());
+        self.view_pending.borrow_mut().insert(id, (entry.name.clone(), local.clone()));
+        let _ = self.session().xfer_pool.send(Cmd::Download {
+            id,
+            name: entry.name.clone(),
+            remote,
+            local,
+            resume: 0,
+            cancel,
+            pause,
+        });
+    }
+
     fn menu_properties(self: &Rc<Self>, local_pane: bool) {
         let Some(entry) = self.menu_entry(local_pane) else { return };
         // Current mode: remote from the listing, local from the filesystem.
@@ -1335,24 +1456,110 @@ impl App {
         if conflicts.is_empty() {
             return;
         }
+        // Destination size + mtime for a conflicting entry (for the detail
+        // text and the "only newer" decision).
+        let dest_info = |state: &App, e: &Entry| -> Option<(u64, Option<i64>)> {
+            if local_pane {
+                state
+                    .session()
+                    .cache
+                    .borrow()
+                    .iter()
+                    .find(|r| !r.is_dir && r.name == e.name)
+                    .map(|r| (r.size, r.mtime))
+            } else {
+                std::fs::metadata(state.local_path.borrow().join(&e.name))
+                    .ok()
+                    .map(|m| {
+                        let mtime = m
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64);
+                        (m.len(), mtime)
+                    })
+            }
+        };
+        let fmt_stamp = |m: Option<i64>| {
+            m.and_then(|s| glib::DateTime::from_unix_local(s).ok())
+                .and_then(|dt| dt.format("%d.%m.%Y %H:%M").ok())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "?".into())
+        };
         let message = if conflicts.len() == 1 {
             format!("{} already exists at the destination.", conflicts[0].name)
         } else {
             format!("{} files already exist at the destination.", conflicts.len())
         };
+        // WinSCP-style detail: source vs target size + mtime with newer hint.
+        let detail = if conflicts.len() == 1 {
+            let e = &conflicts[0];
+            match dest_info(self, e) {
+                Some((dsize, dmtime)) => {
+                    let hint = match (e.mtime, dmtime) {
+                        (Some(s), Some(t)) if s > t => " — source is newer",
+                        (Some(s), Some(t)) if s < t => " — source is older",
+                        (Some(_), Some(_)) => " — same time",
+                        _ => "",
+                    };
+                    format!(
+                        "Source: {} · {}\nTarget: {} · {}{hint}",
+                        human_size(e.size),
+                        fmt_stamp(e.mtime),
+                        human_size(dsize),
+                        fmt_stamp(dmtime),
+                    )
+                }
+                None => "Overwrite replaces the existing copies.".into(),
+            }
+        } else {
+            let newer = conflicts
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        (e.mtime, dest_info(self, e).and_then(|(_, m)| m)),
+                        (Some(s), Some(t)) if s > t
+                    )
+                })
+                .count();
+            format!("{newer} of {} source files are newer than their targets.", conflicts.len())
+        };
         let state = self.clone();
         let dialog = gtk::AlertDialog::builder()
             .message(message)
-            .detail("Overwrite replaces the existing copies.")
-            .buttons(["Cancel", "Skip existing", "Overwrite"])
+            .detail(detail)
+            .buttons(["Cancel", "Skip existing", "Only newer", "Overwrite"])
             .cancel_button(0)
             .default_button(1)
             .build();
         dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |result| {
-            if result != Ok(2) {
-                return; // cancel or skip - existing files stay untouched
-            }
+            let only_newer = match result {
+                Ok(3) => false,
+                Ok(2) => true,
+                _ => return, // cancel or skip - existing files stay untouched
+            };
             for e in &conflicts {
+                if only_newer {
+                    let dest_mtime = if local_pane {
+                        state
+                            .session()
+                            .cache
+                            .borrow()
+                            .iter()
+                            .find(|r| !r.is_dir && r.name == e.name)
+                            .and_then(|r| r.mtime)
+                    } else {
+                        std::fs::metadata(state.local_path.borrow().join(&e.name))
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                    };
+                    match (e.mtime, dest_mtime) {
+                        (Some(s), Some(t)) if s > t => {}
+                        _ => continue,
+                    }
+                }
                 if local_pane {
                     state.upload(e);
                 } else {
@@ -1389,6 +1596,31 @@ impl App {
 
     fn set_focus(self: &Rc<Self>, local: bool) {
         self.focused_local.set(local);
+    }
+
+    /// Type-ahead: select the first row whose name starts with the typed
+    /// letters; the buffer resets after a second of silence.
+    fn type_ahead(&self, local: bool, c: char) {
+        let now = std::time::Instant::now();
+        let fresh = self
+            .type_at
+            .get()
+            .map(|t| now.duration_since(t).as_millis() >= 1000)
+            .unwrap_or(true);
+        self.type_at.set(Some(now));
+        let mut buf = self.type_buf.borrow_mut();
+        if fresh {
+            buf.clear();
+        }
+        buf.extend(c.to_lowercase());
+        let pane = if local { &self.local } else { &self.remote };
+        let entries = pane.entries.borrow();
+        if let Some(i) = entries
+            .iter()
+            .position(|e| e.name != ".." && e.name.to_lowercase().starts_with(buf.as_str()))
+        {
+            pane.selection.select_item(i as u32, true);
+        }
     }
 
     // -- Mark menu: selection commands on the focused pane --------------------
@@ -2000,6 +2232,12 @@ impl App {
                 };
                 self.finish_row(id, &text, true);
 
+                // View flow: temp download done — show the preview, drop the temp.
+                if let Some((vname, vlocal)) = self.view_pending.borrow_mut().remove(&id) {
+                    viewer_dialog(&self.window, &vname, &read_preview(&vlocal));
+                    let _ = std::fs::remove_file(&vlocal);
+                }
+
                 // Edit flow: the temp download finished — open it and watch.
                 if let Some((remote, local)) = self.edit_pending.borrow_mut().remove(&id) {
                     let mtime = std::fs::metadata(&local)
@@ -2179,7 +2417,7 @@ fn create_session(state: &Rc<App>) -> Rc<Session> {
     session
 }
 
-fn build_ui(app: &Application) {
+fn build_ui(app: &Application, open_uri: Option<&str>) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("SCP Commander")
@@ -2719,6 +2957,7 @@ fn build_ui(app: &Application) {
         commands.append(Some("Execute Command…"), Some("win.cmd-exec"));
         commands.append(Some("Open Terminal"), Some("win.cmd-terminal"));
         commands.append(Some("Show Transfer Queue"), Some("win.cmd-queue"));
+        commands.append(Some("Session Log"), Some("win.cmd-log"));
         menubar_model.append_submenu(Some("Commands"), &commands);
 
         let tabs = gio::Menu::new();
@@ -2787,6 +3026,8 @@ fn build_ui(app: &Application) {
         show_hidden: Cell::new(false),
         mirror_sync: Cell::new(false),
         focused_local: Cell::new(true),
+        type_buf: RefCell::new(String::new()),
+        type_at: Cell::new(None),
         local_hist: RefCell::new((Vec::new(), Vec::new())),
         remote_hist: RefCell::new((Vec::new(), Vec::new())),
         remote_hist_suppress: Cell::new(false),
@@ -2796,8 +3037,10 @@ fn build_ui(app: &Application) {
         sites_menu_index: Cell::new(0),
         edit_pending: RefCell::new(HashMap::new()),
         edits: RefCell::new(Vec::new()),
+        view_pending: RefCell::new(HashMap::new()),
         sites: RefCell::new(SitesStore::load()),
         sites_list,
+        log_buf: RefCell::new(Vec::new()),
     });
 
     // First session tab.
@@ -2958,6 +3201,7 @@ fn build_ui(app: &Application) {
         action!("cmd-exec", st, st.menu_exec_command());
         action!("cmd-terminal", st, st.open_terminal());
         action!("cmd-queue", st, st.transfers_window.present());
+        action!("cmd-log", st, session_log_dialog(&st));
         {
             let find_btn = find_btn.clone();
             act("cmd-find", Box::new(move || find_btn.emit_clicked()));
@@ -3152,6 +3396,29 @@ fn build_ui(app: &Application) {
             state.remote.show(&cache, &path, state.show_hidden.get());
         }
     ));
+
+    // Type-ahead: letters jump to the first matching row in the pane.
+    for (view, is_local) in [(&local_view, true), (&remote_view, false)] {
+        let key_ctl = gtk::EventControllerKey::new();
+        key_ctl.connect_key_pressed(glib::clone!(
+            #[strong] state,
+            move |_, keyval, _, modifier| {
+                if modifier.contains(gdk::ModifierType::CONTROL_MASK)
+                    || modifier.contains(gdk::ModifierType::ALT_MASK)
+                {
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(c) = keyval.to_unicode() {
+                    if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                        state.type_ahead(is_local, c);
+                        return glib::Propagation::Stop;
+                    }
+                }
+                glib::Propagation::Proceed
+            }
+        ));
+        view.add_controller(key_ctl);
+    }
 
     // Click-to-focus for the keyboard commander.
     for (view, is_local) in [(&local_view, true), (&remote_view, false)] {
@@ -3359,8 +3626,13 @@ fn build_ui(app: &Application) {
         login_window.present();
     }
 
-    // Connect to a URL passed on the command line (e.g. sftp://host/path).
-    for arg in std::env::args().skip(1) {
+    // Connect to a URL: the `open` signal's URI takes priority, else scan argv.
+    let url_args: Vec<String> = open_uri
+        .map(str::to_string)
+        .into_iter()
+        .chain(std::env::args().skip(1))
+        .collect();
+    for arg in url_args {
         if let Some(rest) = arg.strip_prefix("sftp://").map(|r| ("sftp", r))
             .or_else(|| arg.strip_prefix("ftps://").map(|r| ("ftps", r)))
             .or_else(|| arg.strip_prefix("ftp://").map(|r| ("ftp", r)))
@@ -3441,6 +3713,78 @@ fn build_pane_toolbar(state: &Rc<App>, header: &GtkBox, local_pane: bool) {
     refresh.connect_clicked(glib::clone!(
         #[strong] state,
         move |_| if local_pane { state.load_local() } else { state.refresh_remote() }
+    ));
+
+    // Directory bookmarks: star popover rebuilt each time it opens.
+    let bm_box = GtkBox::builder().orientation(Orientation::Vertical).spacing(2).build();
+    let bm_pop = Popover::builder().child(&bm_box).build();
+    let bm_btn = gtk::MenuButton::builder()
+        .icon_name("starred-symbolic")
+        .popover(&bm_pop)
+        .build();
+    bm_btn.add_css_class("flat");
+    bm_btn.set_tooltip_text(Some("Directory bookmarks"));
+    header.append(&bm_btn);
+    let bm_kind: &'static str = if local_pane { "local" } else { "remote" };
+    bm_pop.connect_show(glib::clone!(
+        #[strong] state,
+        #[strong] bm_box,
+        #[strong] bm_pop,
+        move |_| {
+            while let Some(child) = bm_box.first_child() {
+                bm_box.remove(&child);
+            }
+            let current = if local_pane {
+                state.local_path.borrow().display().to_string()
+            } else {
+                state.session().remote_path.borrow().clone()
+            };
+            let bookmarks = load_bookmarks(bm_kind);
+            for b in &bookmarks {
+                let btn = Button::with_label(b);
+                btn.add_css_class("flat");
+                if let Some(child) = btn.child().and_downcast::<Label>() {
+                    child.set_xalign(0.0);
+                }
+                let target = b.clone();
+                btn.connect_clicked(glib::clone!(
+                    #[strong] state,
+                    #[strong] bm_pop,
+                    move |_| {
+                        bm_pop.popdown();
+                        if local_pane {
+                            state.navigate_local(&target);
+                        } else {
+                            state.navigate_remote(&target);
+                        }
+                    }
+                ));
+                bm_box.append(&btn);
+            }
+            if !bookmarks.is_empty() {
+                bm_box.append(&gtk::Separator::new(Orientation::Horizontal));
+            }
+            let toggle = Button::with_label(if bookmarks.contains(&current) {
+                "Remove bookmark"
+            } else {
+                "Bookmark this directory"
+            });
+            toggle.add_css_class("flat");
+            toggle.connect_clicked(glib::clone!(
+                #[strong] bm_pop,
+                move |_| {
+                    bm_pop.popdown();
+                    let mut list = load_bookmarks(bm_kind);
+                    if let Some(pos) = list.iter().position(|b| *b == current) {
+                        list.remove(pos);
+                    } else {
+                        list.push(current.clone());
+                    }
+                    save_bookmarks(bm_kind, &list);
+                }
+            ));
+            bm_box.append(&toggle);
+        }
     ));
 
     let newf = tool("folder-new-symbolic", "New folder");
@@ -3555,6 +3899,118 @@ fn text_column(
     let col = ColumnViewColumn::new(Some(title), Some(factory));
     col.set_resizable(true); // drag the header divider to resize, WinSCP-style
     col
+}
+
+/// First 256 KB of a file as text, or a placeholder for binary/unreadable.
+fn read_preview(path: &Path) -> String {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return "(unreadable)".into() };
+    let mut buf = vec![0u8; 256 * 1024];
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf.truncate(n);
+    String::from_utf8(buf)
+        .unwrap_or_else(|e| format!("(binary file — {} bytes; no text preview)", e.as_bytes().len()))
+}
+
+/// Read-only text viewer (F3) — WinSCP's internal viewer.
+fn viewer_dialog(parent: &ApplicationWindow, name: &str, text: &str) {
+    let win = gtk::Window::builder()
+        .title(format!("View — {name}"))
+        .transient_for(parent)
+        .default_width(700)
+        .default_height(520)
+        .build();
+    let view = gtk::TextView::builder()
+        .editable(false)
+        .monospace(true)
+        .left_margin(8)
+        .right_margin(8)
+        .top_margin(6)
+        .build();
+    view.buffer().set_text(text);
+    let scroll = ScrolledWindow::builder().vexpand(true).child(&view).build();
+    win.set_child(Some(&scroll));
+    win.present();
+}
+
+/// WinSCP-style session log: every status line, timestamped, in a window.
+fn session_log_dialog(state: &Rc<App>) {
+    let win = gtk::Window::builder()
+        .title("Session Log")
+        .transient_for(&state.window)
+        .default_width(560)
+        .default_height(320)
+        .build();
+    let text = gtk::TextView::builder()
+        .editable(false)
+        .monospace(true)
+        .left_margin(8)
+        .right_margin(8)
+        .top_margin(6)
+        .build();
+    text.buffer().set_text(&state.log_buf.borrow().join("\n"));
+    let scroll = ScrolledWindow::builder().vexpand(true).child(&text).build();
+    // Scroll to the newest line.
+    let mut end = text.buffer().end_iter();
+    text.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
+
+    let clear = Button::with_label("Clear");
+    clear.connect_clicked(glib::clone!(
+        #[strong] state,
+        #[strong] text,
+        move |_| {
+            state.log_buf.borrow_mut().clear();
+            text.buffer().set_text("");
+        }
+    ));
+    let btns = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .halign(gtk::Align::End)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_end(8)
+        .build();
+    btns.append(&clear);
+
+    let vbox = GtkBox::builder().orientation(Orientation::Vertical).build();
+    vbox.append(&scroll);
+    vbox.append(&btns);
+    win.set_child(Some(&vbox));
+    win.present();
+}
+
+/// Bookmark store: one "kind\tpath" line per bookmark under the config dir.
+fn bookmarks_conf_path() -> PathBuf {
+    let dir = glib::user_config_dir().join("scp-commander");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("bookmarks.conf")
+}
+
+fn load_bookmarks(kind: &str) -> Vec<String> {
+    std::fs::read_to_string(bookmarks_conf_path())
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    let (k, v) = l.split_once('\t')?;
+                    (k == kind).then(|| v.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_bookmarks(kind: &str, list: &[String]) {
+    let other: Vec<String> = std::fs::read_to_string(bookmarks_conf_path())
+        .map(|s| {
+            s.lines()
+                .filter(|l| l.split_once('\t').map(|(k, _)| k != kind).unwrap_or(false))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut lines = other;
+    lines.extend(list.iter().map(|b| format!("{kind}\t{b}")));
+    let _ = std::fs::write(bookmarks_conf_path(), lines.join("\n") + "\n");
 }
 
 /// Column-width store: plain "pane.column=px" lines under the user config dir.
@@ -3835,6 +4291,10 @@ fn setup_context_menu(state: &Rc<App>, view: &ColumnView, hook: &MenuHook, local
         let s = state.clone();
         let label = if local_pane { "Upload →" } else { "← Download" };
         add_item(label, false, Box::new(move || s.menu_transfer(local_pane)));
+    }
+    {
+        let s = state.clone();
+        add_item("View", false, Box::new(move || s.menu_view(local_pane)));
     }
     if !local_pane {
         let s = state.clone();

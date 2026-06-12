@@ -57,6 +57,9 @@ final class Transfer: ObservableObject, Identifiable {
     /// Source path and destination directory (WinSCP's File:/Target: lines).
     var source = ""
     var target = ""
+    /// Re-runs the same transfer (set at creation; used by the queue's
+    /// retry button on failed/cancelled rows).
+    var retry: (() -> Void)?
 
     @Published var transferred: UInt64 = 0
     @Published var isPaused: Bool = false

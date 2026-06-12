@@ -54,6 +54,9 @@ struct ScpCommanderApp: App {
                 Button("Show Transfer Queue") {
                     TransferWindowController.shared.show(queue: state.transfers, state: state)
                 }
+                Button("Session Log") {
+                    LogWindowController.shared.show(state: state)
+                }
             }
             CommandMenu("Tabs") {
                 Button("New Tab") { state.newTab() }

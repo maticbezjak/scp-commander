@@ -73,6 +73,9 @@ struct ContentView: View {
     @State private var copyTarget: FileEntry?
     @State private var copyNameText = ""
     @State private var keyMonitor: Any?
+    // Type-ahead: letters typed within 1s jump to the first matching entry.
+    @State private var typeAhead = ""
+    @State private var typeAheadAt = Date.distantPast
 
     var body: some View {
         VStack(spacing: 0) {
@@ -105,6 +108,7 @@ struct ContentView: View {
                     onCopyURL: nil,
                     onProperties: { propertiesTarget = (.local, $0) },
                     onExternalDrop: nil,
+                    onView: { state.viewFile($0, pane: .local) },
                     onBack: { state.goBack(.local) },
                     onForward: { state.goForward(.local) },
                     onHome: { state.goHome(.local) },
@@ -137,6 +141,7 @@ struct ContentView: View {
                     onExternalDrop: { state.uploadExternal($0) },
                     onCopyFile: { e in copyNameText = e.name; copyTarget = e },
                     onExec: state.proto == .sftp ? { _ in state.beginExecCommand() } : nil,
+                    onView: { state.viewFile($0, pane: .remote) },
                     onBack: { state.goBack(.remote) },
                     onForward: { state.goForward(.remote) },
                     onHome: { state.goHome(.remote) },
@@ -186,9 +191,14 @@ struct ContentView: View {
             ),
             titleVisibility: .visible
         ) {
-            Button("Overwrite", role: .destructive) { state.resolveOverwrite(overwrite: true) }
-            Button("Skip existing") { state.resolveOverwrite(overwrite: false) }
+            Button("Overwrite", role: .destructive) { state.resolveOverwrite(.overwrite) }
+            Button("Overwrite only newer") { state.resolveOverwrite(.onlyNewer) }
+            Button("Skip existing") { state.resolveOverwrite(.skip) }
             Button("Cancel", role: .cancel) { state.overwritePrompt = nil }
+        } message: {
+            if let p = state.overwritePrompt {
+                Text(overwriteDetail(p))
+            }
         }
         .sheet(
             isPresented: Binding(
@@ -254,6 +264,16 @@ struct ContentView: View {
         ) {
             ReconnectSheet().environmentObject(state)
         }
+        .sheet(
+            isPresented: Binding(
+                get: { state.viewerContent != nil },
+                set: { if !$0 { state.viewerContent = nil } }
+            )
+        ) {
+            if let v = state.viewerContent {
+                ViewerSheet(name: v.name, text: v.text) { state.viewerContent = nil }
+            }
+        }
         .alert(
             "Duplicate as…",
             isPresented: Binding(
@@ -292,6 +312,32 @@ struct ContentView: View {
                 Text("This cannot be undone.")
             }
         }
+    }
+
+    /// WinSCP-style overwrite detail: source vs target size + mtime, with a
+    /// "newer"/"older" hint. Multi-file prompts summarize the newer count.
+    private func overwriteDetail(_ p: (pane: PaneKind, entries: [FileEntry])) -> String {
+        func stamp(_ d: Date?) -> String { d.map { changedFormatter.string(from: $0) } ?? "?" }
+        if p.entries.count == 1 {
+            let e = p.entries[0]
+            guard let dest = state.destinationInfo(for: e, pane: p.pane) else { return "" }
+            let hint: String
+            if let s = e.mtime, let t = dest.mtime {
+                hint = s > t ? " — source is newer" : s < t ? " — source is older" : " — same time"
+            } else {
+                hint = ""
+            }
+            return """
+                Source: \(humanSize(e.size)) · \(stamp(e.mtime))
+                Target: \(humanSize(dest.size)) · \(stamp(dest.mtime))\(hint)
+                """
+        }
+        let newer = p.entries.filter { e in
+            guard let s = e.mtime, let t = state.destinationInfo(for: e, pane: p.pane)?.mtime
+            else { return false }
+            return s > t
+        }.count
+        return "\(newer) of \(p.entries.count) source files are newer than their targets."
     }
 
     private func beginRename(_ pane: PaneKind, _ entry: FileEntry) {
@@ -369,14 +415,44 @@ struct ContentView: View {
             let selected = state.selectedEntries(in: pane)
             if !selected.isEmpty { deleteTarget = (pane, selected) }
             return true
+        case 99:  // F3 — view file
+            if let entry = state.selectedEntries(in: pane).first {
+                state.viewFile(entry, pane: pane)
+            }
+            return true
         case 36:  // Return — open
             if let entry = state.selectedEntries(in: pane).first {
                 if pane == .local { state.openLocal(entry) } else { state.openRemote(entry) }
             }
             return true
         default:
-            return false
+            return typeAheadJump(event, pane: pane)
         }
+    }
+
+    /// WinSCP type-ahead: typed letters select the first entry whose name
+    /// starts with them; the buffer resets after a second of silence.
+    private func typeAheadJump(_ event: NSEvent, pane: PaneKind) -> Bool {
+        guard !event.modifierFlags.contains(.command),
+            !event.modifierFlags.contains(.control),
+            let chars = event.characters?.lowercased(), !chars.isEmpty,
+            chars.unicodeScalars.allSatisfy({
+                CharacterSet.alphanumerics.contains($0) || ".-_ ".unicodeScalars.contains($0)
+            })
+        else { return false }
+        let now = Date()
+        typeAhead = now.timeIntervalSince(typeAheadAt) < 1.0 ? typeAhead + chars : chars
+        typeAheadAt = now
+        let entries = (pane == .local ? state.localEntries : state.remoteEntries)
+            .filter { state.showHidden || !$0.name.hasPrefix(".") }
+        guard let hit = entries.first(where: { $0.name.lowercased().hasPrefix(typeAhead) })
+        else { return true }
+        if pane == .local {
+            state.localSelection = [hit.id]
+        } else {
+            state.remoteSelection = [hit.id]
+        }
+        return true
     }
 }
 
@@ -822,6 +898,7 @@ private struct FilePane: View {
     let onExternalDrop: (([URL]) -> Void)?
     var onCopyFile: ((FileEntry) -> Void)? = nil
     var onExec: ((FileEntry) -> Void)? = nil
+    var onView: ((FileEntry) -> Void)? = nil
     // Navigation history (WinSCP back/forward/home)
     var onBack: (() -> Void)? = nil
     var onForward: (() -> Void)? = nil
@@ -931,6 +1008,7 @@ private struct FilePane: View {
                     toolButton("house", "Home directory", action: onHome)
                 }
                 toolButton("arrow.clockwise", "Refresh", action: onRefresh)
+                bookmarkMenu
                 Divider().frame(height: 14).padding(.horizontal, 2)
                 toolButton(
                     kind == "local" ? "arrow.up.circle" : "arrow.down.circle",
@@ -995,6 +1073,38 @@ private struct FilePane: View {
             .buttonStyle(.borderless)
             .disabled(disabled)
             .help(help)
+    }
+
+    // MARK: Directory bookmarks (persisted per pane)
+
+    private var bookmarksKey: String { "bookmarks.\(kind)" }
+
+    private var bookmarkMenu: some View {
+        Menu {
+            let bookmarks = UserDefaults.standard.stringArray(forKey: bookmarksKey) ?? []
+            if bookmarks.isEmpty {
+                Text("No bookmarks")
+            }
+            ForEach(bookmarks, id: \.self) { b in
+                Button(b) { onNavigate(b) }
+            }
+            Divider()
+            if bookmarks.contains(path) {
+                Button("Remove Bookmark") {
+                    UserDefaults.standard.set(
+                        bookmarks.filter { $0 != path }, forKey: bookmarksKey)
+                }
+            } else {
+                Button("Bookmark This Directory") {
+                    UserDefaults.standard.set(bookmarks + [path], forKey: bookmarksKey)
+                }
+            }
+        } label: {
+            Image(systemName: "star")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Directory bookmarks")
     }
 
     // MARK: Resizable columns
@@ -1256,6 +1366,9 @@ private struct FilePane: View {
                 Button(targets.count > 1 ? "\(transferLabel) \(targets.count) items" : transferLabel)
                 {
                     for t in targets { onTransfer(t) }
+                }
+                if let onView {
+                    Button("View (F3)") { onView(entry) }
                 }
                 if let onEdit {
                     Button("Edit (auto-upload on save)") { onEdit(entry) }
@@ -1601,6 +1714,35 @@ private struct StatusBar: View {
             Spacer()
         }
         .padding(.horizontal, 8).padding(.vertical, 4)
+    }
+}
+
+// MARK: - Internal file viewer (F3)
+
+struct ViewerSheet: View {
+    let name: String
+    let text: String
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Image(systemName: "doc.text.magnifyingglass")
+                Text(name).font(.headline)
+                Spacer()
+                Button("Close") { onClose() }.keyboardShortcut(.escape)
+            }
+            .padding(12)
+            Divider()
+            ScrollView([.vertical, .horizontal]) {
+                Text(text)
+                    .font(.system(size: 12, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+            }
+        }
+        .frame(minWidth: 560, idealWidth: 700, minHeight: 380, idealHeight: 520)
     }
 }
 

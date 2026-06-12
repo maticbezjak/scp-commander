@@ -54,8 +54,25 @@ final class AppState: ObservableObject {
     @Published var remoteEntries: [FileEntry] = []
     @Published var activeConnected = false
 
-    @Published var status = "Not connected"
+    @Published var status = "Not connected" {
+        didSet { log(status) }
+    }
     @Published var busy = false
+
+    /// Session log: timestamped copy of every status line (ring buffer).
+    @Published private(set) var logLines: [String] = []
+    private let logFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm:ss"
+        return df
+    }()
+
+    func log(_ line: String) {
+        logLines.append("\(logFormatter.string(from: Date()))  \(line)")
+        if logLines.count > 500 { logLines.removeFirst(logLines.count - 500) }
+    }
+
+    func clearLog() { logLines.removeAll() }
 
     // Commander state: focused pane, per-pane multi-selection, dotfile toggle.
     // Plain var — changing focus must not re-render the full ContentView.
@@ -113,6 +130,9 @@ final class AppState: ObservableObject {
     /// Results of the last remote Find.
     @Published var findResults: (mask: String, hits: [CoreClient.FindHit])?
     @Published var showFind = false
+
+    /// Internal viewer (F3): file name + text preview awaiting display.
+    @Published var viewerContent: (name: String, text: String)?
 
     /// Reconnect prompt: shown when a browse error hits an already-connected session.
     @Published var reconnectMessage: String? = nil
@@ -888,6 +908,11 @@ final class AppState: ObservableObject {
         transfer.target = direction == .download
             ? (local as NSString).deletingLastPathComponent
             : parentPosix(remote)
+        transfer.retry = { [weak self] in
+            self?.transferFile(
+                on: session, remote: remote, local: local, name: name, size: size,
+                direction: direction, resumeUpload: resumeUpload, onDone: onDone)
+        }
         transfers.add(transfer)
         TransferWindowController.shared.show(queue: transfers, state: self)
         let flag = transfer.cancelFlag
@@ -1088,6 +1113,11 @@ final class AppState: ObservableObject {
         let transfer = Transfer(name: "\(name)/", direction: direction)
         transfer.source = direction == .download ? remote : local
         transfer.target = direction == .download ? local : remote
+        transfer.retry = { [weak self] in
+            self?.runFolderOp(
+                on: session, name: name, direction: direction,
+                remote: remote, local: local, onDone: onDone)
+        }
         transfers.add(transfer)
         TransferWindowController.shared.show(queue: transfers, state: self)
         let flag = transfer.cancelFlag
@@ -1150,6 +1180,49 @@ final class AppState: ObservableObject {
             }
             return !flag.isCancelled
         }
+    }
+
+    // MARK: - Internal viewer (F3)
+
+    /// Show a read-only text preview (first 256 KB). Remote files download to
+    /// a temp copy on the transfer pool first.
+    func viewFile(_ entry: FileEntry, pane: PaneKind) {
+        guard !entry.isDir else { return }
+        if pane == .local {
+            let path = pathJoin(localPath, entry.name)
+            viewerContent = (entry.name, Self.readPreview(path))
+            return
+        }
+        guard active.connected else { return }
+        let session = active
+        let remote = pathJoinPosix(session.remotePath, entry.name)
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScpCommander-view-\(UUID().uuidString)")
+        status = "Loading \(entry.name)…"
+        session.transferPool.submit { client in
+            let ok =
+                (try? client.download(remote: remote, local: tmp.path, onProgress: { _, _ in true }))
+                != nil
+            let preview = ok ? Self.readPreview(tmp.path) : nil
+            try? FileManager.default.removeItem(at: tmp)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if let preview {
+                    self.viewerContent = (entry.name, preview)
+                    self.status = "Viewing \(entry.name)"
+                } else {
+                    self.status = "Error: could not load \(entry.name)"
+                }
+            }
+        }
+    }
+
+    private nonisolated static func readPreview(_ path: String) -> String {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return "(unreadable)" }
+        defer { try? handle.close() }
+        let data = handle.readData(ofLength: 256 * 1024)
+        if let text = String(data: data, encoding: .utf8) { return text }
+        return "(binary file — \(data.count) bytes; no text preview)"
     }
 
     // MARK: - Edit in editor
@@ -1276,14 +1349,38 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// "Overwrite" chosen in the prompt: replace the existing destinations.
-    func resolveOverwrite(overwrite: Bool) {
+    enum OverwriteDecision { case overwrite, onlyNewer, skip }
+
+    /// Resolve the overwrite prompt. `.onlyNewer` copies only entries whose
+    /// source is more recently modified than the existing destination.
+    func resolveOverwrite(_ decision: OverwriteDecision) {
         guard let prompt = overwritePrompt else { return }
         overwritePrompt = nil
-        guard overwrite else { return }
+        guard decision != .skip else { return }
         for e in prompt.entries {
+            if decision == .onlyNewer {
+                let destMtime = destinationInfo(for: e, pane: prompt.pane)?.mtime
+                guard let src = e.mtime, let dest = destMtime, src > dest else { continue }
+            }
             if prompt.pane == .local { upload(e) } else { download(e) }
         }
+    }
+
+    /// Size + mtime of the destination file an overwrite would replace.
+    func destinationInfo(for e: FileEntry, pane: PaneKind) -> (size: UInt64, mtime: Date?)? {
+        if pane == .local {
+            guard let d = active.remoteEntries.first(where: { !$0.isDir && $0.name == e.name })
+            else { return nil }
+            return (d.size, d.mtime)
+        }
+        let local = (localPath as NSString).appendingPathComponent(e.name)
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: local) else {
+            return nil
+        }
+        return (
+            (attrs[.size] as? NSNumber)?.uint64Value ?? 0,
+            attrs[.modificationDate] as? Date
+        )
     }
 
     /// Recursive remote search (Find Files).
