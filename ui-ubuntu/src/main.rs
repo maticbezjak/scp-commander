@@ -3534,7 +3534,9 @@ fn text_column(
             label.set_text(&text);
         }
     ));
-    ColumnViewColumn::new(Some(title), Some(factory))
+    let col = ColumnViewColumn::new(Some(title), Some(factory));
+    col.set_resizable(true); // drag the header divider to resize, WinSCP-style
+    col
 }
 
 /// Build a titled pane with WinSCP-style columns (Name | Size | Changed
@@ -3590,6 +3592,7 @@ fn make_pane(
     });
     let name_col = ColumnViewColumn::new(Some("Name"), Some(name_factory));
     name_col.set_expand(true);
+    name_col.set_resizable(true);
     view.append_column(&name_col);
 
     let size_col = text_column(

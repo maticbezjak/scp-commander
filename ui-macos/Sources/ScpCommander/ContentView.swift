@@ -833,6 +833,9 @@ private struct FilePane: View {
     @State private var ascending = true
     @State private var pathText = ""
     @State private var filterText = ""
+    // Resizable column widths (live values; persisted to UserDefaults on release).
+    @State private var colWidths: [String: CGFloat] = [:]
+    @State private var dragStartWidth: [String: CGFloat] = [:]
 
     private var sorted: [FileEntry] {
         var v = showHidden ? entries : entries.filter { !$0.name.hasPrefix(".") }
@@ -990,30 +993,75 @@ private struct FilePane: View {
             .help(help)
     }
 
-    /// Clickable, sortable column headers.
+    // MARK: Resizable columns
+
+    private static let defaultWidths: [String: CGFloat] = [
+        "size": 76, "type": 110, "changed": 118, "owner": 48, "group": 48, "rights": 80,
+    ]
+
+    /// Current width of a column: live drag value, else persisted, else default.
+    private func colWidth(_ col: String) -> CGFloat {
+        if let w = colWidths[col] { return w }
+        let saved = UserDefaults.standard.double(forKey: "colw.\(kind).\(col)")
+        return saved >= 40 ? CGFloat(saved) : Self.defaultWidths[col, default: 80]
+    }
+
+    /// Thin draggable divider that resizes the column to its left.
+    private func resizeHandle(_ col: String) -> some View {
+        Rectangle()
+            .fill(Color.secondary.opacity(0.3))
+            .frame(width: 1, height: 12)
+            .padding(.horizontal, 3)
+            .contentShape(Rectangle().inset(by: -2))
+            .onHover { inside in
+                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { v in
+                        if dragStartWidth[col] == nil { dragStartWidth[col] = colWidth(col) }
+                        let w = max(40, min(400, dragStartWidth[col]! + v.translation.width))
+                        colWidths[col] = w
+                    }
+                    .onEnded { _ in
+                        dragStartWidth[col] = nil
+                        if let w = colWidths[col] {
+                            UserDefaults.standard.set(Double(w), forKey: "colw.\(kind).\(col)")
+                        }
+                    }
+            )
+    }
+
+    /// Clickable, sortable column headers with drag-to-resize dividers.
     private var columnHeader: some View {
         HStack(spacing: 0) {
             headerCell("Name", key: .name, alignment: .leading)
                 .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
             headerCell("Size", key: .size, alignment: .trailing)
-                .frame(width: 76, alignment: .trailing)
+                .frame(width: colWidth("size"), alignment: .trailing)
+            resizeHandle("size")
             headerCell("Type", key: .type, alignment: .leading)
-                .frame(width: 110, alignment: .leading)
+                .frame(width: colWidth("type"), alignment: .leading)
+            resizeHandle("type")
             headerCell("Changed", key: .mtime, alignment: .leading)
-                .frame(width: 118, alignment: .leading)
+                .frame(width: colWidth("changed"), alignment: .leading)
+            resizeHandle("changed")
             if showRights {
                 Text("Owner")
                     .font(.caption.bold())
                     .foregroundStyle(.secondary)
-                    .frame(width: 48, alignment: .trailing)
+                    .frame(width: colWidth("owner"), alignment: .trailing)
+                resizeHandle("owner")
                 Text("Group")
                     .font(.caption.bold())
                     .foregroundStyle(.secondary)
-                    .frame(width: 48, alignment: .trailing)
+                    .frame(width: colWidth("group"), alignment: .trailing)
+                resizeHandle("group")
                 Text("Rights")
                     .font(.caption.bold())
                     .foregroundStyle(.secondary)
-                    .frame(width: 80, alignment: .leading)
+                    .frame(width: colWidth("rights"), alignment: .leading)
+                resizeHandle("rights")
             }
         }
         .padding(.horizontal, 12)
@@ -1066,29 +1114,35 @@ private struct FilePane: View {
             Text(entry.isDir ? "" : humanSize(entry.size))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(width: 76, alignment: .trailing)
+                .frame(width: colWidth("size"), alignment: .trailing)
+            Color.clear.frame(width: 7)  // aligns with the header resize handle
             Text(entry.typeDescription)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-                .frame(width: 110, alignment: .leading)
+                .frame(width: colWidth("type"), alignment: .leading)
+            Color.clear.frame(width: 7)
             Text(entry.mtime.map { changedFormatter.string(from: $0) } ?? "")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(width: 118, alignment: .leading)
+                .frame(width: colWidth("changed"), alignment: .leading)
+            Color.clear.frame(width: 7)
             if showRights {
                 Text(entry.uid.map { String($0) } ?? "")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
-                    .frame(width: 48, alignment: .trailing)
+                    .frame(width: colWidth("owner"), alignment: .trailing)
+                Color.clear.frame(width: 7)
                 Text(entry.gid.map { String($0) } ?? "")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
-                    .frame(width: 48, alignment: .trailing)
+                    .frame(width: colWidth("group"), alignment: .trailing)
+                Color.clear.frame(width: 7)
                 Text(entry.perms ?? "")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
-                    .frame(width: 80, alignment: .leading)
+                    .frame(width: colWidth("rights"), alignment: .leading)
+                Color.clear.frame(width: 7)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
