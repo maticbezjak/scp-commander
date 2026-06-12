@@ -838,6 +838,8 @@ private struct FilePane: View {
     @State private var dragStartWidth: [String: CGFloat] = [:]
     /// Rendered width of the flexible Name column — drag base when first resized.
     @State private var nameMeasuredWidth: CGFloat = 200
+    /// Rendered width of the whole header row — drag clamp + sanity check.
+    @State private var headerWidth: CGFloat = 0
 
     private var sorted: [FileEntry] {
         var v = showHidden ? entries : entries.filter { !$0.name.hasPrefix(".") }
@@ -1015,6 +1017,23 @@ private struct FilePane: View {
         return saved >= 80 ? CGFloat(saved) : nil
     }
 
+    /// Fixed-width columns present in this pane.
+    private var fixedColumns: [String] {
+        showRights
+            ? ["size", "type", "changed", "owner", "group", "rights"]
+            : ["size", "type", "changed"]
+    }
+
+    /// Widest this column may get without pushing the others (or Name's
+    /// 80pt minimum) past the pane edge.
+    private func maxColWidth(_ col: String) -> CGFloat {
+        guard headerWidth > 0 else { return col == "name" ? 800 : 400 }
+        let others = fixedColumns.filter { $0 != col }.map(colWidth).reduce(0, +)
+        let nameMin: CGFloat = col == "name" ? 0 : 80
+        let handles = CGFloat(fixedColumns.count + 1) * 7
+        return max(40, headerWidth - others - nameMin - handles - 24)
+    }
+
     /// Thin draggable divider that resizes the column to its left.
     /// Double-click resets the column to its default width.
     private func resizeHandle(_ col: String) -> some View {
@@ -1033,9 +1052,10 @@ private struct FilePane: View {
                             dragStartWidth[col] =
                                 col == "name" ? (nameWidth ?? nameMeasuredWidth) : colWidth(col)
                         }
-                        let maxW: CGFloat = col == "name" ? 800 : 400
                         let minW: CGFloat = col == "name" ? 80 : 40
-                        colWidths[col] = max(minW, min(maxW, dragStartWidth[col]! + v.translation.width))
+                        colWidths[col] = max(
+                            minW,
+                            min(maxColWidth(col), dragStartWidth[col]! + v.translation.width))
                     }
                     .onEnded { _ in
                         dragStartWidth[col] = nil
@@ -1048,6 +1068,21 @@ private struct FilePane: View {
                 colWidths[col] = nil
                 UserDefaults.standard.removeObject(forKey: "colw.\(kind).\(col)")
             }
+    }
+
+    /// Saved widths that no longer fit this pane reset to defaults — columns
+    /// must never push Name off the edge.
+    private func sanitizeColumnWidths(paneWidth: CGFloat) {
+        guard paneWidth > 0 else { return }
+        let handles = CGFloat(fixedColumns.count + 1) * 7
+        let fixed = fixedColumns.map(colWidth).reduce(0, +)
+        let name = nameWidth ?? 80
+        if name + fixed + handles + 24 > paneWidth {
+            for col in fixedColumns + ["name"] {
+                colWidths[col] = nil
+                UserDefaults.standard.removeObject(forKey: "colw.\(kind).\(col)")
+            }
+        }
     }
 
     /// Clickable, sortable column headers with drag-to-resize dividers.
@@ -1096,6 +1131,15 @@ private struct FilePane: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12)
         .padding(.vertical, 3)
+        .background(
+            GeometryReader { g in
+                Color.clear
+                    .onAppear {
+                        headerWidth = g.size.width
+                        sanitizeColumnWidths(paneWidth: g.size.width)
+                    }
+                    .onChange(of: g.size.width) { headerWidth = $0 }
+            })
     }
 
     private func headerCell(_ label: String, key: SortKey, alignment: Alignment) -> some View {
