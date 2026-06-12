@@ -836,6 +836,8 @@ private struct FilePane: View {
     // Resizable column widths (live values; persisted to UserDefaults on release).
     @State private var colWidths: [String: CGFloat] = [:]
     @State private var dragStartWidth: [String: CGFloat] = [:]
+    /// Rendered width of the flexible Name column — drag base when first resized.
+    @State private var nameMeasuredWidth: CGFloat = 200
 
     private var sorted: [FileEntry] {
         var v = showHidden ? entries : entries.filter { !$0.name.hasPrefix(".") }
@@ -1006,7 +1008,15 @@ private struct FilePane: View {
         return saved >= 40 ? CGFloat(saved) : Self.defaultWidths[col, default: 80]
     }
 
+    /// Name is flexible until the user drags its divider; then it's fixed.
+    private var nameWidth: CGFloat? {
+        if let w = colWidths["name"] { return w }
+        let saved = UserDefaults.standard.double(forKey: "colw.\(kind).name")
+        return saved >= 80 ? CGFloat(saved) : nil
+    }
+
     /// Thin draggable divider that resizes the column to its left.
+    /// Double-click resets the column to its default width.
     private func resizeHandle(_ col: String) -> some View {
         Rectangle()
             .fill(Color.secondary.opacity(0.3))
@@ -1019,9 +1029,13 @@ private struct FilePane: View {
             .gesture(
                 DragGesture(minimumDistance: 1)
                     .onChanged { v in
-                        if dragStartWidth[col] == nil { dragStartWidth[col] = colWidth(col) }
-                        let w = max(40, min(400, dragStartWidth[col]! + v.translation.width))
-                        colWidths[col] = w
+                        if dragStartWidth[col] == nil {
+                            dragStartWidth[col] =
+                                col == "name" ? (nameWidth ?? nameMeasuredWidth) : colWidth(col)
+                        }
+                        let maxW: CGFloat = col == "name" ? 800 : 400
+                        let minW: CGFloat = col == "name" ? 80 : 40
+                        colWidths[col] = max(minW, min(maxW, dragStartWidth[col]! + v.translation.width))
                     }
                     .onEnded { _ in
                         dragStartWidth[col] = nil
@@ -1030,13 +1044,26 @@ private struct FilePane: View {
                         }
                     }
             )
+            .onTapGesture(count: 2) {
+                colWidths[col] = nil
+                UserDefaults.standard.removeObject(forKey: "colw.\(kind).\(col)")
+            }
     }
 
     /// Clickable, sortable column headers with drag-to-resize dividers.
     private var columnHeader: some View {
         HStack(spacing: 0) {
             headerCell("Name", key: .name, alignment: .leading)
-                .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
+                .frame(
+                    minWidth: nameWidth ?? 80,
+                    maxWidth: nameWidth ?? .infinity,
+                    alignment: .leading)
+                .background(
+                    GeometryReader { g in
+                        Color.clear.onAppear { nameMeasuredWidth = g.size.width }
+                            .onChange(of: g.size.width) { nameMeasuredWidth = $0 }
+                    })
+            resizeHandle("name")
             headerCell("Size", key: .size, alignment: .trailing)
                 .frame(width: colWidth("size"), alignment: .trailing)
             resizeHandle("size")
@@ -1063,7 +1090,9 @@ private struct FilePane: View {
                     .frame(width: colWidth("rights"), alignment: .leading)
                 resizeHandle("rights")
             }
+            if nameWidth != nil { Spacer(minLength: 0) }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12)
         .padding(.vertical, 3)
     }
@@ -1110,12 +1139,16 @@ private struct FilePane: View {
                     .frame(width: 16)
                 Text(entry.name).lineLimit(1)
             }
-            .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
+            .frame(
+                minWidth: nameWidth ?? 80,
+                maxWidth: nameWidth ?? .infinity,
+                alignment: .leading)
+            Color.clear.frame(width: 7)  // aligns with the header resize handle
             Text(entry.isDir ? "" : humanSize(entry.size))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: colWidth("size"), alignment: .trailing)
-            Color.clear.frame(width: 7)  // aligns with the header resize handle
+            Color.clear.frame(width: 7)
             Text(entry.typeDescription)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1144,6 +1177,7 @@ private struct FilePane: View {
                     .frame(width: colWidth("rights"), alignment: .leading)
                 Color.clear.frame(width: 7)
             }
+            if nameWidth != nil { Spacer(minLength: 0) }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .tag(entry.id)
