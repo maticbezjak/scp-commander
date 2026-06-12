@@ -1058,6 +1058,7 @@ private struct FilePane: View {
                     minWidth: nameWidth ?? 80,
                     maxWidth: nameWidth ?? .infinity,
                     alignment: .leading)
+                .layoutPriority(1)  // never let fixed columns squeeze Name away
                 .background(
                     GeometryReader { g in
                         Color.clear.onAppear { nameMeasuredWidth = g.size.width }
@@ -1143,6 +1144,7 @@ private struct FilePane: View {
                 minWidth: nameWidth ?? 80,
                 maxWidth: nameWidth ?? .infinity,
                 alignment: .leading)
+            .layoutPriority(1)
             Color.clear.frame(width: 7)  // aligns with the header resize handle
             Text(entry.isDir ? "" : humanSize(entry.size))
                 .font(.caption.monospacedDigit())
