@@ -86,12 +86,15 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(mirrorSync, forKey: "mirrorSync") }
     }
 
-    /// Speed limit in KiB/s (0 = unlimited) — stored but not yet wired into
-    /// core callbacks (placeholder for the preferences window).
+    /// Speed limit in KiB/s (0 = unlimited), enforced per connection by the
+    /// transfer progress callbacks via `SpeedLimit.shared`.
     @Published var speedLimitKbs: Int =
         UserDefaults.standard.integer(forKey: "speedLimitKbs")
     {
-        didSet { UserDefaults.standard.set(speedLimitKbs, forKey: "speedLimitKbs") }
+        didSet {
+            UserDefaults.standard.set(speedLimitKbs, forKey: "speedLimitKbs")
+            SpeedLimit.shared.kbs = speedLimitKbs
+        }
     }
 
     /// Output of the last Execute Command run.
@@ -892,9 +895,11 @@ final class AppState: ObservableObject {
         let offset = resumeOffset
 
         session.transferPool.submit { [weak self] client in
+            var speedDone: UInt64 = offset
             let progress: (UInt64, UInt64) -> Bool = { done, total in
                 DispatchQueue.main.async { transfer.note(done, total: total) }
                 pause.waitWhilePaused()
+                SpeedLimit.shared.throttle(lastDone: &speedDone, done: done)
                 return !flag.isCancelled
             }
             let result = Result {
@@ -1121,6 +1126,7 @@ final class AppState: ObservableObject {
         -> (Int32, String?, UInt64, UInt64) -> Bool
     {
         let pause = transfer.pauseFlag
+        var speedDone: UInt64 = 0
         return { kind, file, done, total in
             DispatchQueue.main.async {
                 switch kind {
@@ -1137,6 +1143,11 @@ final class AppState: ObservableObject {
                 }
             }
             pause.waitWhilePaused()
+            if kind == 0 {
+                speedDone = 0  // per-file byte counter restarts
+            } else if kind == 1 {
+                SpeedLimit.shared.throttle(lastDone: &speedDone, done: done)
+            }
             return !flag.isCancelled
         }
     }
@@ -1521,11 +1532,10 @@ final class AppState: ObservableObject {
                         let msg = error.localizedDescription
                         self.status = "Error: \(msg)"
                         // Show reconnect dialog for network errors on active sessions.
-                        if session.connected && self.reconnectMessage == nil {
-                            let isNetworkError = (error as? CoreError)?.isNetworkError ?? true
-                            if isNetworkError {
-                                self.showReconnectDialog(message: msg)
-                            }
+                        if session.connected && self.reconnectMessage == nil,
+                            (error as? CoreError)?.isNetworkError == true
+                        {
+                            self.showReconnectDialog(message: msg)
                         }
                     }
                 }

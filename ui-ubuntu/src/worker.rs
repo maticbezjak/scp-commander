@@ -7,9 +7,27 @@
 //! `Arc<AtomicBool>` cancel flag flipped by the UI's cancel buttons.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
+
+/// Process-wide transfer speed cap in KiB/s (0 = unlimited). Set by the
+/// Transfer Settings dropdown; read by every transfer progress callback.
+/// The cap applies per connection — with the 3-worker pool, aggregate
+/// throughput can reach 3× this value when transfers run in parallel.
+pub static SPEED_LIMIT_KBS: AtomicU64 = AtomicU64::new(0);
+
+/// Sleep long enough that the bytes since `last_done` match the cap.
+fn throttle(last_done: &mut u64, done: u64) {
+    let kbs = SPEED_LIMIT_KBS.load(Ordering::Relaxed);
+    if kbs > 0 && done > *last_done {
+        let micros = (done - *last_done) * 1_000_000 / (kbs * 1024);
+        if micros > 0 {
+            thread::sleep(std::time::Duration::from_micros(micros.min(1_000_000)));
+        }
+    }
+    *last_done = done;
+}
 
 /// Thread-safe pause flag shared between the UI pause button and the worker
 /// progress callback. The worker calls `wait_while_paused()` on each tick.
@@ -332,13 +350,15 @@ fn transfer(
         send(Event::Failed { id, message: "not connected".into() });
         return;
     };
-    let mut throttle = Throttle::new();
+    let mut ui_throttle = Throttle::new();
+    let mut speed_done: u64 = 0;
     let mut progress = |done: u64, total: u64| -> bool {
         if cancel.load(Ordering::Relaxed) {
             return false;
         }
         pause.wait_while_paused();
-        if throttle.should_send(done, total) {
+        throttle(&mut speed_done, done);
+        if ui_throttle.should_send(done, total) {
             send(Event::Progress { id, done, total });
         }
         true
@@ -365,7 +385,8 @@ fn multi(
         send(Event::Failed { id, message: "not connected".into() });
         return;
     };
-    let mut throttle = Throttle::new();
+    let mut ui_throttle = Throttle::new();
+    let mut speed_done: u64 = 0;
     let mut cb = |ev: XferEvent| -> bool {
         if cancel.load(Ordering::Relaxed) {
             return false;
@@ -373,11 +394,13 @@ fn multi(
         pause.wait_while_paused();
         match ev {
             XferEvent::Start { name, total, .. } => {
-                throttle = Throttle::new();
+                ui_throttle = Throttle::new();
+                speed_done = 0;
                 send(Event::FileStart { id, file: name.to_string(), total });
             }
             XferEvent::Bytes { done, total } => {
-                if throttle.should_send(done, total) {
+                throttle(&mut speed_done, done);
+                if ui_throttle.should_send(done, total) {
                     send(Event::Progress { id, done, total });
                 }
             }
@@ -433,42 +456,59 @@ pub fn spawn_pool(n: usize, events: async_channel::Sender<Event>) -> Vec<mpsc::S
 
 fn pool_run(rx: mpsc::Receiver<Cmd>, events: async_channel::Sender<Event>) {
     let mut session: Option<Box<dyn Transport>> = None;
+    let mut creds: Option<Credentials> = None;
     let send = move |ev: Event| {
         let _ = events.send_blocking(ev);
     };
+    // Lazy reconnect: if the silent connect failed (or the session died and
+    // was dropped), retry with the stored credentials before each transfer
+    // instead of failing every command with "not connected".
+    fn ensure(session: &mut Option<Box<dyn Transport>>, creds: &Option<Credentials>) {
+        if session.is_none() {
+            if let Some(c) = creds {
+                *session = connect(c).ok();
+            }
+        }
+    }
 
     loop {
         match rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok(cmd) => match cmd {
-                Cmd::Connect { creds, .. } => {
-                    // Silent connect — no Event::Connected, errors silently retried by next use.
-                    session = connect(&creds).ok();
+                Cmd::Connect { creds: c, .. } => {
+                    // Silent connect — no Event::Connected; failures retried on first use.
+                    session = connect(&c).ok();
+                    creds = Some(c);
                 }
                 Cmd::Download { id, name, remote, local, resume, cancel, pause } => {
+                    ensure(&mut session, &creds);
                     transfer(&mut session, &send, id, name, cancel, pause, true, |t, p| {
                         if resume > 0 { t.download_resume(&remote, &local, resume, p) }
                         else { t.download_progress(&remote, &local, p) }
                     });
                 }
                 Cmd::Upload { id, name, local, remote, resume, cancel, pause } => {
+                    ensure(&mut session, &creds);
                     transfer(&mut session, &send, id, name, cancel, pause, false, |t, p| {
                         if resume { t.upload_resume(&local, &remote, p) }
                         else { t.upload_progress(&local, &remote, p) }
                     });
                 }
                 Cmd::DownloadDir { id, name, remote, local, excludes, cancel, pause } => {
+                    ensure(&mut session, &creds);
                     let filter = Filter::parse(&excludes);
                     multi(&mut session, &send, id, name, cancel, pause, true, |t, cb| {
                         ops::download_dir(t, &remote, &local, &filter, cb)
                     });
                 }
                 Cmd::UploadDir { id, name, local, remote, excludes, cancel, pause } => {
+                    ensure(&mut session, &creds);
                     let filter = Filter::parse(&excludes);
                     multi(&mut session, &send, id, name, cancel, pause, false, |t, cb| {
                         ops::upload_dir(t, &local, &remote, &filter, cb)
                     });
                 }
                 Cmd::Sync { id, download, local, remote, excludes, cancel, pause } => {
+                    ensure(&mut session, &creds);
                     let filter = Filter::parse(&excludes);
                     let dir = if download { SyncDirection::Download } else { SyncDirection::Upload };
                     let name = format!("Sync {}", if download { "⬇" } else { "⬆" });

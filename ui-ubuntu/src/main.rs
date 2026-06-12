@@ -2557,13 +2557,31 @@ fn build_ui(app: &Application) {
     sep2.set_margin_end(4);
     cmd_bar.append(&sep2);
 
-    // Transfer Settings label (non-interactive for now — speed limit via menu)
-    let xfer_settings_lbl = Label::builder()
-        .label("Transfer Settings: Default")
-        .xalign(0.0)
-        .build();
-    xfer_settings_lbl.add_css_class("dim-label");
-    cmd_bar.append(&xfer_settings_lbl);
+    // Transfer Settings: speed-limit dropdown wired to the worker throttle.
+    let speed_lbl = Label::builder().label("Speed:").xalign(0.0).build();
+    speed_lbl.add_css_class("dim-label");
+    cmd_bar.append(&speed_lbl);
+    const SPEED_CHOICES: [(&str, u64); 5] = [
+        ("Unlimited", 0),
+        ("100 KiB/s", 100),
+        ("500 KiB/s", 500),
+        ("1 MiB/s", 1024),
+        ("5 MiB/s", 5120),
+    ];
+    let speed_dd = DropDown::from_strings(
+        &SPEED_CHOICES.iter().map(|(l, _)| *l).collect::<Vec<_>>());
+    // Restore the persisted cap.
+    let saved_kbs = load_column_widths().get("transfer.speed_kbs").copied().unwrap_or(0) as u64;
+    worker::SPEED_LIMIT_KBS.store(saved_kbs, std::sync::atomic::Ordering::Relaxed);
+    if let Some(idx) = SPEED_CHOICES.iter().position(|(_, k)| *k == saved_kbs) {
+        speed_dd.set_selected(idx as u32);
+    }
+    speed_dd.connect_selected_notify(move |dd| {
+        let kbs = SPEED_CHOICES[dd.selected() as usize].1;
+        worker::SPEED_LIMIT_KBS.store(kbs, std::sync::atomic::Ordering::Relaxed);
+        save_column_width("transfer.speed_kbs", kbs as i32);
+    });
+    cmd_bar.append(&speed_dd);
 
     // Sites sidebar ------------------------------------------------------------
     // WinSCP behavior: single click selects/edits, double click logs in.

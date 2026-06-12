@@ -21,6 +21,8 @@ typedef struct ScpSession ScpSession;
 #define SCP_ERR_GENERIC 1
 #define SCP_ERR_UNKNOWN_HOST_KEY 2
 #define SCP_ERR_HOST_KEY_MISMATCH 3
+/* Network-level failure (connect / IO / protocol) — a reconnect may help. */
+#define SCP_ERR_NETWORK 4
 
 /* protocol: 0=SFTP, 1=FTP, 2=FTPS, 3=S3. Returns NULL on failure.
  *

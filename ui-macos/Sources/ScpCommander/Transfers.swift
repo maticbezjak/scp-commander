@@ -1,5 +1,29 @@
 import Foundation
 
+/// Process-wide transfer speed cap (KiB/s, 0 = unlimited). Written by the
+/// Transfer Settings dropdown on the main thread, read by worker-thread
+/// progress callbacks. The cap applies per connection — with the 3-client
+/// pool, aggregate throughput can reach 3× this value.
+final class SpeedLimit: @unchecked Sendable {
+    static let shared = SpeedLimit()
+    private let lock = NSLock()
+    private var _kbs: Int = UserDefaults.standard.integer(forKey: "speedLimitKbs")
+
+    var kbs: Int {
+        get { lock.lock(); defer { lock.unlock() }; return _kbs }
+        set { lock.lock(); _kbs = newValue; lock.unlock() }
+    }
+
+    /// Sleep so the bytes since the previous call match the cap.
+    func throttle(lastDone: inout UInt64, done: UInt64) {
+        defer { lastDone = done }
+        let limit = kbs
+        guard limit > 0, done > lastDone else { return }
+        let micros = (done - lastDone) * 1_000_000 / (UInt64(limit) * 1024)
+        if micros > 0 { usleep(UInt32(min(micros, 1_000_000))) }
+    }
+}
+
 enum TransferDirection {
     case upload
     case download

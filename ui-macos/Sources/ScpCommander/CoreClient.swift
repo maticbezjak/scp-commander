@@ -65,14 +65,9 @@ struct CoreError: LocalizedError {
 
     var isUnknownHostKey: Bool { code == SCP_ERR_UNKNOWN_HOST_KEY }
     var isHostKeyMismatch: Bool { code == SCP_ERR_HOST_KEY_MISMATCH }
-    /// True for IO/network-level failures that warrant a reconnect prompt.
-    var isNetworkError: Bool {
-        code != SCP_ERR_UNKNOWN_HOST_KEY && code != SCP_ERR_HOST_KEY_MISMATCH
-            && (message.contains("timed out") || message.contains("Connection")
-                || message.contains("network") || message.contains("broken pipe")
-                || message.contains("EOF") || message.contains("reset by peer")
-                || message.contains("list failed") || message.contains("not connected"))
-    }
+    /// Network-level failure (connect/IO/protocol) — a reconnect may help.
+    /// Classified by the core, not by message text.
+    var isNetworkError: Bool { code == SCP_ERR_NETWORK }
 }
 
 enum HostKeyMode: Int32 {
@@ -168,6 +163,8 @@ private final class XferBox {
 final class CoreClient: @unchecked Sendable {
     private var session: OpaquePointer?
 
+    /// Whether a live session handle exists (it may still be a dead TCP
+    /// connection — the core's AutoReconnect revives those transparently).
     var isConnected: Bool { session != nil }
 
     /// Empty strings for bucket/region/fingerprint/keyPath mean "absent" (the

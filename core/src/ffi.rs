@@ -24,6 +24,8 @@ pub const SCP_ERR_NONE: c_int = 0;
 pub const SCP_ERR_GENERIC: c_int = 1;
 pub const SCP_ERR_UNKNOWN_HOST_KEY: c_int = 2;
 pub const SCP_ERR_HOST_KEY_MISMATCH: c_int = 3;
+/// Network-level failure (connect / IO / protocol) — a reconnect may help.
+pub const SCP_ERR_NETWORK: c_int = 4;
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -45,6 +47,7 @@ fn set_error_typed(err: &Error) {
     let (code, fp) = match err {
         Error::UnknownHostKey { fingerprint } => (SCP_ERR_UNKNOWN_HOST_KEY, Some(fingerprint)),
         Error::HostKeyMismatch { fingerprint } => (SCP_ERR_HOST_KEY_MISMATCH, Some(fingerprint)),
+        Error::Connect(_) | Error::Io(_) | Error::Protocol(_) => (SCP_ERR_NETWORK, None),
         _ => (SCP_ERR_GENERIC, None),
     };
     LAST_CODE.with(|c| c.set(code));
@@ -207,7 +210,7 @@ pub extern "C" fn scp_list_dir(session: *mut ScpSession, path: *const c_char) ->
             }
         },
         Err(e) => {
-            set_error(e.to_string());
+            set_error_typed(&e);
             ptr::null_mut()
         }
     }
@@ -232,7 +235,7 @@ pub extern "C" fn scp_download(
     match session.inner.download(remote, Path::new(local)) {
         Ok(n) => n as i64,
         Err(e) => {
-            set_error(e.to_string());
+            set_error_typed(&e);
             -1
         }
     }
@@ -257,7 +260,7 @@ pub extern "C" fn scp_upload(
     match session.inner.upload(Path::new(local), remote) {
         Ok(n) => n as i64,
         Err(e) => {
-            set_error(e.to_string());
+            set_error_typed(&e);
             -1
         }
     }
