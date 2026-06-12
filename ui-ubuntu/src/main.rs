@@ -3539,6 +3539,37 @@ fn text_column(
     col
 }
 
+/// Column-width store: plain "pane.column=px" lines under the user config dir.
+fn columns_conf_path() -> PathBuf {
+    let dir = glib::user_config_dir().join("scp-commander");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("columns.conf")
+}
+
+fn load_column_widths() -> HashMap<String, i32> {
+    std::fs::read_to_string(columns_conf_path())
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    let (k, v) = l.split_once('=')?;
+                    Some((k.trim().to_string(), v.trim().parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_column_width(key: &str, width: i32) {
+    let mut all = load_column_widths();
+    if all.get(key) == Some(&width) {
+        return; // resize notifications fire continuously during a drag
+    }
+    all.insert(key.to_string(), width);
+    let mut lines: Vec<String> = all.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    lines.sort();
+    let _ = std::fs::write(columns_conf_path(), lines.join("\n") + "\n");
+}
+
 /// Build a titled pane with WinSCP-style columns (Name | Size | Changed
 /// [| Rights]), a header (title + action buttons appended later by build_ui),
 /// and a path label. Rows get a right-click gesture firing the pane's
@@ -3631,6 +3662,13 @@ fn make_pane(
     changed_col.set_fixed_width(130);
     view.append_column(&changed_col);
 
+    let mut cols: Vec<(&'static str, ColumnViewColumn)> = vec![
+        ("name", name_col.clone()),
+        ("size", size_col.clone()),
+        ("type", type_col.clone()),
+        ("changed", changed_col.clone()),
+    ];
+
     if show_rights {
         let owner_col = text_column(
             "Owner",
@@ -3661,6 +3699,31 @@ fn make_pane(
         );
         rights_col.set_fixed_width(95);
         view.append_column(&rights_col);
+
+        cols.push(("owner", owner_col));
+        cols.push(("group", group_col));
+        cols.push(("rights", rights_col));
+    }
+
+    // Restore saved widths and persist any drag-to-resize (WinSCP remembers
+    // column layout per pane).
+    {
+        let kind = title.to_lowercase();
+        let saved = load_column_widths();
+        for (col_name, col) in &cols {
+            let key = format!("{kind}.{col_name}");
+            if let Some(w) = saved.get(&key) {
+                if *w >= 40 {
+                    col.set_fixed_width(*w);
+                }
+            }
+            col.connect_fixed_width_notify(move |c| {
+                let w = c.fixed_width();
+                if w >= 40 {
+                    save_column_width(&key, w);
+                }
+            });
+        }
     }
 
     view.set_single_click_activate(false);
