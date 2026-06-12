@@ -1053,14 +1053,32 @@ private struct FilePane: View {
                                 col == "name" ? (nameWidth ?? nameMeasuredWidth) : colWidth(col)
                         }
                         let minW: CGFloat = col == "name" ? 80 : 40
-                        colWidths[col] = max(
-                            minW,
-                            min(maxColWidth(col), dragStartWidth[col]! + v.translation.width))
+                        var desired = max(minW, dragStartWidth[col]! + v.translation.width)
+                        if col == "name" {
+                            // Widening Name steals space from the other columns,
+                            // shrinking them (down to 40pt each) to make room.
+                            let handles = CGFloat(fixedColumns.count + 1) * 7
+                            let budget = headerWidth - handles - 24
+                            let othersMin = CGFloat(fixedColumns.count) * 40
+                            desired = min(desired, budget - othersMin)
+                            let others = fixedColumns.map(colWidth).reduce(0, +)
+                            if desired + others > budget, others > 0 {
+                                let scale = (budget - desired) / others
+                                for c in fixedColumns {
+                                    colWidths[c] = max(40, colWidth(c) * scale)
+                                }
+                            }
+                            colWidths[col] = desired
+                        } else {
+                            colWidths[col] = min(maxColWidth(col), desired)
+                        }
                     }
                     .onEnded { _ in
                         dragStartWidth[col] = nil
-                        if let w = colWidths[col] {
-                            UserDefaults.standard.set(Double(w), forKey: "colw.\(kind).\(col)")
+                        // Persist every column the drag touched (a Name drag
+                        // may have shrunk the others too).
+                        for (c, w) in colWidths {
+                            UserDefaults.standard.set(Double(w), forKey: "colw.\(kind).\(c)")
                         }
                     }
             )
