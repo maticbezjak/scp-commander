@@ -2160,6 +2160,25 @@ impl App {
         });
     }
 
+    /// Import hosts from ~/.ssh/config into saved sites (grouped under "SSH/").
+    fn import_ssh_config(self: &Rc<Self>) {
+        let path = glib::home_dir().join(".ssh").join("config");
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                self.set_status("No ~/.ssh/config found");
+                return;
+            }
+        };
+        match self.sites.borrow_mut().import_ssh_config(&data) {
+            Ok(count) => {
+                self.refresh_sites_list();
+                self.set_status(&format!("Imported {count} host(s) from ~/.ssh/config"));
+            }
+            Err(e) => self.set_status(&format!("Import failed: {e}")),
+        }
+    }
+
     fn refresh_sites_list(&self) {
         while let Some(row) = self.sites_list.first_child() {
             self.sites_list.remove(&row);
@@ -3005,7 +3024,9 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     export_btn.add_css_class("flat");
     let winscp_btn = Button::with_label("Import from WinSCP INI…");
     winscp_btn.add_css_class("flat");
-    for b in [&import_btn, &winscp_btn, &export_btn] {
+    let sshcfg_btn = Button::with_label("Import from ~/.ssh/config");
+    sshcfg_btn.add_css_class("flat");
+    for b in [&import_btn, &winscp_btn, &sshcfg_btn, &export_btn] {
         if let Some(child) = b.child().and_downcast::<Label>() {
             child.set_xalign(0.0);
         }
@@ -3221,6 +3242,14 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         move |_| {
             tools_popover.popdown();
             state.import_winscp();
+        }
+    ));
+    sshcfg_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        #[strong] tools_popover,
+        move |_| {
+            tools_popover.popdown();
+            state.import_ssh_config();
         }
     ));
     sync_up_btn.connect_clicked(glib::clone!(

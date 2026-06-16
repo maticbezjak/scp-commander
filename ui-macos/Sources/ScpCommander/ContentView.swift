@@ -614,6 +614,7 @@ private struct LoginSheet: View {
                 Menu("Tools") {
                     Button("Import sites…") { state.importSites() }
                     Button("Import from WinSCP INI…") { state.importWinScp() }
+                    Button("Import from ~/.ssh/config") { state.importSshConfig() }
                     Button("Export sites…") { state.exportSites() }
                 }
                 .menuStyle(.borderlessButton)

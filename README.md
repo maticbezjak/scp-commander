@@ -99,6 +99,16 @@ left sidebar; double-click one to connect instantly.
 
 To delete or rename a site, right-click it in the sidebar.
 
+**Tools menu** (in the Login dialog) can import existing connections so you
+don't retype them:
+
+- **Import from ~/.ssh/config** — turns every concrete `Host` entry into an
+  SFTP site (grouped under an "SSH" folder), picking up HostName, User, Port,
+  and IdentityFile.
+- **Import from WinSCP INI** — migrates WinSCP `[Sessions\…]` entries.
+- **Import / Export sites** — move sites between machines via a shared JSON
+  file (passwords stay in the system keychain, never in the file).
+
 ### Browsing
 
 - The **left pane** always shows your local filesystem; the **right pane** shows

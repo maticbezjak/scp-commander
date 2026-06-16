@@ -301,6 +301,78 @@ final class SitesStore: ObservableObject {
         return count
     }
 
+    /// Import hosts from an OpenSSH `~/.ssh/config`. Each concrete `Host` alias
+    /// (wildcards skipped) becomes an SFTP site grouped under "SSH/", using its
+    /// HostName/User/Port/IdentityFile. Returns the number imported.
+    func importSshConfig(_ text: String) throws -> Int {
+        struct Block {
+            var aliases: [String] = []
+            var hostName = ""
+            var user = ""
+            var port = ""
+            var identityFile = ""
+        }
+
+        // "Key Value" or "Key=Value"; keys are case-insensitive, # comments.
+        func parseLine(_ raw: String) -> (key: String, value: String)? {
+            var line = raw
+            if let hash = line.firstIndex(of: "#") { line = String(line[..<hash]) }
+            line = line.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { return nil }
+            guard let sep = line.firstIndex(where: { $0 == " " || $0 == "\t" || $0 == "=" })
+            else { return (line.lowercased(), "") }
+            let key = String(line[..<sep]).lowercased()
+            var value = String(line[line.index(after: sep)...])
+                .trimmingCharacters(in: CharacterSet(charactersIn: " \t="))
+            if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+                value = String(value.dropFirst().dropLast())
+            }
+            return (key, value)
+        }
+
+        var blocks: [Block] = []
+        var current: Block?
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            guard let (key, value) = parseLine(String(raw)) else { continue }
+            if key == "host" {
+                if let c = current { blocks.append(c) }
+                var b = Block()
+                b.aliases = value.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+                current = b
+            } else if current != nil {
+                switch key {
+                case "hostname": current?.hostName = value
+                case "user": current?.user = value
+                case "port": current?.port = value
+                case "identityfile":
+                    if current?.identityFile.isEmpty ?? false { current?.identityFile = value }
+                default: break
+                }
+            }
+        }
+        if let c = current { blocks.append(c) }
+
+        var count = 0
+        for b in blocks {
+            for alias in b.aliases where !alias.contains("*") && !alias.contains("?") {
+                let host = b.hostName.isEmpty ? alias : b.hostName
+                guard !host.isEmpty else { continue }
+                let key = b.identityFile.isEmpty
+                    ? "" : (b.identityFile as NSString).expandingTildeInPath
+                add(
+                    Site(
+                        name: "SSH/\(alias)", proto: .sftp, host: host,
+                        port: b.port.isEmpty ? "22" : b.port, user: b.user,
+                        authMode: key.isEmpty ? .agent : .keyFile, keyPath: key))
+                count += 1
+            }
+        }
+        guard count > 0 else {
+            throw CoreError(message: "no Host entries found in the SSH config")
+        }
+        return count
+    }
+
     private func sortAndSave() {
         sort()
         save()

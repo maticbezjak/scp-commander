@@ -456,6 +456,21 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Import hosts from ~/.ssh/config into saved sites (grouped under "SSH/").
+    func importSshConfig() {
+        let path = (("~/.ssh/config") as NSString).expandingTildeInPath
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+            status = "No ~/.ssh/config found"
+            return
+        }
+        do {
+            let count = try sites.importSshConfig(text)
+            status = "Imported \(count) host(s) from ~/.ssh/config"
+        } catch {
+            status = "Import failed: \(error.localizedDescription)"
+        }
+    }
+
     func removeSite(_ site: Site) {
         Keychain.delete(account: site.keychainAccount)
         sites.remove(site)

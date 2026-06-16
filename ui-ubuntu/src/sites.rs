@@ -296,6 +296,95 @@ impl SitesStore {
         true
     }
 
+    /// Import hosts from an OpenSSH `~/.ssh/config`. Each concrete `Host` alias
+    /// (wildcards skipped) becomes an SFTP site grouped under "SSH/", using its
+    /// HostName/User/Port/IdentityFile. Returns the number imported.
+    pub fn import_ssh_config(&mut self, text: &str) -> Result<usize, String> {
+        #[derive(Default)]
+        struct Block {
+            aliases: Vec<String>,
+            host_name: String,
+            user: String,
+            port: String,
+            identity_file: String,
+        }
+        // "Key Value" or "Key=Value"; keys case-insensitive, # starts a comment.
+        fn parse_line(raw: &str) -> Option<(String, String)> {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                return None;
+            }
+            let sep = line.find([' ', '\t', '='])?;
+            let key = line[..sep].to_ascii_lowercase();
+            let value = line[sep + 1..]
+                .trim_matches([' ', '\t', '='])
+                .trim_matches('"');
+            Some((key, value.to_string()))
+        }
+
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut current: Option<Block> = None;
+        for raw in text.lines() {
+            let Some((key, value)) = parse_line(raw) else { continue };
+            if key == "host" {
+                if let Some(b) = current.take() {
+                    blocks.push(b);
+                }
+                current = Some(Block {
+                    aliases: value.split_whitespace().map(|s| s.to_string()).collect(),
+                    ..Default::default()
+                });
+            } else if let Some(b) = current.as_mut() {
+                match key.as_str() {
+                    "hostname" => b.host_name = value,
+                    "user" => b.user = value,
+                    "port" => b.port = value,
+                    "identityfile" => {
+                        if b.identity_file.is_empty() {
+                            b.identity_file = value;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(b) = current.take() {
+            blocks.push(b);
+        }
+
+        let mut count = 0;
+        for b in &blocks {
+            for alias in &b.aliases {
+                if alias.contains('*') || alias.contains('?') {
+                    continue;
+                }
+                let host = if b.host_name.is_empty() { alias.clone() } else { b.host_name.clone() };
+                if host.is_empty() {
+                    continue;
+                }
+                let key_path = expand_tilde(&b.identity_file);
+                self.add(Site {
+                    name: format!("SSH/{alias}"),
+                    proto: 0,
+                    host,
+                    port: if b.port.is_empty() { "22".into() } else { b.port.clone() },
+                    user: b.user.clone(),
+                    auth: if key_path.is_empty() { 2 } else { 1 }, // agent | key file
+                    key_path,
+                    bucket: String::new(),
+                    region: String::new(),
+                    remote_dir: String::new(),
+                    local_dir: String::new(),
+                });
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return Err("no Host entries found in the SSH config".into());
+        }
+        Ok(count)
+    }
+
     /// Sorted so folder groups sit together: ungrouped sites first, then
     /// folders alphabetically, each group alphabetical by display name.
     fn sort(&mut self) {
@@ -316,6 +405,20 @@ impl SitesStore {
             let _ = fs::write(&self.file, data);
         }
     }
+}
+
+/// Expand a leading `~` in a path against the user's home directory.
+fn expand_tilde(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return gtk::glib::home_dir().join(rest).to_string_lossy().into_owned();
+    }
+    if path == "~" {
+        return gtk::glib::home_dir().to_string_lossy().into_owned();
+    }
+    path.to_string()
 }
 
 /// Accumulator for one [Sessions\…] block while parsing WinSCP.ini.
@@ -427,6 +530,37 @@ mod tests {
         let keyed = by_name("Keyed");
         assert_eq!(keyed.auth, 1);
         assert_eq!(keyed.key_path, "C:\\keys\\id.ppk");
+    }
+
+    #[test]
+    fn imports_ssh_config() {
+        let cfg = "\
+# my hosts
+Host web1 web1.alias
+    HostName 10.0.0.5
+    User deploy
+    Port 2222
+    IdentityFile ~/.ssh/id_web
+
+Host *.internal
+    User admin
+
+Host db
+    HostName db.example.com
+";
+        let mut s = store();
+        // web1 + web1.alias + db = 3; the wildcard block is skipped.
+        assert_eq!(s.import_ssh_config(cfg).unwrap(), 3);
+        let web1 = s.sites.iter().find(|x| x.name == "SSH/web1").unwrap();
+        assert_eq!(web1.host, "10.0.0.5");
+        assert_eq!(web1.user, "deploy");
+        assert_eq!(web1.port, "2222");
+        assert_eq!(web1.auth, 1); // key file
+        assert!(web1.key_path.ends_with("/.ssh/id_web"), "got {}", web1.key_path);
+        let db = s.sites.iter().find(|x| x.name == "SSH/db").unwrap();
+        assert_eq!(db.host, "db.example.com");
+        assert_eq!(db.port, "22");
+        assert_eq!(db.auth, 2); // agent (no IdentityFile)
     }
 
     #[test]
