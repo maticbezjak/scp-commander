@@ -148,6 +148,7 @@ On macOS it's the standard ⌘, window; on Ubuntu it's under the Login dialog's
 | Upload file(s) | Select in the local pane → press **F5** or click the ↑ button |
 | Download file(s) | Select in the remote pane → press **F5** or click the ↓ button |
 | Drag and drop | Drag files between the two panes |
+| Drag out | Drag an item onto the Desktop/Finder to download it (macOS); local items drag to the file manager on both platforms |
 | Move instead of copy | Select → **F6** |
 
 Folders are transferred recursively. When the destination already has a file —

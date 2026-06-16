@@ -5671,6 +5671,7 @@ fn add_drag_source(view: &ColumnView, kind: &'static str, pane: &Pane) {
     let drag = DragSource::builder().actions(gdk::DragAction::COPY).build();
     let entries = pane.entries.clone();
     let selection = pane.selection.clone();
+    let path_entry = pane.path_entry.clone();
     drag.connect_prepare(move |_, _, _| {
         let bitset = selection.selection();
         let entries = entries.borrow();
@@ -5681,9 +5682,24 @@ fn add_drag_source(view: &ColumnView, kind: &'static str, pane: &Pane) {
         if names.is_empty() {
             return None;
         }
-        Some(gdk::ContentProvider::for_value(
-            &format!("{kind}:{}", names.join("\n")).to_value(),
-        ))
+        // Inter-pane payload ("local:name\n…") — parsed by the other pane.
+        let inter = gdk::ContentProvider::for_value(
+            &format!("{kind}:{}", names.join("\n")).to_value());
+        // Local items also export real file:// URIs so they can be dragged
+        // straight into Nautilus/the desktop. (Remote items have no local file
+        // to promise — GTK4 has no async file-promise like macOS, so dragging
+        // a remote file out isn't offered; use Download instead.)
+        if kind == "local" {
+            let base = PathBuf::from(path_entry.text().as_str());
+            let uris: String = names
+                .iter()
+                .map(|n| format!("{}\r\n", gio::File::for_path(base.join(n)).uri()))
+                .collect();
+            let uri_provider = gdk::ContentProvider::for_bytes(
+                "text/uri-list", &glib::Bytes::from(uris.as_bytes()));
+            return Some(gdk::ContentProvider::new_union(&[inter, uri_provider]));
+        }
+        Some(inter)
     });
     view.add_controller(drag);
 }

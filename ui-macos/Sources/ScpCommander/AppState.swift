@@ -1014,6 +1014,34 @@ final class AppState: ObservableObject {
 
     // MARK: - Transfers
 
+    /// Download a remote path to a temp file so it can be dragged out to
+    /// Finder. Runs on the transfer pool (off the main thread) and returns the
+    /// local URL once complete. Folders download recursively.
+    func dragOutDownload(path: String, name: String, isDir: Bool) async throws -> URL {
+        guard active.connected else { throw CoreError(message: "Not connected") }
+        let pool = active.transferPool
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScpCommander-drag", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let local = dir.appendingPathComponent(name)
+        status = "Downloading \(name) to drag out…"
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            pool.submit { client in
+                let result = Result { () -> Void in
+                    if isDir {
+                        _ = try client.downloadDir(remote: path, local: local.path) { _, _, _, _ in true }
+                    } else {
+                        _ = try client.download(remote: path, local: local.path) { _, _ in true }
+                    }
+                }
+                cont.resume(with: result)
+            }
+        }
+        status = "Dragged out \(name)"
+        return local
+    }
+
     func download(_ entry: FileEntry) {
         let session = active
         guard session.connected else { return }

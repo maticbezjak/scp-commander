@@ -3,15 +3,32 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// Payload dragged between panes. `pane` records the source so a drop on the
-/// opposite pane knows whether it's an upload or a download.
+/// opposite pane knows whether it's an upload or a download. `path` is the
+/// absolute source path so a drag *out* to Finder can fetch the file.
 struct DraggedFile: Codable, Transferable {
     let pane: String
     let name: String
+    var path: String = ""
+    var isDir: Bool = false
 
     static var transferRepresentation: some TransferRepresentation {
+        // Same-app drags between the two panes use this typed payload.
         CodableRepresentation(
             contentType: UTType(exportedAs: "com.manto.scp-commander.dragged-file")
         )
+        // Dragging onto Finder/Desktop exports a real file: local items hand
+        // over their URL, remote items download to a temp copy on demand.
+        FileRepresentation(exportedContentType: .data) { item in
+            if item.pane == "local" {
+                return SentTransferredFile(URL(fileURLWithPath: item.path))
+            }
+            guard let app = await AppStateRegistry.shared else {
+                throw CoreError(message: "not connected")
+            }
+            let url = try await app.dragOutDownload(
+                path: item.path, name: item.name, isDir: item.isDir)
+            return SentTransferredFile(url)
+        }
     }
 }
 
@@ -1429,7 +1446,12 @@ private struct FilePane: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .tag(entry.id)
         .contentShape(Rectangle())
-        .draggable(DraggedFile(pane: kind, name: entry.name))
+        .draggable({
+            let sep = path.hasSuffix("/") ? "" : "/"
+            return DraggedFile(
+                pane: kind, name: entry.name, path: "\(path)\(sep)\(entry.name)",
+                isDir: entry.isDir)
+        }())
         .contextMenu {
             if entry.isDir {
                 Button("Open") { onOpen(entry) }
