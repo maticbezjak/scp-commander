@@ -31,9 +31,18 @@ impl SftpTransport {
         verify_host_key(&session, creds)?;
 
         match &creds.auth {
-            Auth::Password(pw) => session
-                .userauth_password(&creds.username, pw)
-                .map_err(auth_or_connect)?,
+            Auth::Password(pw) => {
+                // Plain password first. Many servers (especially with 2FA/OTP)
+                // only offer keyboard-interactive; fall back to it, feeding the
+                // same secret to every prompt. A wrong secret simply fails both.
+                let _ = session.userauth_password(&creds.username, pw);
+                if !session.authenticated() {
+                    let mut responder = SingleResponse { secret: pw };
+                    session
+                        .userauth_keyboard_interactive(&creds.username, &mut responder)
+                        .map_err(auth_or_connect)?;
+                }
+            }
             Auth::KeyFile { path, passphrase } => session
                 .userauth_pubkey_file(
                     &creds.username,
@@ -310,6 +319,24 @@ impl SftpTransport {
     }
 }
 
+/// Keyboard-interactive responder that answers every prompt with one secret —
+/// covers servers that wrap the password in keyboard-interactive, and the
+/// common single-prompt OTP/2FA case (user types the code in the password box).
+struct SingleResponse<'a> {
+    secret: &'a str,
+}
+
+impl ssh2::KeyboardInteractivePrompt for SingleResponse<'_> {
+    fn prompt<'a>(
+        &mut self,
+        _username: &str,
+        _instructions: &str,
+        prompts: &[ssh2::Prompt<'a>],
+    ) -> Vec<String> {
+        prompts.iter().map(|_| self.secret.to_string()).collect()
+    }
+}
+
 /// Auth calls also surface transport failures (socket died mid-login):
 /// labelling those "authentication failed" sends the UI into wrong-password
 /// flows. Only genuine auth rejections map to Error::Auth.
@@ -451,6 +478,55 @@ fn user_known_hosts_path() -> Option<PathBuf> {
 
 fn app_known_hosts_path() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("HOME")?).join(".config/scp-commander/known_hosts"))
+}
+
+/// One entry in the app's trusted-host store (host + key algorithm).
+pub struct KnownHost {
+    pub host: String,
+    pub key_type: String,
+}
+
+/// List the SSH host keys SCP Commander has trusted (its own store, not the
+/// system `~/.ssh/known_hosts`). Entries are written with plain hostnames.
+pub fn list_known_hosts() -> Vec<KnownHost> {
+    let Some(path) = app_known_hosts_path() else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let mut parts = line.split_whitespace();
+            let host = parts.next()?.to_string();
+            let key_type = parts.next()?.to_string();
+            Some(KnownHost { host, key_type })
+        })
+        .collect()
+}
+
+/// Forget a trusted host: remove every entry for `host` from the app store so
+/// the next connection re-prompts. Returns how many lines were removed.
+pub fn remove_known_host(host: &str) -> Result<usize> {
+    let Some(path) = app_known_hosts_path() else { return Ok(0) };
+    let Ok(text) = std::fs::read_to_string(&path) else { return Ok(0) };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut removed = 0usize;
+    for line in text.lines() {
+        if line.split_whitespace().next() == Some(host) {
+            removed += 1;
+        } else {
+            kept.push(line);
+        }
+    }
+    if removed > 0 {
+        let mut out = kept.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        std::fs::write(&path, out)?;
+    }
+    Ok(removed)
 }
 
 fn base64_nopad(data: &[u8]) -> String {

@@ -914,6 +914,45 @@ pub extern "C" fn scp_string_free(s: *mut c_char) {
     }
 }
 
+/// List SCP Commander's trusted SSH host keys (its own store, not the system
+/// ~/.ssh/known_hosts) as JSON: [{"host":"…","key_type":"…"}]. Caller frees
+/// with scp_string_free; returns null only on an out-of-memory NUL error.
+#[no_mangle]
+pub extern "C" fn scp_list_known_hosts() -> *mut c_char {
+    let hosts = crate::sftp::list_known_hosts();
+    let mut s = String::from("[");
+    for (i, h) in hosts.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str("{\"host\":");
+        json_str(&mut s, &h.host);
+        s.push_str(",\"key_type\":");
+        json_str(&mut s, &h.key_type);
+        s.push('}');
+    }
+    s.push(']');
+    CString::new(s).map(CString::into_raw).unwrap_or(ptr::null_mut())
+}
+
+/// Forget a trusted host: remove every entry for `host` from the app store so
+/// the next connection re-prompts. Returns entries removed, or -1 on error.
+#[no_mangle]
+pub extern "C" fn scp_remove_known_host(host: *const c_char) -> c_int {
+    clear_error();
+    let Some(host) = (unsafe { cstr(host) }) else {
+        set_error("invalid host");
+        return -1;
+    };
+    match crate::sftp::remove_known_host(host) {
+        Ok(n) => n as c_int,
+        Err(e) => {
+            set_error_typed(&e);
+            -1
+        }
+    }
+}
+
 // --- tiny dependency-free JSON encoder for directory listings ---------------
 
 fn entries_to_json(entries: &[crate::types::Entry]) -> String {

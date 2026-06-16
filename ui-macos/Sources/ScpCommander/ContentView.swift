@@ -616,6 +616,7 @@ private struct TopBar: View {
 
 private struct LoginSheet: View {
     @EnvironmentObject var state: AppState
+    @State private var showKnownHosts = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -633,6 +634,8 @@ private struct LoginSheet: View {
                     Button("Import from WinSCP INI…") { state.importWinScp() }
                     Button("Import from ~/.ssh/config") { state.importSshConfig() }
                     Button("Export sites…") { state.exportSites() }
+                    Divider()
+                    Button("Manage known hosts…") { showKnownHosts = true }
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
@@ -657,6 +660,9 @@ private struct LoginSheet: View {
         .frame(width: 760, height: 440)
         .sheet(isPresented: $state.saveSitePrompt) {
             SaveSiteSheet().environmentObject(state)
+        }
+        .sheet(isPresented: $showKnownHosts) {
+            KnownHostsSheet { showKnownHosts = false }
         }
         .alert(
             "Unknown server host key",
@@ -684,6 +690,54 @@ private struct LoginSheet: View {
                 """)
         }
     }
+}
+
+/// Lists SCP Commander's trusted SSH host keys with a "Forget" action, so a
+/// changed key can be cleared instead of failing closed forever.
+private struct KnownHostsSheet: View {
+    let onClose: () -> Void
+    @State private var hosts: [CoreClient.KnownHostInfo] = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Trusted host keys").font(.headline)
+            Text(
+                "Keys SCP Commander has accepted. Forget one to be re-prompted on "
+                    + "the next connection. Your system ~/.ssh/known_hosts is not shown "
+                    + "or modified here.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if hosts.isEmpty {
+                Text("No trusted keys yet.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 120, alignment: .center)
+            } else {
+                List(hosts) { h in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(h.host)
+                            Text(h.key_type).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Forget") {
+                            CoreClient.removeKnownHost(h.host)
+                            reload()
+                        }
+                    }
+                }
+                .frame(minHeight: 180)
+            }
+            HStack {
+                Spacer()
+                Button("Close") { onClose() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 440)
+        .onAppear { reload() }
+    }
+
+    private func reload() { hosts = CoreClient.listKnownHosts() }
 }
 
 /// The right-hand "Session" form of the Login dialog.

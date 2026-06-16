@@ -465,4 +465,26 @@ final class CoreClient: @unchecked Sendable {
                 gid: $0.gid)
         }
     }
+
+    // MARK: - Known hosts (session-independent)
+
+    struct KnownHostInfo: Identifiable, Decodable {
+        let host: String
+        let key_type: String
+        var id: String { "\(host) \(key_type)" }
+    }
+
+    /// SCP Commander's trusted SSH host keys (its own store).
+    static func listKnownHosts() -> [KnownHostInfo] {
+        guard let ptr = scp_list_known_hosts() else { return [] }
+        defer { scp_string_free(ptr) }
+        let json = String(cString: ptr)
+        return (try? JSONDecoder().decode([KnownHostInfo].self, from: Data(json.utf8))) ?? []
+    }
+
+    /// Forget a trusted host; returns how many entries were removed (-1 error).
+    @discardableResult
+    static func removeKnownHost(_ host: String) -> Int {
+        Int(scp_remove_known_host(host))
+    }
 }

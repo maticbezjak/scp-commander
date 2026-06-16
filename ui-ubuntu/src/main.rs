@@ -2407,6 +2407,101 @@ impl App {
         win.present();
     }
 
+    /// View and forget SCP Commander's trusted SSH host keys (its own store).
+    fn known_hosts_dialog(self: &Rc<Self>) {
+        let win = gtk::Window::builder()
+            .title("Known Hosts")
+            .transient_for(&self.login_window)
+            .modal(true)
+            .default_width(440)
+            .default_height(360)
+            .build();
+
+        let intro = Label::builder()
+            .label(
+                "Keys SCP Commander has accepted. Forget one to be re-prompted on the \
+                 next connection. Your system ~/.ssh/known_hosts is not shown or modified.")
+            .xalign(0.0)
+            .wrap(true)
+            .build();
+        intro.add_css_class("caption");
+        intro.add_css_class("dim-label");
+
+        let list = ListBox::new();
+        list.add_css_class("boxed-list");
+        let scroll = ScrolledWindow::builder().vexpand(true).child(&list).build();
+
+        // Self-referential rebuild closure so a Forget button can refresh.
+        let rebuild: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let rebuild_impl: Rc<dyn Fn()> = {
+            let list = list.clone();
+            let state = self.clone();
+            let rebuild = rebuild.clone();
+            Rc::new(move || {
+                while let Some(row) = list.first_child() {
+                    list.remove(&row);
+                }
+                let hosts = scp_core::sftp::list_known_hosts();
+                if hosts.is_empty() {
+                    let l = Label::builder().label("No trusted keys yet.").build();
+                    l.add_css_class("dim-label");
+                    l.set_margin_top(12);
+                    l.set_margin_bottom(12);
+                    list.append(&l);
+                    return;
+                }
+                for h in hosts {
+                    let row = GtkBox::builder()
+                        .orientation(Orientation::Horizontal).spacing(8)
+                        .margin_top(4).margin_bottom(4).margin_start(8).margin_end(8)
+                        .build();
+                    let info = GtkBox::builder()
+                        .orientation(Orientation::Vertical).hexpand(true).build();
+                    let host_l = Label::builder().label(&h.host).xalign(0.0).build();
+                    let type_l = Label::builder().label(&h.key_type).xalign(0.0).build();
+                    type_l.add_css_class("caption");
+                    type_l.add_css_class("dim-label");
+                    info.append(&host_l);
+                    info.append(&type_l);
+                    let forget = Button::with_label("Forget");
+                    forget.add_css_class("destructive-action");
+                    let host = h.host.clone();
+                    let st = state.clone();
+                    let rb = rebuild.clone();
+                    forget.connect_clicked(move |_| {
+                        let _ = scp_core::sftp::remove_known_host(&host);
+                        st.set_status(&format!("Forgot host key for {host}"));
+                        if let Some(f) = rb.borrow().clone() {
+                            f();
+                        }
+                    });
+                    row.append(&info);
+                    row.append(&forget);
+                    list.append(&row);
+                }
+            })
+        };
+        *rebuild.borrow_mut() = Some(rebuild_impl.clone());
+        rebuild_impl();
+
+        let close = Button::with_label("Close");
+        close.connect_clicked(glib::clone!(#[weak] win, move |_| win.close()));
+        let btns = GtkBox::builder()
+            .orientation(Orientation::Horizontal).halign(gtk::Align::End)
+            .margin_top(6).build();
+        btns.append(&close);
+
+        let vbox = GtkBox::builder()
+            .orientation(Orientation::Vertical).spacing(8)
+            .margin_top(12).margin_bottom(12).margin_start(12).margin_end(12)
+            .build();
+        vbox.append(&intro);
+        vbox.append(&scroll);
+        vbox.append(&btns);
+        win.set_child(Some(&vbox));
+        win.present();
+    }
+
     fn refresh_sites_list(&self) {
         while let Some(row) = self.sites_list.first_child() {
             self.sites_list.remove(&row);
@@ -3272,7 +3367,9 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     sshcfg_btn.add_css_class("flat");
     let prefs_btn = Button::with_label("Preferences…");
     prefs_btn.add_css_class("flat");
-    for b in [&import_btn, &winscp_btn, &sshcfg_btn, &export_btn, &prefs_btn] {
+    let knownhosts_btn = Button::with_label("Manage known hosts…");
+    knownhosts_btn.add_css_class("flat");
+    for b in [&import_btn, &winscp_btn, &sshcfg_btn, &export_btn, &knownhosts_btn, &prefs_btn] {
         if let Some(child) = b.child().and_downcast::<Label>() {
             child.set_xalign(0.0);
         }
@@ -3505,6 +3602,14 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         move |_| {
             tools_popover.popdown();
             state.preferences_dialog();
+        }
+    ));
+    knownhosts_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        #[strong] tools_popover,
+        move |_| {
+            tools_popover.popdown();
+            state.known_hosts_dialog();
         }
     ));
     sync_up_btn.connect_clicked(glib::clone!(

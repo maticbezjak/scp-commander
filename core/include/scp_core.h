@@ -147,6 +147,13 @@ const char *scp_last_error(void);
 /* Frees a string returned by the core. */
 void scp_string_free(char *s);
 
+/* SCP Commander's trusted SSH host keys (its own store, not ~/.ssh/known_hosts).
+ * scp_list_known_hosts returns JSON [{"host","key_type"}] (free with
+ * scp_string_free). scp_remove_known_host forgets every entry for `host`,
+ * returning the number removed, or -1 on error. */
+char *scp_list_known_hosts(void);
+int scp_remove_known_host(const char *host);
+
 #ifdef __cplusplus
 }
 #endif
