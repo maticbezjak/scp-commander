@@ -54,7 +54,7 @@ impl PauseFlag {
     }
 }
 
-use scp_core::ops::{self, Filter, SyncDirection, SyncOptions, SyncPlan, XferEvent};
+use scp_core::ops::{self, Filter, OverwritePolicy, SyncDirection, SyncOptions, SyncPlan, XferEvent};
 use scp_core::types::{Credentials, Entry, Error};
 use scp_core::{connect, Transport};
 
@@ -82,8 +82,8 @@ pub enum Cmd {
         cancel: Arc<AtomicBool>,
         pause: Arc<PauseFlag>,
     },
-    DownloadDir { id: u64, name: String, remote: String, local: PathBuf, excludes: String, cancel: Arc<AtomicBool>, pause: Arc<PauseFlag> },
-    UploadDir { id: u64, name: String, local: PathBuf, remote: String, excludes: String, cancel: Arc<AtomicBool>, pause: Arc<PauseFlag> },
+    DownloadDir { id: u64, name: String, remote: String, local: PathBuf, excludes: String, overwrite: i32, cancel: Arc<AtomicBool>, pause: Arc<PauseFlag> },
+    UploadDir { id: u64, name: String, local: PathBuf, remote: String, excludes: String, overwrite: i32, cancel: Arc<AtomicBool>, pause: Arc<PauseFlag> },
     Sync { id: u64, download: bool, local: PathBuf, remote: String, excludes: String, cancel: Arc<AtomicBool>, pause: Arc<PauseFlag> },
     /// Sync dry run; result arrives as Event::SyncPlanReady.
     SyncPlan { download: bool, local: PathBuf, remote: String, excludes: String, delete_extraneous: bool },
@@ -197,17 +197,19 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                     });
                 }
 
-                Cmd::DownloadDir { id, name, remote, local, excludes, cancel, pause } => {
+                Cmd::DownloadDir { id, name, remote, local, excludes, overwrite, cancel, pause } => {
                     let filter = Filter::parse(&excludes);
+                    let policy = OverwritePolicy::from_code(overwrite);
                     multi(&mut session, &send, id, name, cancel, pause, true, |t, cb| {
-                        ops::download_dir(t, &remote, &local, &filter, cb)
+                        ops::download_dir_opts(t, &remote, &local, &filter, policy, cb)
                     });
                 }
 
-                Cmd::UploadDir { id, name, local, remote, excludes, cancel, pause } => {
+                Cmd::UploadDir { id, name, local, remote, excludes, overwrite, cancel, pause } => {
                     let filter = Filter::parse(&excludes);
+                    let policy = OverwritePolicy::from_code(overwrite);
                     multi(&mut session, &send, id, name, cancel, pause, false, |t, cb| {
-                        ops::upload_dir(t, &local, &remote, &filter, cb)
+                        ops::upload_dir_opts(t, &local, &remote, &filter, policy, cb)
                     });
                 }
 
@@ -493,18 +495,20 @@ fn pool_run(rx: mpsc::Receiver<Cmd>, events: async_channel::Sender<Event>) {
                         else { t.upload_progress(&local, &remote, p) }
                     });
                 }
-                Cmd::DownloadDir { id, name, remote, local, excludes, cancel, pause } => {
+                Cmd::DownloadDir { id, name, remote, local, excludes, overwrite, cancel, pause } => {
                     ensure(&mut session, &creds);
                     let filter = Filter::parse(&excludes);
+                    let policy = OverwritePolicy::from_code(overwrite);
                     multi(&mut session, &send, id, name, cancel, pause, true, |t, cb| {
-                        ops::download_dir(t, &remote, &local, &filter, cb)
+                        ops::download_dir_opts(t, &remote, &local, &filter, policy, cb)
                     });
                 }
-                Cmd::UploadDir { id, name, local, remote, excludes, cancel, pause } => {
+                Cmd::UploadDir { id, name, local, remote, excludes, overwrite, cancel, pause } => {
                     ensure(&mut session, &creds);
                     let filter = Filter::parse(&excludes);
+                    let policy = OverwritePolicy::from_code(overwrite);
                     multi(&mut session, &send, id, name, cancel, pause, false, |t, cb| {
-                        ops::upload_dir(t, &local, &remote, &filter, cb)
+                        ops::upload_dir_opts(t, &local, &remote, &filter, policy, cb)
                     });
                 }
                 Cmd::Sync { id, download, local, remote, excludes, cancel, pause } => {

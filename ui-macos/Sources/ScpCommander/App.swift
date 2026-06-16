@@ -1,13 +1,40 @@
+import AppKit
 import SwiftUI
+
+/// Hosts the quit guard: AppKit asks the delegate before terminating, so a
+/// running transfer can put up a confirmation instead of dying silently.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    weak var state: AppState?
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let state, state.transfers.activeCount > 0 else { return .terminateNow }
+        let n = state.transfers.activeCount
+        let alert = NSAlert()
+        alert.messageText = n == 1 ? "1 transfer is still running" : "\(n) transfers are still running"
+        alert.informativeText = "Quitting now will cancel "
+            + (n == 1 ? "it." : "them.")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Quit Anyway")
+        alert.addButton(withTitle: "Keep Transferring")
+        if alert.runModal() == .alertFirstButtonReturn {
+            state.transfers.cancelAll()
+            return .terminateNow
+        }
+        return .terminateCancel
+    }
+}
 
 @main
 struct ScpCommanderApp: App {
     @StateObject private var state = AppState()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
         WindowGroup("SCP Commander") {
             ContentView()
                 .environmentObject(state)
+                .onAppear { appDelegate.state = state }
                 .onOpenURL { url in
                     Task { @MainActor in state.openURL(url) }
                 }

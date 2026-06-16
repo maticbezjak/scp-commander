@@ -28,6 +28,30 @@ pub enum XferEvent<'a> {
 /// Return `false` to cancel the operation ([`Error::Cancelled`]).
 pub type XferCb<'a> = &'a mut dyn FnMut(XferEvent) -> bool;
 
+/// What to do when a recursive folder transfer reaches a file that already
+/// exists at the destination. Chosen once for the whole operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverwritePolicy {
+    /// Always overwrite — the historical (and default) behavior.
+    #[default]
+    Overwrite,
+    /// Never overwrite — copy only files missing at the destination.
+    Skip,
+    /// Overwrite only when the source differs in size or is newer.
+    OnlyNewer,
+}
+
+impl OverwritePolicy {
+    /// Map a UI/FFI integer code to a policy (unknown codes → Overwrite).
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            1 => OverwritePolicy::Skip,
+            2 => OverwritePolicy::OnlyNewer,
+            _ => OverwritePolicy::Overwrite,
+        }
+    }
+}
+
 /// Direction for [`sync_dir`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncDirection {
@@ -335,6 +359,18 @@ pub fn download_dir(
     filter: &Filter,
     cb: XferCb,
 ) -> Result<u64> {
+    download_dir_opts(t, remote, local, filter, OverwritePolicy::Overwrite, cb)
+}
+
+/// Like [`download_dir`] but skips/overwrites existing files per `policy`.
+pub fn download_dir_opts(
+    t: &mut dyn Transport,
+    remote: &str,
+    local: &Path,
+    filter: &Filter,
+    policy: OverwritePolicy,
+    cb: XferCb,
+) -> Result<u64> {
     fs::create_dir_all(local)?;
     let entries = t.list_dir(remote)?;
     let mut bytes = 0u64;
@@ -350,9 +386,12 @@ pub fn download_dir(
         let child_remote = join(remote, &e.name);
         let child_local = local.join(&e.name);
         if e.is_dir {
-            bytes += download_dir(t, &child_remote, &child_local, filter, cb)?;
+            bytes += download_dir_opts(t, &child_remote, &child_local, filter, policy, cb)?;
         } else {
-            bytes += one_file(t, &child_remote, &child_local, e.size, true, cb)?;
+            let dst = fs::metadata(&child_local).ok().map(|m| (m.len(), mtime_unix(&m)));
+            if policy_allows(policy, e.size, e.mtime, dst) {
+                bytes += one_file(t, &child_remote, &child_local, e.size, true, cb)?;
+            }
         }
     }
     Ok(bytes)
@@ -366,9 +405,28 @@ pub fn upload_dir(
     filter: &Filter,
     cb: XferCb,
 ) -> Result<u64> {
+    upload_dir_opts(t, local, remote, filter, OverwritePolicy::Overwrite, cb)
+}
+
+/// Like [`upload_dir`] but skips/overwrites existing files per `policy`.
+pub fn upload_dir_opts(
+    t: &mut dyn Transport,
+    local: &Path,
+    remote: &str,
+    filter: &Filter,
+    policy: OverwritePolicy,
+    cb: XferCb,
+) -> Result<u64> {
     // Tolerate "already exists" — there is no portable way to distinguish it
     // across protocols, and a genuinely broken connection fails on use anyway.
     let _ = t.mkdir(remote);
+    // Skip/OnlyNewer need to know what is already on the server; Overwrite
+    // doesn't care, so we avoid the extra round-trip in that case.
+    let remote_entries: Vec<Entry> = if policy == OverwritePolicy::Overwrite {
+        Vec::new()
+    } else {
+        t.list_dir(remote).unwrap_or_default()
+    };
     let mut bytes = 0u64;
     for entry in fs::read_dir(local)? {
         let entry = entry?;
@@ -380,13 +438,35 @@ pub fn upload_dir(
         let child_remote = join(remote, &name);
         let child_local = entry.path();
         if is_dir {
-            bytes += upload_dir(t, &child_local, &child_remote, filter, cb)?;
+            bytes += upload_dir_opts(t, &child_local, &child_remote, filter, policy, cb)?;
         } else {
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            bytes += one_file(t, &child_remote, &child_local, size, false, cb)?;
+            let meta = entry.metadata().ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let src_mtime = meta.as_ref().and_then(mtime_unix);
+            let dst = remote_entries
+                .iter()
+                .find(|e| e.name == name && !e.is_dir)
+                .map(|e| (e.size, e.mtime));
+            if policy_allows(policy, size, src_mtime, dst) {
+                bytes += one_file(t, &child_remote, &child_local, size, false, cb)?;
+            }
         }
     }
     Ok(bytes)
+}
+
+/// Per-file copy decision for a folder transfer under an [`OverwritePolicy`].
+fn policy_allows(
+    policy: OverwritePolicy,
+    src_size: u64,
+    src_mtime: Option<i64>,
+    dst: Option<(u64, Option<i64>)>,
+) -> bool {
+    match policy {
+        OverwritePolicy::Overwrite => true,
+        OverwritePolicy::Skip => dst.is_none(),
+        OverwritePolicy::OnlyNewer => needs_copy(src_size, src_mtime, dst),
+    }
 }
 
 /// Recursively delete a remote directory. Symlinks are unlinked, never
@@ -822,6 +902,49 @@ mod tests {
         assert_eq!(bytes, 7);
         assert_eq!(t.files.get("/up/x.bin").unwrap(), b"12345");
         assert_eq!(t.files.get("/up/nested/y.bin").unwrap(), b"67");
+        let _ = fs::remove_dir_all(&local);
+    }
+
+    #[test]
+    fn upload_dir_skip_policy_keeps_existing_copies_new() {
+        let local = tempdir("ul-skip");
+        fs::write(local.join("keep.bin"), b"NEWLOCAL").unwrap();
+        fs::write(local.join("fresh.bin"), b"hi").unwrap();
+
+        // Remote already has keep.bin (different content) but not fresh.bin.
+        let mut t = fake_with(&[("/up/keep.bin", "OLDREMOTE")], &["/up"]);
+        let bytes =
+            upload_dir_opts(&mut t, &local, "/up", &Filter::empty(), OverwritePolicy::Skip, &mut |_| true)
+                .unwrap();
+        // Only fresh.bin (2 bytes) is copied; keep.bin is left untouched.
+        assert_eq!(bytes, 2);
+        assert_eq!(t.files.get("/up/keep.bin").unwrap(), b"OLDREMOTE");
+        assert_eq!(t.files.get("/up/fresh.bin").unwrap(), b"hi");
+        let _ = fs::remove_dir_all(&local);
+    }
+
+    #[test]
+    fn download_dir_skip_policy_keeps_existing_copies_new() {
+        let mut t = fake_with(&[("/d/keep.txt", "REMOTE"), ("/d/new.txt", "added")], &["/d"]);
+        let local = tempdir("dl-skip");
+        fs::write(local.join("keep.txt"), b"LOCALWINS").unwrap();
+
+        download_dir_opts(&mut t, "/d", &local, &Filter::empty(), OverwritePolicy::Skip, &mut |_| true)
+            .unwrap();
+        // keep.txt already existed locally → untouched; new.txt is pulled down.
+        assert_eq!(fs::read_to_string(local.join("keep.txt")).unwrap(), "LOCALWINS");
+        assert_eq!(fs::read_to_string(local.join("new.txt")).unwrap(), "added");
+        let _ = fs::remove_dir_all(&local);
+    }
+
+    #[test]
+    fn upload_dir_overwrite_policy_replaces_existing() {
+        let local = tempdir("ul-ow");
+        fs::write(local.join("f.bin"), b"NEW").unwrap();
+        let mut t = fake_with(&[("/up/f.bin", "OLD")], &["/up"]);
+        upload_dir_opts(&mut t, &local, "/up", &Filter::empty(), OverwritePolicy::Overwrite, &mut |_| true)
+            .unwrap();
+        assert_eq!(t.files.get("/up/f.bin").unwrap(), b"NEW");
         let _ = fs::remove_dir_all(&local);
     }
 

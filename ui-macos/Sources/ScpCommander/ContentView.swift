@@ -318,6 +318,17 @@ struct ContentView: View {
     /// "newer"/"older" hint. Multi-file prompts summarize the newer count.
     private func overwriteDetail(_ p: (pane: PaneKind, entries: [FileEntry])) -> String {
         func stamp(_ d: Date?) -> String { d.map { changedFormatter.string(from: $0) } ?? "?" }
+        // Folders merge: the chosen action applies per file inside them.
+        if p.entries.contains(where: { $0.isDir }) {
+            let folders = p.entries.filter { $0.isDir }.count
+            let what = folders == p.entries.count
+                ? (folders == 1 ? "This folder" : "These folders")
+                : "Some items"
+            return "\(what) already exist at the destination. "
+                + "Your choice applies to each file inside:\n"
+                + "Overwrite — replace all · Only newer — replace older files · "
+                + "Skip — keep existing, copy only new files."
+        }
         if p.entries.count == 1 {
             let e = p.entries[0]
             guard let dest = state.destinationInfo(for: e, pane: p.pane) else { return "" }

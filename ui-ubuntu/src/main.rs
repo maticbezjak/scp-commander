@@ -203,6 +203,9 @@ struct App {
     sites_list: ListBox,
     /// Session log: timestamped copy of every status line (ring buffer).
     log_buf: RefCell<Vec<String>>,
+    /// Set once the user confirms "Quit Anyway" so the close handler stops
+    /// re-prompting and lets the window actually close.
+    quit_confirmed: Cell<bool>,
 }
 
 impl App {
@@ -562,16 +565,22 @@ impl App {
     // -- Transfers ----------------------------------------------------------
 
     fn download(self: &Rc<Self>, entry: &Entry) -> Option<u64> {
-        let id = self.download_inner(entry);
+        self.download_with(entry, 0)
+    }
+
+    /// Download with an explicit folder overwrite policy (0/1/2). Files ignore
+    /// it (the caller already decided); folders pass it to the recursive copy.
+    fn download_with(self: &Rc<Self>, entry: &Entry, overwrite: i32) -> Option<u64> {
+        let id = self.download_inner(entry, overwrite);
         if let Some(id) = id {
             let st = self.clone();
             let e = entry.clone();
-            self.set_retry(id, Rc::new(move || { st.download(&e); }));
+            self.set_retry(id, Rc::new(move || { st.download_with(&e, overwrite); }));
         }
         id
     }
 
-    fn download_inner(self: &Rc<Self>, entry: &Entry) -> Option<u64> {
+    fn download_inner(self: &Rc<Self>, entry: &Entry, overwrite: i32) -> Option<u64> {
         if !self.session().connected.get() {
             return None;
         }
@@ -586,6 +595,7 @@ impl App {
                 remote,
                 local,
                 excludes: self.exclude_masks(),
+                overwrite,
                 cancel,
                 pause,
             });
@@ -613,16 +623,22 @@ impl App {
     }
 
     fn upload(self: &Rc<Self>, entry: &Entry) -> Option<u64> {
-        let id = self.upload_inner(entry);
+        self.upload_with(entry, 0)
+    }
+
+    /// Upload with an explicit folder overwrite policy (0/1/2). Files ignore it
+    /// (the caller already decided); folders pass it to the recursive copy.
+    fn upload_with(self: &Rc<Self>, entry: &Entry, overwrite: i32) -> Option<u64> {
+        let id = self.upload_inner(entry, overwrite);
         if let Some(id) = id {
             let st = self.clone();
             let e = entry.clone();
-            self.set_retry(id, Rc::new(move || { st.upload(&e); }));
+            self.set_retry(id, Rc::new(move || { st.upload_with(&e, overwrite); }));
         }
         id
     }
 
-    fn upload_inner(self: &Rc<Self>, entry: &Entry) -> Option<u64> {
+    fn upload_inner(self: &Rc<Self>, entry: &Entry, overwrite: i32) -> Option<u64> {
         if !self.session().connected.get() {
             self.set_status("Connect first to upload");
             return None;
@@ -638,6 +654,7 @@ impl App {
                 local,
                 remote,
                 excludes: self.exclude_masks(),
+                overwrite,
                 cancel,
                 pause,
             });
@@ -948,6 +965,11 @@ impl App {
                 row.cancel.store(true, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Transfers still running — used by the quit guard.
+    fn active_transfers(&self) -> usize {
+        self.transfer_rows.borrow().values().filter(|r| !r.finished).count()
     }
 
     /// Show a prompt to execute a command on the remote (SFTP only).
@@ -1426,7 +1448,17 @@ impl App {
         let mut conflicts = Vec::new();
         for e in entries {
             let conflict = if e.is_dir {
-                false
+                // A folder conflicts when a folder of the same name already
+                // exists at the destination (its files may collide on merge).
+                if local_pane {
+                    self.session()
+                        .cache
+                        .borrow()
+                        .iter()
+                        .any(|r| r.is_dir && r.name == e.name)
+                } else {
+                    self.local_path.borrow().join(&e.name).is_dir()
+                }
             } else if local_pane {
                 // Upload: destination is the remote listing.
                 self.session()
@@ -1486,13 +1518,20 @@ impl App {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "?".into())
         };
+        let any_dir = conflicts.iter().any(|e| e.is_dir);
         let message = if conflicts.len() == 1 {
             format!("{} already exists at the destination.", conflicts[0].name)
         } else {
-            format!("{} files already exist at the destination.", conflicts.len())
+            format!("{} items already exist at the destination.", conflicts.len())
         };
         // WinSCP-style detail: source vs target size + mtime with newer hint.
-        let detail = if conflicts.len() == 1 {
+        // Folders merge, so the choice applies to each file inside them.
+        let detail = if any_dir {
+            "Your choice applies to each file inside:\n\
+             Overwrite — replace all · Only newer — replace older files · \
+             Skip — keep existing, copy only new files."
+                .to_string()
+        } else if conflicts.len() == 1 {
             let e = &conflicts[0];
             match dest_info(self, e) {
                 Some((dsize, dmtime)) => {
@@ -1533,13 +1572,30 @@ impl App {
             .default_button(1)
             .build();
         dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |result| {
-            let only_newer = match result {
-                Ok(3) => false,
-                Ok(2) => true,
-                _ => return, // cancel or skip - existing files stay untouched
+            // Map the button to a folder overwrite-policy code (0/1/2). Single
+            // files use it directly; folders pass it to the recursive copy.
+            let policy: i32 = match result {
+                Ok(3) => 0, // Overwrite
+                Ok(2) => 2, // Only newer
+                Ok(1) => 1, // Skip existing
+                _ => return, // Cancel
             };
             for e in &conflicts {
-                if only_newer {
+                if e.is_dir {
+                    // Folders merge per-file. "Skip existing" still copies new
+                    // files inside, so the whole folder is never dropped.
+                    if local_pane {
+                        state.upload_with(e, policy);
+                    } else {
+                        state.download_with(e, policy);
+                    }
+                    continue;
+                }
+                // Single file: Skip drops it; Only-newer compares mtimes.
+                if policy == 1 {
+                    continue;
+                }
+                if policy == 2 {
                     let dest_mtime = if local_pane {
                         state
                             .session()
@@ -3041,6 +3097,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         sites: RefCell::new(SitesStore::load()),
         sites_list,
         log_buf: RefCell::new(Vec::new()),
+        quit_confirmed: Cell::new(false),
     });
 
     // First session tab.
@@ -3579,6 +3636,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
                         local: path,
                         remote,
                         excludes: state.exclude_masks(),
+                        overwrite: 0,
                         cancel,
                         pause,
                     });
@@ -3618,7 +3676,39 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     // Save the workspace (open tabs + paths) when the window closes.
     window.connect_close_request(glib::clone!(
         #[strong] state,
-        move |_| {
+        move |win| {
+            // Quit guard: don't silently kill running transfers.
+            let active = state.active_transfers();
+            if active > 0 && !state.quit_confirmed.get() {
+                let msg = if active == 1 {
+                    "1 transfer is still running".to_string()
+                } else {
+                    format!("{active} transfers are still running")
+                };
+                let detail = if active == 1 {
+                    "Quitting now will cancel it."
+                } else {
+                    "Quitting now will cancel them."
+                };
+                let dialog = gtk::AlertDialog::builder()
+                    .message(msg)
+                    .detail(detail)
+                    .buttons(["Keep Transferring", "Quit Anyway"])
+                    .cancel_button(0)
+                    .default_button(0)
+                    .build();
+                dialog.choose(Some(win), gio::Cancellable::NONE, glib::clone!(
+                    #[strong] state,
+                    move |result| {
+                        if result == Ok(1) {
+                            state.cancel_all();
+                            state.quit_confirmed.set(true);
+                            state.window.close();
+                        }
+                    }
+                ));
+                return glib::Propagation::Stop;
+            }
             state.save_workspace();
             glib::Propagation::Proceed
         }

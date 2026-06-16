@@ -384,6 +384,7 @@ pub extern "C" fn scp_download_dir(
     remote: *const c_char,
     local: *const c_char,
     excludes: *const c_char,
+    overwrite_policy: c_int,
     cb: Option<XferCb>,
     user_data: *mut c_void,
 ) -> i64 {
@@ -397,13 +398,15 @@ pub extern "C" fn scp_download_dir(
         return -1;
     };
     let filter = parse_filter(excludes);
+    let policy = crate::ops::OverwritePolicy::from_code(overwrite_policy);
     let user = UserData(user_data);
     let mut adapter = xfer_adapter(cb, &user);
-    match crate::ops::download_dir(
+    match crate::ops::download_dir_opts(
         session.inner.as_mut(),
         remote,
         Path::new(local),
         &filter,
+        policy,
         &mut adapter,
     ) {
         Ok(n) => n as i64,
@@ -421,6 +424,7 @@ pub extern "C" fn scp_upload_dir(
     local: *const c_char,
     remote: *const c_char,
     excludes: *const c_char,
+    overwrite_policy: c_int,
     cb: Option<XferCb>,
     user_data: *mut c_void,
 ) -> i64 {
@@ -434,13 +438,15 @@ pub extern "C" fn scp_upload_dir(
         return -1;
     };
     let filter = parse_filter(excludes);
+    let policy = crate::ops::OverwritePolicy::from_code(overwrite_policy);
     let user = UserData(user_data);
     let mut adapter = xfer_adapter(cb, &user);
-    match crate::ops::upload_dir(
+    match crate::ops::upload_dir_opts(
         session.inner.as_mut(),
         Path::new(local),
         remote,
         &filter,
+        policy,
         &mut adapter,
     ) {
         Ok(n) => n as i64,

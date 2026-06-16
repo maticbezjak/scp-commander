@@ -229,13 +229,14 @@ final class CoreClient: @unchecked Sendable {
     @discardableResult
     func downloadDir(
         remote: String, local: String, excludes: String = "",
+        overwritePolicy: Int32 = 0,
         onEvent: @escaping (Int32, String?, UInt64, UInt64) -> Bool
     ) throws -> Int64 {
         guard let session else { throw CoreError(message: "not connected") }
         let box = XferBox(onEvent)
         let ud = Unmanaged.passRetained(box).toOpaque()
         defer { Unmanaged<XferBox>.fromOpaque(ud).release() }
-        let n = scp_download_dir(session, remote, local, excludes, Self.xferTrampoline, ud)
+        let n = scp_download_dir(session, remote, local, excludes, overwritePolicy, Self.xferTrampoline, ud)
         if n < 0 { throw Self.lastError() }
         return n
     }
@@ -243,13 +244,14 @@ final class CoreClient: @unchecked Sendable {
     @discardableResult
     func uploadDir(
         local: String, remote: String, excludes: String = "",
+        overwritePolicy: Int32 = 0,
         onEvent: @escaping (Int32, String?, UInt64, UInt64) -> Bool
     ) throws -> Int64 {
         guard let session else { throw CoreError(message: "not connected") }
         let box = XferBox(onEvent)
         let ud = Unmanaged.passRetained(box).toOpaque()
         defer { Unmanaged<XferBox>.fromOpaque(ud).release() }
-        let n = scp_upload_dir(session, local, remote, excludes, Self.xferTrampoline, ud)
+        let n = scp_upload_dir(session, local, remote, excludes, overwritePolicy, Self.xferTrampoline, ud)
         if n < 0 { throw Self.lastError() }
         return n
     }

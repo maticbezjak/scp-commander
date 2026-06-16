@@ -958,25 +958,27 @@ final class AppState: ObservableObject {
         }
     }
 
-    func downloadFolder(_ entry: FileEntry) {
+    func downloadFolder(_ entry: FileEntry, policy: Int32 = 0) {
         let session = active
         guard session.connected, entry.isDir else { return }
         runFolderOp(
             on: session,
             name: entry.name, direction: .download,
             remote: pathJoinPosix(session.remotePath, entry.name),
-            local: pathJoin(localPath, entry.name)
+            local: pathJoin(localPath, entry.name),
+            policy: policy
         ) { [weak self] in self?.loadLocal() }
     }
 
-    func uploadFolder(_ entry: FileEntry) {
+    func uploadFolder(_ entry: FileEntry, policy: Int32 = 0) {
         let session = active
         guard session.connected, entry.isDir else { return }
         runFolderOp(
             on: session,
             name: entry.name, direction: .upload,
             remote: pathJoinPosix(session.remotePath, entry.name),
-            local: pathJoin(localPath, entry.name)
+            local: pathJoin(localPath, entry.name),
+            policy: policy
         ) { [weak self] in self?.refreshSession(session) }
     }
 
@@ -1108,6 +1110,7 @@ final class AppState: ObservableObject {
     private func runFolderOp(
         on session: SessionHandle,
         name: String, direction: TransferDirection, remote: String, local: String,
+        policy: Int32 = 0,
         onDone: @escaping () -> Void
     ) {
         let transfer = Transfer(name: "\(name)/", direction: direction)
@@ -1116,7 +1119,7 @@ final class AppState: ObservableObject {
         transfer.retry = { [weak self] in
             self?.runFolderOp(
                 on: session, name: name, direction: direction,
-                remote: remote, local: local, onDone: onDone)
+                remote: remote, local: local, policy: policy, onDone: onDone)
         }
         transfers.add(transfer)
         TransferWindowController.shared.show(queue: transfers, state: self)
@@ -1128,9 +1131,11 @@ final class AppState: ObservableObject {
             let result = Result {
                 direction == .download
                     ? try client.downloadDir(
-                        remote: remote, local: local, excludes: excludes, onEvent: handler)
+                        remote: remote, local: local, excludes: excludes,
+                        overwritePolicy: policy, onEvent: handler)
                     : try client.uploadDir(
-                        local: local, remote: remote, excludes: excludes, onEvent: handler)
+                        local: local, remote: remote, excludes: excludes,
+                        overwritePolicy: policy, onEvent: handler)
             }
             DispatchQueue.main.async {
                 switch result {
@@ -1327,7 +1332,16 @@ final class AppState: ObservableObject {
         for e in entries {
             let conflict: Bool
             if e.isDir {
-                conflict = false
+                // A folder conflicts when the destination already has a folder
+                // of the same name — its contents may collide on merge.
+                if pane == .local {
+                    conflict = active.remoteEntries.contains { $0.isDir && $0.name == e.name }
+                } else {
+                    let local = (localPath as NSString).appendingPathComponent(e.name)
+                    var isDir: ObjCBool = false
+                    conflict = FileManager.default.fileExists(atPath: local, isDirectory: &isDir)
+                        && isDir.boolValue
+                }
             } else if pane == .local {
                 conflict = active.remoteEntries.contains {
                     !$0.isDir && $0.name == e.name && $0.size >= e.size
@@ -1356,8 +1370,17 @@ final class AppState: ObservableObject {
     func resolveOverwrite(_ decision: OverwriteDecision) {
         guard let prompt = overwritePrompt else { return }
         overwritePrompt = nil
-        guard decision != .skip else { return }
+        // Folder transfers get the equivalent per-file policy passed into core.
+        // "Skip existing" still copies *new* files inside a folder, so unlike a
+        // single file we don't drop the whole folder.
+        let folderPolicy: Int32 = decision == .skip ? 1 : (decision == .onlyNewer ? 2 : 0)
         for e in prompt.entries {
+            if e.isDir {
+                if prompt.pane == .local { uploadFolder(e, policy: folderPolicy) }
+                else { downloadFolder(e, policy: folderPolicy) }
+                continue
+            }
+            if decision == .skip { continue }
             if decision == .onlyNewer {
                 let destMtime = destinationInfo(for: e, pane: prompt.pane)?.mtime
                 guard let src = e.mtime, let dest = destMtime, src > dest else { continue }

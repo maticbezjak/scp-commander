@@ -80,11 +80,14 @@ typedef int (*ScpXferCb)(int kind, const char *file, uint64_t done, uint64_t tot
                          void *user_data);
 
 /* Recursive folder transfers. Return total bytes moved, or -1 on error.
- * excludes: ";"-separated WinSCP-style masks ("*.tmp; .git/"); NULL/empty = none. */
+ * excludes: ";"-separated WinSCP-style masks ("*.tmp; .git/"); NULL/empty = none.
+ * overwrite_policy: 0 = overwrite all, 1 = skip existing, 2 = only if newer. */
 int64_t scp_download_dir(ScpSession *session, const char *remote, const char *local,
-                         const char *excludes, ScpXferCb cb, void *user_data);
+                         const char *excludes, int overwrite_policy,
+                         ScpXferCb cb, void *user_data);
 int64_t scp_upload_dir(ScpSession *session, const char *local, const char *remote,
-                       const char *excludes, ScpXferCb cb, void *user_data);
+                       const char *excludes, int overwrite_policy,
+                       ScpXferCb cb, void *user_data);
 
 /* One-way directory sync. direction: 0 = local->remote, 1 = remote->local.
  * delete_extraneous: non-zero enables mirror mode (removes destination items

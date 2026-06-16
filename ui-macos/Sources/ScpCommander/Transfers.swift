@@ -122,6 +122,11 @@ final class TransferQueue: ObservableObject {
         items.insert(transfer, at: 0)
     }
 
+    /// Transfers still running — used by the quit guard and dock badge.
+    var activeCount: Int {
+        items.reduce(0) { $0 + ($1.state == .active ? 1 : 0) }
+    }
+
     func clearFinished() {
         items.removeAll { $0.state != .active }
     }

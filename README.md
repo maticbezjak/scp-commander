@@ -120,8 +120,14 @@ To delete or rename a site, right-click it in the sidebar.
 | Drag and drop | Drag files between the two panes |
 | Move instead of copy | Select → **F6** |
 
-Folders are transferred recursively. If the destination already has a file with
-the same name you'll get an **Overwrite / Skip / Cancel** prompt.
+Folders are transferred recursively. When the destination already has a file —
+or a folder — of the same name, you'll get an **Overwrite / Overwrite only
+newer / Skip existing / Cancel** prompt. For a folder the choice applies to each
+file inside it: *Skip existing* still copies files that are new, *Only newer*
+replaces only files older than the source.
+
+Quitting the app while transfers are still running asks for confirmation first,
+so an in-flight copy is never killed silently.
 
 Transfers run in the background on a dedicated connection — you can keep
 browsing while files copy. Watch progress in the **transfer queue** panel at the
