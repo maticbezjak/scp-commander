@@ -154,6 +154,11 @@ void scp_string_free(char *s);
 char *scp_list_known_hosts(void);
 int scp_remove_known_host(const char *host);
 
+/* Atomic uploads: when enabled (non-zero; the default), fresh uploads write to
+ * a temp name and rename into place so an interrupted transfer never leaves a
+ * truncated file at the real name. Process-global. */
+void scp_set_atomic_uploads(int enabled);
+
 #ifdef __cplusplus
 }
 #endif

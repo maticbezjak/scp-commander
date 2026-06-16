@@ -165,6 +165,36 @@ impl Transport for SftpTransport {
         let mut local_file = File::open(local)?;
         let meta = local_file.metadata().ok();
         let total = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+
+        // Atomic upload: stream into a temp sibling, then swap it into place so
+        // an interrupted transfer can't leave a truncated file at the real name.
+        if crate::atomic_uploads_enabled() {
+            let temp = crate::upload_temp_name(remote);
+            let n = {
+                let mut remote_file = self
+                    .sftp
+                    .create(Path::new(&temp))
+                    .map_err(|e| Error::Protocol(e.to_string()))?;
+                match copy_with_progress(&mut local_file, &mut remote_file, total, progress) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        drop(remote_file);
+                        let _ = self.sftp.unlink(Path::new(&temp));
+                        return Err(e);
+                    }
+                }
+            };
+            // Promote temp -> final. Unlink any existing target first so the
+            // rename succeeds on servers that won't overwrite on rename.
+            let _ = self.sftp.unlink(Path::new(remote));
+            if let Err(e) = self.sftp.rename(Path::new(&temp), Path::new(remote), None) {
+                let _ = self.sftp.unlink(Path::new(&temp));
+                return Err(Error::Protocol(e.to_string()));
+            }
+            self.stamp_remote_mtime(remote, meta.as_ref());
+            return Ok(n);
+        }
+
         let n = {
             let mut remote_file = self
                 .sftp

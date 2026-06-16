@@ -2438,6 +2438,11 @@ impl App {
             .text(prefs::get("exclude_masks").unwrap_or_default())
             .placeholder_text("*.tmp; .git/")
             .build();
+        let atomic_check = gtk::CheckButton::with_label("Upload to temporary file first");
+        atomic_check.set_active(prefs::get_int("atomic_uploads", 1) != 0);
+        atomic_check.set_tooltip_text(Some(
+            "Uploads land under a temp name and rename on success, so an interrupted \
+             transfer never leaves a truncated file."));
 
         let grid = gtk::Grid::builder()
             .row_spacing(8).column_spacing(10)
@@ -2452,6 +2457,7 @@ impl App {
         grid.attach(&ka_spin, 1, 2, 1, 1);
         grid.attach(&label("Default exclude masks:"), 0, 3, 1, 1);
         grid.attach(&masks_entry, 1, 3, 1, 1);
+        grid.attach(&atomic_check, 0, 4, 2, 1);
 
         let hint = Label::builder()
             .label("Connection count applies to sessions opened afterwards.")
@@ -2486,15 +2492,19 @@ impl App {
             #[weak] pool_spin,
             #[weak] ka_spin,
             #[weak] masks_entry,
+            #[weak] atomic_check,
             move |_| {
                 prefs::set("editor", &editor_entry.text());
                 prefs::set("pool_size", &pool_spin.value_as_int().to_string());
                 let ka = ka_spin.value_as_int();
                 prefs::set("keepalive_secs", &ka.to_string());
                 prefs::set("exclude_masks", &masks_entry.text());
+                let atomic = atomic_check.is_active();
+                prefs::set("atomic_uploads", if atomic { "1" } else { "0" });
                 // Apply live where possible.
                 worker::KEEPALIVE_SECS
                     .store(ka.max(5) as u64, std::sync::atomic::Ordering::Relaxed);
+                scp_core::set_atomic_uploads(atomic);
                 state.exclude_entry.set_text(&masks_entry.text());
                 state.set_status("Preferences saved");
                 win.close();
@@ -3573,6 +3583,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     worker::KEEPALIVE_SECS.store(
         prefs::get_int("keepalive_secs", 30).max(5) as u64,
         std::sync::atomic::Ordering::Relaxed);
+    scp_core::set_atomic_uploads(prefs::get_int("atomic_uploads", 1) != 0);
     if let Some(idx) = SPEED_CHOICES.iter().position(|(_, k)| *k == saved_kbs) {
         speed_dd.set_selected(idx as u32);
     }

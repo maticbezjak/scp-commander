@@ -286,6 +286,10 @@ final class AppState: ObservableObject {
     }
 
     init() {
+        // Apply the persisted atomic-uploads preference (core defaults to on).
+        if UserDefaults.standard.object(forKey: "atomicUploads") != nil {
+            scp_set_atomic_uploads(UserDefaults.standard.bool(forKey: "atomicUploads") ? 1 : 0)
+        }
         loadLocal()
         startLocalWatch()
         restoreQueue()

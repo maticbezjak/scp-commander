@@ -1,4 +1,5 @@
 import AppKit
+import CScpCore
 import SwiftUI
 
 /// The standard ⌘, Preferences window: settings that otherwise live in
@@ -8,6 +9,7 @@ struct PreferencesView: View {
     @AppStorage("editorPath") private var editorPath = ""
     @AppStorage("transferPoolSize") private var poolSize = 3
     @AppStorage("keepaliveSeconds") private var keepaliveSeconds = 30
+    @AppStorage("atomicUploads") private var atomicUploads = true
 
     var body: some View {
         Form {
@@ -29,6 +31,10 @@ struct PreferencesView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 TextField("Default exclude masks", text: $state.excludeMasks)
                 Text("e.g. *.tmp; .git/ — skipped during folder transfers and sync.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Upload to temporary file first", isOn: $atomicUploads)
+                    .onChange(of: atomicUploads) { scp_set_atomic_uploads($0 ? 1 : 0) }
+                Text("Uploads land under a temp name and rename on success, so an interrupted transfer never leaves a truncated file.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Connection") {

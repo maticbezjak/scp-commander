@@ -935,6 +935,13 @@ pub extern "C" fn scp_list_known_hosts() -> *mut c_char {
     CString::new(s).map(CString::into_raw).unwrap_or(ptr::null_mut())
 }
 
+/// Enable (non-zero) or disable atomic uploads, where fresh uploads write to a
+/// temp name and rename into place. Process-global; default enabled.
+#[no_mangle]
+pub extern "C" fn scp_set_atomic_uploads(enabled: c_int) {
+    crate::set_atomic_uploads(enabled != 0);
+}
+
 /// Forget a trusted host: remove every entry for `host` from the app store so
 /// the next connection re-prompts. Returns entries removed, or -1 on error.
 #[no_mangle]

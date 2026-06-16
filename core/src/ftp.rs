@@ -180,6 +180,36 @@ impl Transport for FtpTransport {
     fn upload_progress(&mut self, local: &Path, remote: &str, progress: Progress) -> Result<u64> {
         let mut local_file = File::open(local)?;
         let total = local_file.metadata().map(|m| m.len()).unwrap_or(0);
+
+        // Atomic upload: stream to a temp sibling, then swap into place so an
+        // interrupted transfer can't leave a truncated file at the real name.
+        if crate::atomic_uploads_enabled() {
+            let temp = crate::upload_temp_name(remote);
+            return with_conn!(self, c => {
+                let mut stream = c
+                    .put_with_stream(&temp)
+                    .map_err(|e| Error::Protocol(e.to_string()))?;
+                let n = match copy_with_progress(&mut local_file, &mut stream, total, progress) {
+                    Ok(n) => {
+                        c.finalize_put_stream(stream)
+                            .map_err(|e| Error::Protocol(e.to_string()))?;
+                        n
+                    }
+                    Err(e) => {
+                        let _ = c.finalize_put_stream(stream);
+                        let _ = c.rm(&temp);
+                        return Err(e);
+                    }
+                };
+                let _ = c.rm(remote); // ignore "doesn't exist"
+                if let Err(e) = c.rename(temp.as_str(), remote) {
+                    let _ = c.rm(temp.as_str());
+                    return Err(Error::Protocol(e.to_string()));
+                }
+                Ok(n)
+            });
+        }
+
         with_conn!(self, c => {
             let mut stream = c
                 .put_with_stream(remote)
