@@ -893,6 +893,31 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Compare the focused pane against the other and select the entries that
+    /// differ — missing on the other side, or a size/kind mismatch. The result
+    /// is a ready-to-transfer selection (press F5).
+    func selectDifferingFiles() {
+        let mine = focusedVisibleEntries
+        let other = focusedPane == .local ? remoteEntries : localEntries
+        var otherByName: [String: FileEntry] = [:]
+        for e in other { otherByName[e.name] = e }
+        var sel = Set<FileEntry.ID>()
+        for e in mine where e.name != ".." {
+            switch otherByName[e.name] {
+            case .none:
+                sel.insert(e.id) // not present on the other side
+            case .some(let o):
+                if e.isDir != o.isDir || (!e.isDir && e.size != o.size) {
+                    sel.insert(e.id) // kind or size differs
+                }
+            }
+        }
+        if focusedPane == .local { localSelection = sel } else { remoteSelection = sel }
+        status = sel.isEmpty
+            ? "Compare: no differences with the other pane"
+            : "Compare: selected \(sel.count) item(s) that differ"
+    }
+
     func newLocalFolder(named name: String) {
         guard !name.isEmpty else { return }
         do {

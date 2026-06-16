@@ -55,6 +55,9 @@ struct ScpCommanderApp: App {
                     .keyboardShortcut("d", modifiers: [.command, .shift])
                 Button("Invert Selection") { state.invertSelection() }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
+                Divider()
+                Button("Select Files That Differ") { state.selectDifferingFiles() }
+                    .keyboardShortcut("c", modifiers: [.command, .shift])
             }
             CommandMenu("Files") {
                 Button("Transfer (F5)") { state.transferSelected() }

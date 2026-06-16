@@ -170,6 +170,18 @@ Transfers run in the background on a dedicated connection — you can keep
 browsing while files copy. Watch progress in the **transfer queue** panel at the
 bottom; each row has its own **×** cancel button.
 
+Uploads are **atomic** by default — each file lands under a temporary name and
+is renamed into place on success, so an interrupted transfer never leaves a
+truncated file at the real name (toggle in Preferences). When the whole queue
+finishes while the app is in the background, you get a desktop alert, and the
+transfer window shows aggregate progress across all active transfers.
+
+### Compare directories
+
+**Mark → Select Files That Differ** (⇧⌘C on macOS) compares the focused pane
+against the other and selects every entry that is missing on the other side or
+differs in size/kind — press **F5** to transfer exactly those.
+
 ### Multi-select
 
 - **Click** to select one item; **Shift-click** extends the selection;

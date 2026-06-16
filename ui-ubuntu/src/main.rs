@@ -2021,6 +2021,40 @@ impl App {
         }
     }
 
+    /// Compare the focused pane with the other and select the entries that
+    /// differ — missing on the other side, or a size/kind mismatch — so they
+    /// can be transferred with one F5.
+    fn mark_compare(&self) {
+        let local = self.focused_local.get();
+        let (mine, other) = if local {
+            (&self.local, &self.remote)
+        } else {
+            (&self.remote, &self.local)
+        };
+        let mine_entries = mine.entries.borrow().clone();
+        let other_entries = other.entries.borrow().clone();
+        mine.selection.unselect_all();
+        let mut count = 0u32;
+        for (i, e) in mine_entries.iter().enumerate() {
+            if e.name == ".." {
+                continue;
+            }
+            let differ = match other_entries.iter().find(|o| o.name != ".." && o.name == e.name) {
+                None => true,
+                Some(o) => e.is_dir != o.is_dir || (!e.is_dir && e.size != o.size),
+            };
+            if differ {
+                mine.selection.select_item(i as u32, false);
+                count += 1;
+            }
+        }
+        self.set_status(&if count == 0 {
+            "Compare: no differences with the other pane".to_string()
+        } else {
+            format!("Compare: selected {count} item(s) that differ")
+        });
+    }
+
     /// Open an interactive SSH session to the current server in a terminal.
     fn open_terminal(self: &Rc<Self>) {
         let session = self.session();
@@ -3763,6 +3797,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         mark.append(Some("Select All"), Some("win.mark-all"));
         mark.append(Some("Unselect All"), Some("win.mark-none"));
         mark.append(Some("Invert Selection"), Some("win.mark-invert"));
+        mark.append(Some("Select Files That Differ"), Some("win.mark-compare"));
         menubar_model.append_submenu(Some("Mark"), &mark);
 
         let files = gio::Menu::new();
@@ -4058,6 +4093,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         action!("mark-all", st, st.mark_select_all());
         action!("mark-none", st, st.mark_unselect_all());
         action!("mark-invert", st, st.mark_invert());
+        action!("mark-compare", st, st.mark_compare());
 
         // Files (act on the focused pane's selection)
         action!("files-transfer", st, st.transfer_selected());
