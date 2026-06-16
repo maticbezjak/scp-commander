@@ -140,6 +140,9 @@ On macOS it's the standard ⌘, window; on Ubuntu it's under the Login dialog's
   from another app), so you rarely need to refresh manually.
 - Right-click any item for **Copy path**; local items also offer **Reveal in
   Finder** (macOS) / **Show in Files** (Ubuntu).
+- **Synchronized browsing** (Options menu): entering or leaving a folder in one
+  pane mirrors the move in the other pane whenever a folder of the same name
+  exists there — handy for walking parallel local/remote trees.
 
 ### Transferring files
 

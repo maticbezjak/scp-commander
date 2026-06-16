@@ -196,6 +196,8 @@ struct App {
     exclude_entry: GtkEntry,
     show_hidden: Cell<bool>,
     mirror_sync: Cell<bool>,
+    /// Synchronized browsing: mirror folder enter/leave onto the other pane.
+    sync_browse: Cell<bool>,
     focused_local: Cell<bool>,
     // Type-ahead: letters typed within 1s jump to the first matching row.
     type_buf: RefCell<String>,
@@ -418,6 +420,13 @@ impl App {
             self.record_local_history();
             self.local_path.borrow_mut().push(&entry.name);
             self.load_local();
+            // Synchronized browsing: follow into the same-named remote folder.
+            if self.sync_browse.get() && self.session().connected.get()
+                && self.session().cache.borrow().iter().any(|e| e.is_dir && e.name == entry.name)
+            {
+                let path = join_posix(&self.session().remote_path.borrow(), &entry.name);
+                let _ = self.session().cmd.send(Cmd::List { path });
+            }
         } else {
             self.upload(&entry);
         }
@@ -427,6 +436,11 @@ impl App {
         self.record_local_history();
         self.local_path.borrow_mut().pop();
         self.load_local();
+        // Mirror "up" on the remote pane (inline, so it can't loop back here).
+        if self.sync_browse.get() && self.session().connected.get() {
+            let parent = parent_posix(&self.session().remote_path.borrow());
+            let _ = self.session().cmd.send(Cmd::List { path: parent });
+        }
     }
 
     // -- Navigation history (back / forward / home) ---------------------------
@@ -596,6 +610,15 @@ impl App {
         if entry.is_dir {
             let path = join_posix(&self.session().remote_path.borrow(), &entry.name);
             let _ = self.session().cmd.send(Cmd::List { path });
+            // Synchronized browsing: follow into the same-named local folder.
+            if self.sync_browse.get() {
+                let child = self.local_path.borrow().join(&entry.name);
+                if child.is_dir() {
+                    self.record_local_history();
+                    *self.local_path.borrow_mut() = child;
+                    self.load_local();
+                }
+            }
         } else {
             self.download(&entry);
         }
@@ -607,6 +630,12 @@ impl App {
         }
         let parent = parent_posix(&self.session().remote_path.borrow());
         let _ = self.session().cmd.send(Cmd::List { path: parent });
+        // Mirror "up" on the local pane (inline, so it can't loop back here).
+        if self.sync_browse.get() {
+            self.record_local_history();
+            self.local_path.borrow_mut().pop();
+            self.load_local();
+        }
     }
 
     fn refresh_remote(&self) {
@@ -3465,6 +3494,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         let options = gio::Menu::new();
         options.append(Some("Toggle Hidden Files"), Some("win.opt-hidden"));
         options.append(Some("Toggle Mirror Mode"), Some("win.opt-mirror"));
+        options.append(Some("Toggle Synchronized Browsing"), Some("win.opt-syncbrowse"));
         menubar_model.append_submenu(Some("Options"), &options);
 
         menubar_model.append_submenu(Some("Right"), &pane_menu("right"));
@@ -3522,6 +3552,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         exclude_entry,
         show_hidden: Cell::new(false),
         mirror_sync: Cell::new(false),
+        sync_browse: Cell::new(false),
         focused_local: Cell::new(true),
         type_buf: RefCell::new(String::new()),
         type_at: Cell::new(None),
@@ -3748,6 +3779,15 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
             let mirror_check = mirror_check.clone();
             act("opt-mirror", Box::new(move || mirror_check.set_active(!mirror_check.is_active())));
         }
+        action!("opt-syncbrowse", st, {
+            let on = !st.sync_browse.get();
+            st.sync_browse.set(on);
+            st.set_status(if on {
+                "Synchronized browsing on"
+            } else {
+                "Synchronized browsing off"
+            });
+        });
 
         // Help
         {

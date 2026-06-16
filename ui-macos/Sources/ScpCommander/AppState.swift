@@ -106,6 +106,14 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(mirrorSync, forKey: "mirrorSync") }
     }
 
+    /// Synchronized browsing: entering/leaving a folder in one pane mirrors the
+    /// move in the other pane when a folder of the same name exists there.
+    @Published var syncBrowse =
+        UserDefaults.standard.bool(forKey: "syncBrowse")
+    {
+        didSet { UserDefaults.standard.set(syncBrowse, forKey: "syncBrowse") }
+    }
+
     /// Speed limit in KiB/s (0 = unlimited), enforced per connection by the
     /// transfer progress callbacks via `SpeedLimit.shared`.
     @Published var speedLimitKbs: Int =
@@ -661,6 +669,12 @@ final class AppState: ObservableObject {
             recordLocalHistory()
             localPath = pathJoin(localPath, entry.name)
             loadLocal()
+            // Synchronized browsing: follow into the same-named remote folder.
+            if syncBrowse, active.connected,
+                active.remoteEntries.contains(where: { $0.isDir && $0.name == entry.name })
+            {
+                listRemote(pathJoinPosix(remotePath, entry.name))
+            }
         } else {
             upload(entry)
         }
@@ -671,6 +685,9 @@ final class AppState: ObservableObject {
         localPath = (localPath as NSString).deletingLastPathComponent
         if localPath.isEmpty { localPath = "/" }
         loadLocal()
+        if syncBrowse, active.connected, remotePath != "/" {
+            listRemote(parentPosix(remotePath))
+        }
     }
 
     // MARK: - Navigation history
@@ -923,6 +940,18 @@ final class AppState: ObservableObject {
     func openRemote(_ entry: FileEntry) {
         if entry.isDir {
             listRemote(pathJoinPosix(remotePath, entry.name))
+            // Synchronized browsing: follow into the same-named local folder.
+            if syncBrowse {
+                var isDir: ObjCBool = false
+                let child = pathJoin(localPath, entry.name)
+                if FileManager.default.fileExists(atPath: child, isDirectory: &isDir),
+                    isDir.boolValue
+                {
+                    recordLocalHistory()
+                    localPath = child
+                    loadLocal()
+                }
+            }
         } else {
             download(entry)
         }
@@ -930,6 +959,12 @@ final class AppState: ObservableObject {
 
     func remoteUp() {
         listRemote(parentPosix(remotePath))
+        if syncBrowse, localPath != "/" {
+            recordLocalHistory()
+            localPath = (localPath as NSString).deletingLastPathComponent
+            if localPath.isEmpty { localPath = "/" }
+            loadLocal()
+        }
     }
 
     func listRemote(_ path: String) {

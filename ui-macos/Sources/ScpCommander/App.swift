@@ -108,6 +108,7 @@ struct ScpCommanderApp: App {
                 Toggle("Show Hidden Files", isOn: $state.showHidden)
                     .keyboardShortcut(".", modifiers: [.command, .shift])
                 Toggle("Mirror Mode (sync deletes extraneous)", isOn: $state.mirrorSync)
+                Toggle("Synchronized Browsing", isOn: $state.syncBrowse)
             }
             CommandMenu("Right") {
                 paneMenu(.remote)
