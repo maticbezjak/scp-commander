@@ -256,6 +256,7 @@ final class AppState: ObservableObject {
     init() {
         loadLocal()
         startLocalWatch()
+        restoreQueue()
         // NAT keepalive every 30s for every connected tab; a session that
         // died anyway is revived by the core on the next operation.
         keepaliveTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) {
@@ -498,6 +499,93 @@ final class AppState: ObservableObject {
         }
         sortEntries(&entries)
         localEntries = entries
+    }
+
+    // MARK: - Queue persistence (re-offer interrupted transfers next launch)
+
+    /// A transfer that didn't finish, saved so it can be re-offered on relaunch.
+    private struct PendingTransfer: Codable {
+        var direction: String  // "upload" | "download"
+        var isFolder: Bool
+        var name: String
+        var remote: String
+        var local: String
+        var size: UInt64
+    }
+
+    private var queueFileURL: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first ?? FileManager.default.temporaryDirectory
+        let dir = base.appendingPathComponent("ScpCommander", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("queue.json")
+    }
+
+    /// Save every transfer that isn't done (called at quit). An empty queue
+    /// removes the file so we don't re-offer stale work.
+    func persistQueue() {
+        let pending: [PendingTransfer] = transfers.items.compactMap { t in
+            guard t.state != .done else { return nil }
+            let isFolder = t.name.hasSuffix("/")
+            let remote = t.direction == .download ? t.source : t.target
+            let local = t.direction == .download ? t.target : t.source
+            return PendingTransfer(
+                direction: t.direction == .download ? "download" : "upload",
+                isFolder: isFolder,
+                name: isFolder ? String(t.name.dropLast()) : t.name,
+                remote: remote, local: local, size: t.total)
+        }
+        if pending.isEmpty {
+            try? FileManager.default.removeItem(at: queueFileURL)
+        } else if let data = try? JSONEncoder().encode(pending) {
+            try? data.write(to: queueFileURL, options: .atomic)
+        }
+    }
+
+    /// Re-offer last session's unfinished transfers as failed rows with a retry
+    /// that re-runs them against the active (connected) session.
+    func restoreQueue() {
+        guard let data = try? Data(contentsOf: queueFileURL),
+            let pending = try? JSONDecoder().decode([PendingTransfer].self, from: data),
+            !pending.isEmpty
+        else { return }
+        try? FileManager.default.removeItem(at: queueFileURL)  // consumed
+        for p in pending {
+            let dir: TransferDirection = p.direction == "upload" ? .upload : .download
+            let t = Transfer(name: p.isFolder ? "\(p.name)/" : p.name, direction: dir)
+            t.source = dir == .download ? p.remote : p.local
+            t.target = dir == .download ? p.local : p.remote
+            t.total = p.size
+            t.state = .failed("Interrupted last session")
+            t.retry = { [weak self] in self?.rerunPending(p) }
+            transfers.add(t)
+        }
+        status = "\(pending.count) unfinished transfer(s) from last session — open the queue to retry"
+        TransferWindowController.shared.show(queue: transfers, state: self)
+    }
+
+    /// Re-run a persisted transfer by path against the active session.
+    private func rerunPending(_ p: PendingTransfer) {
+        let session = active
+        guard session.connected else {
+            status = "Connect first to retry \(p.name)"
+            return
+        }
+        let dir: TransferDirection = p.direction == "upload" ? .upload : .download
+        if p.isFolder {
+            runFolderOp(
+                on: session, name: p.name, direction: dir, remote: p.remote, local: p.local
+            ) { [weak self] in
+                if dir == .download { self?.loadLocal() } else { self?.refreshSession(session) }
+            }
+        } else {
+            transferFile(
+                on: session, remote: p.remote, local: p.local, name: p.name, size: p.size,
+                direction: dir
+            ) { [weak self] in
+                if dir == .download { self?.loadLocal() } else { self?.refreshSession(session) }
+            }
+        }
     }
 
     // MARK: - Dock badge (active transfer count)

@@ -98,12 +98,29 @@ struct TransferRow {
     cancel: Arc<AtomicBool>,
     pause: Arc<PauseFlag>,
     finished: bool,
+    /// True only on a successful finish — used to persist/re-offer the rest.
+    succeeded: bool,
     files_done: u32,
     download: bool,
+    /// Descriptor for queue persistence: display name (trailing "/" = folder)
+    /// and the source/target paths exactly as shown.
+    name: String,
+    source: String,
+    target: String,
     started: std::time::Instant,
     last_done: u64,
     last_at: Option<std::time::Instant>,
     speed: f64,
+}
+
+/// One unfinished transfer persisted across launches (re-offered as retryable).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct PendingTransfer {
+    download: bool,
+    is_folder: bool,
+    name: String,
+    remote: String,
+    local: String,
 }
 
 struct EditWatch {
@@ -968,8 +985,12 @@ impl App {
                 cancel: cancel.clone(),
                 pause: pause.clone(),
                 finished: false,
+                succeeded: false,
                 files_done: 0,
                 download,
+                name: name.to_string(),
+                source: source.to_string(),
+                target: target.to_string(),
                 started: std::time::Instant::now(),
                 last_done: 0,
                 last_at: None,
@@ -1028,6 +1049,107 @@ impl App {
         self.window.set_title(Some(&title));
     }
 
+    fn queue_file() -> PathBuf {
+        glib::user_config_dir().join("scp-commander").join("queue.json")
+    }
+
+    /// Persist every transfer that didn't succeed (called at quit) so it can be
+    /// re-offered on next launch. An empty set removes the file.
+    fn save_queue(&self) {
+        let pending: Vec<PendingTransfer> = self
+            .transfer_rows
+            .borrow()
+            .values()
+            .filter(|r| !r.succeeded)
+            .map(|r| {
+                let is_folder = r.name.ends_with('/');
+                let (remote, local) = if r.download {
+                    (r.source.clone(), r.target.clone())
+                } else {
+                    (r.target.clone(), r.source.clone())
+                };
+                PendingTransfer {
+                    download: r.download,
+                    is_folder,
+                    name: r.name.trim_end_matches('/').to_string(),
+                    remote,
+                    local,
+                }
+            })
+            .collect();
+        let path = Self::queue_file();
+        if pending.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else if let Ok(data) = serde_json::to_vec_pretty(&pending) {
+            let _ = std::fs::write(&path, data);
+        }
+    }
+
+    /// Re-offer last session's unfinished transfers as failed rows with retry.
+    fn restore_queue(self: &Rc<Self>) {
+        let path = Self::queue_file();
+        let Ok(data) = std::fs::read(&path) else { return };
+        let _ = std::fs::remove_file(&path); // consumed
+        let Ok(pending) = serde_json::from_slice::<Vec<PendingTransfer>>(&data) else { return };
+        if pending.is_empty() {
+            return;
+        }
+        let count = pending.len();
+        for p in pending {
+            let display = if p.is_folder { format!("{}/", p.name) } else { p.name.clone() };
+            let (source, target) = if p.download {
+                (p.remote.clone(), p.local.clone())
+            } else {
+                (p.local.clone(), p.remote.clone())
+            };
+            let (id, _cancel, _pause) = self.add_transfer(&display, p.download, 0, &source, &target);
+            let st = self.clone();
+            self.set_retry(id, Rc::new(move || st.rerun_pending(&p)));
+            self.finish_row(id, "Interrupted last session", false);
+        }
+        self.set_status(&format!(
+            "{count} unfinished transfer(s) from last session — retry from the queue"
+        ));
+        self.transfers_window.present();
+    }
+
+    /// Re-run a persisted transfer by absolute paths against the active session.
+    fn rerun_pending(self: &Rc<Self>, p: &PendingTransfer) {
+        if !self.session().connected.get() {
+            self.set_status(&format!("Connect first to retry {}", p.name));
+            return;
+        }
+        let remote = p.remote.clone();
+        let local = PathBuf::from(&p.local);
+        let (source, target) = if p.download {
+            (p.remote.clone(), p.local.clone())
+        } else {
+            (p.local.clone(), p.remote.clone())
+        };
+        let display = if p.is_folder { format!("{}/", p.name) } else { p.name.clone() };
+        let (id, cancel, pause) = self.add_transfer(&display, p.download, 0, &source, &target);
+        let st = self.clone();
+        let pc = p.clone();
+        self.set_retry(id, Rc::new(move || st.rerun_pending(&pc)));
+        let cmd = match (p.download, p.is_folder) {
+            (true, true) => Cmd::DownloadDir {
+                id, name: p.name.clone(), remote, local,
+                excludes: self.exclude_masks(), overwrite: 0, cancel, pause,
+            },
+            (true, false) => Cmd::Download {
+                id, name: p.name.clone(), remote, local, resume: 0, cancel, pause,
+            },
+            (false, true) => Cmd::UploadDir {
+                id, name: p.name.clone(), local, remote,
+                excludes: self.exclude_masks(), overwrite: 0, cancel, pause,
+            },
+            (false, false) => Cmd::Upload {
+                id, name: p.name.clone(), local, remote, resume: false, cancel, pause,
+            },
+        };
+        let _ = self.session().xfer_pool.send(cmd);
+    }
+
     /// Show a prompt to execute a command on the remote (SFTP only).
     fn menu_exec_command(self: &Rc<Self>) {
         let session = self.session();
@@ -1082,6 +1204,7 @@ impl App {
             row.detail.set_text(&format!(
                 "Time elapsed {}:{:02}:{:02}", el / 3600, (el / 60) % 60, el % 60));
             row.finished = true;
+            row.succeeded = full;
             row.cancel_btn.set_visible(false);
             row.pause_btn.set_visible(false);
             // Failed/cancelled transfers with a retry hook get a retry button.
@@ -3215,6 +3338,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     update_form();
     state.load_local();
     state.refresh_sites_list();
+    state.restore_queue();
 
     // Context menus -------------------------------------------------------------
     setup_context_menu(&state, &local_view, &local_hook, true);
@@ -3792,6 +3916,8 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     window.connect_close_request(glib::clone!(
         #[strong] state,
         move |win| {
+            // Re-offer whatever didn't finish (failed rows too) next launch.
+            state.save_queue();
             // Quit guard: don't silently kill running transfers.
             let active = state.active_transfers();
             if active > 0 && !state.quit_confirmed.get() {

@@ -8,7 +8,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var state: AppState?
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let state, state.transfers.activeCount > 0 else { return .terminateNow }
+        guard let state else { return .terminateNow }
+        // Re-offer whatever didn't finish (failed rows too) on next launch.
+        state.persistQueue()
+        guard state.transfers.activeCount > 0 else { return .terminateNow }
         let n = state.transfers.activeCount
         let alert = NSAlert()
         alert.messageText = n == 1 ? "1 transfer is still running" : "\(n) transfers are still running"

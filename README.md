@@ -143,7 +143,10 @@ file inside it: *Skip existing* still copies files that are new, *Only newer*
 replaces only files older than the source.
 
 Quitting the app while transfers are still running asks for confirmation first,
-so an in-flight copy is never killed silently.
+so an in-flight copy is never killed silently. Transfers that didn't finish are
+remembered and **re-offered in the queue on the next launch** — click their
+retry button (once reconnected) to run them again. While transfers are active
+the count shows on the Dock icon (macOS) / in the window title (Ubuntu).
 
 Transfers run in the background on a dedicated connection — you can keep
 browsing while files copy. Watch progress in the **transfer queue** panel at the
