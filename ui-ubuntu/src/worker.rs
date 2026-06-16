@@ -132,7 +132,9 @@ pub enum Event {
     /// For sync rows, `bytes` is the number of files copied.
     Done { id: u64, name: String, bytes: u64, download: bool },
     Cancelled { id: u64, name: String },
-    Failed { id: u64, message: String },
+    Failed { id: u64, message: String, network: bool },
+    /// A transient failure is being auto-retried (1-based attempt number).
+    Retrying { id: u64, attempt: u32 },
     /// A remote management op (mkdir/delete/rename) finished; refresh.
     OpOk { message: String },
     /// Result of Cmd::SyncPlan.
@@ -362,6 +364,30 @@ fn with_session(
 }
 
 /// Single-file transfer with throttled progress, pause, and cancellation.
+/// A transient network/socket failure worth auto-retrying. Logical protocol
+/// errors (missing file, permission) are not retried.
+fn is_transient(e: &Error) -> bool {
+    matches!(e, Error::Connect(_) | Error::Io(_))
+}
+
+/// Transient failures are retried this many times before reporting Failed.
+const MAX_AUTO_RETRIES: u32 = 3;
+
+/// Sleep for the backoff before retry `attempt` (1-based): 1s, 2s, 4s. Aborts
+/// early if cancelled. Returns false if cancelled during the wait.
+fn backoff_sleep(attempt: u32, cancel: &Arc<AtomicBool>) -> bool {
+    let total_ms = 1000u64 << (attempt - 1);
+    let mut slept = 0;
+    while slept < total_ms {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        slept += 100;
+    }
+    !cancel.load(Ordering::Relaxed)
+}
+
 fn transfer(
     session: &mut Option<Box<dyn Transport>>,
     send: &impl Fn(Event),
@@ -370,29 +396,44 @@ fn transfer(
     cancel: Arc<AtomicBool>,
     pause: Arc<PauseFlag>,
     download: bool,
-    op: impl FnOnce(&mut dyn Transport, scp_core::transport::Progress) -> scp_core::Result<u64>,
+    op: impl Fn(&mut dyn Transport, scp_core::transport::Progress) -> scp_core::Result<u64>,
 ) {
     let Some(t) = session.as_mut() else {
-        send(Event::Failed { id, message: "not connected".into() });
+        send(Event::Failed { id, message: "not connected".into(), network: true });
         return;
     };
-    let mut ui_throttle = Throttle::new();
-    let mut speed_done: u64 = 0;
-    let mut progress = |done: u64, total: u64| -> bool {
-        if cancel.load(Ordering::Relaxed) {
-            return false;
+    let mut attempt = 0u32;
+    loop {
+        let mut ui_throttle = Throttle::new();
+        let mut speed_done: u64 = 0;
+        let mut progress = |done: u64, total: u64| -> bool {
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+            pause.wait_while_paused();
+            throttle(&mut speed_done, done);
+            if ui_throttle.should_send(done, total) {
+                send(Event::Progress { id, done, total });
+            }
+            true
+        };
+        match op(t.as_mut(), &mut progress) {
+            Ok(bytes) => return send(Event::Done { id, name, bytes, download }),
+            Err(Error::Cancelled) => return send(Event::Cancelled { id, name }),
+            Err(e) => {
+                // The AutoReconnect transport revives the session on the next
+                // op, so re-running after a backoff recovers a dropped link.
+                if is_transient(&e) && attempt < MAX_AUTO_RETRIES && !cancel.load(Ordering::Relaxed) {
+                    attempt += 1;
+                    send(Event::Retrying { id, attempt });
+                    if !backoff_sleep(attempt, &cancel) {
+                        return send(Event::Cancelled { id, name });
+                    }
+                    continue;
+                }
+                return send(Event::Failed { id, message: e.to_string(), network: is_transient(&e) });
+            }
         }
-        pause.wait_while_paused();
-        throttle(&mut speed_done, done);
-        if ui_throttle.should_send(done, total) {
-            send(Event::Progress { id, done, total });
-        }
-        true
-    };
-    match op(t.as_mut(), &mut progress) {
-        Ok(bytes) => send(Event::Done { id, name, bytes, download }),
-        Err(Error::Cancelled) => send(Event::Cancelled { id, name }),
-        Err(e) => send(Event::Failed { id, message: e.to_string() }),
     }
 }
 
@@ -405,39 +446,52 @@ fn multi(
     cancel: Arc<AtomicBool>,
     pause: Arc<PauseFlag>,
     download: bool,
-    op: impl FnOnce(&mut dyn Transport, ops::XferCb) -> scp_core::Result<u64>,
+    op: impl Fn(&mut dyn Transport, ops::XferCb) -> scp_core::Result<u64>,
 ) {
     let Some(t) = session.as_mut() else {
-        send(Event::Failed { id, message: "not connected".into() });
+        send(Event::Failed { id, message: "not connected".into(), network: true });
         return;
     };
-    let mut ui_throttle = Throttle::new();
-    let mut speed_done: u64 = 0;
-    let mut cb = |ev: XferEvent| -> bool {
-        if cancel.load(Ordering::Relaxed) {
-            return false;
-        }
-        pause.wait_while_paused();
-        match ev {
-            XferEvent::Start { name, total, .. } => {
-                ui_throttle = Throttle::new();
-                speed_done = 0;
-                send(Event::FileStart { id, file: name.to_string(), total });
+    let mut attempt = 0u32;
+    loop {
+        let mut ui_throttle = Throttle::new();
+        let mut speed_done: u64 = 0;
+        let mut cb = |ev: XferEvent| -> bool {
+            if cancel.load(Ordering::Relaxed) {
+                return false;
             }
-            XferEvent::Bytes { done, total } => {
-                throttle(&mut speed_done, done);
-                if ui_throttle.should_send(done, total) {
-                    send(Event::Progress { id, done, total });
+            pause.wait_while_paused();
+            match ev {
+                XferEvent::Start { name, total, .. } => {
+                    ui_throttle = Throttle::new();
+                    speed_done = 0;
+                    send(Event::FileStart { id, file: name.to_string(), total });
                 }
+                XferEvent::Bytes { done, total } => {
+                    throttle(&mut speed_done, done);
+                    if ui_throttle.should_send(done, total) {
+                        send(Event::Progress { id, done, total });
+                    }
+                }
+                XferEvent::DoneFile => send(Event::FileDone { id }),
             }
-            XferEvent::DoneFile => send(Event::FileDone { id }),
+            true
+        };
+        match op(t.as_mut(), &mut cb) {
+            Ok(bytes) => return send(Event::Done { id, name, bytes, download }),
+            Err(Error::Cancelled) => return send(Event::Cancelled { id, name }),
+            Err(e) => {
+                if is_transient(&e) && attempt < MAX_AUTO_RETRIES && !cancel.load(Ordering::Relaxed) {
+                    attempt += 1;
+                    send(Event::Retrying { id, attempt });
+                    if !backoff_sleep(attempt, &cancel) {
+                        return send(Event::Cancelled { id, name });
+                    }
+                    continue;
+                }
+                return send(Event::Failed { id, message: e.to_string(), network: is_transient(&e) });
+            }
         }
-        true
-    };
-    match op(t.as_mut(), &mut cb) {
-        Ok(bytes) => send(Event::Done { id, name, bytes, download }),
-        Err(Error::Cancelled) => send(Event::Cancelled { id, name }),
-        Err(e) => send(Event::Failed { id, message: e.to_string() }),
     }
 }
 

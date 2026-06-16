@@ -1,4 +1,5 @@
 import AppKit
+import CScpCore
 import Foundation
 import SwiftUI
 
@@ -1014,6 +1015,11 @@ final class AppState: ObservableObject {
 
     // MARK: - Transfers
 
+    /// Transient network failures auto-retry this many times before giving up.
+    static let maxAutoRetries = 3
+    /// Exponential backoff between auto-retries: 1s, 2s, 4s.
+    static func retryDelay(_ attempt: Int) -> Double { Double(1 << attempt) }
+
     /// Download a remote path to a temp file so it can be dragged out to
     /// Finder. Runs on the transfer pool (off the main thread) and returns the
     /// local URL once complete. Folders download recursively.
@@ -1119,45 +1125,70 @@ final class AppState: ObservableObject {
         TransferWindowController.shared.show(queue: transfers, state: self)
         let flag = transfer.cancelFlag
         let pause = transfer.pauseFlag
-        let offset = resumeOffset
 
-        session.transferPool.submit { [weak self] client in
-            var speedDone: UInt64 = offset
-            let progress: (UInt64, UInt64) -> Bool = { done, total in
-                DispatchQueue.main.async { transfer.note(done, total: total) }
-                pause.waitWhilePaused()
-                SpeedLimit.shared.throttle(lastDone: &speedDone, done: done)
-                return !flag.isCancelled
+        // One attempt; on a transient network error it re-submits itself (same
+        // queue row) up to `maxAutoRetries` times with exponential backoff.
+        func attempt(_ tryN: Int) {
+            // Resume from whatever's already local — recomputed each attempt so
+            // a partially-transferred file isn't refetched from scratch.
+            var offset: UInt64 = 0
+            if direction == .download, size > 0,
+                let attrs = try? FileManager.default.attributesOfItem(atPath: local),
+                let existing = (attrs[.size] as? NSNumber)?.uint64Value,
+                existing > 0, existing < size
+            {
+                offset = existing
             }
-            let result = Result {
-                if direction == .download {
-                    if offset > 0 {
-                        return try client.downloadResume(
-                            remote: remote, local: local, offset: offset, onProgress: progress)
+            session.transferPool.submit { [weak self] client in
+                var speedDone: UInt64 = offset
+                let progress: (UInt64, UInt64) -> Bool = { done, total in
+                    DispatchQueue.main.async { transfer.note(done, total: total) }
+                    pause.waitWhilePaused()
+                    SpeedLimit.shared.throttle(lastDone: &speedDone, done: done)
+                    return !flag.isCancelled
+                }
+                let result = Result {
+                    if direction == .download {
+                        if offset > 0 {
+                            return try client.downloadResume(
+                                remote: remote, local: local, offset: offset, onProgress: progress)
+                        }
+                        return try client.download(remote: remote, local: local, onProgress: progress)
                     }
-                    return try client.download(remote: remote, local: local, onProgress: progress)
+                    if resumeUpload {
+                        return try client.uploadResume(
+                            local: local, remote: remote, onProgress: progress)
+                    }
+                    return try client.upload(local: local, remote: remote, onProgress: progress)
                 }
-                if resumeUpload {
-                    return try client.uploadResume(
-                        local: local, remote: remote, onProgress: progress)
-                }
-                return try client.upload(local: local, remote: remote, onProgress: progress)
-            }
-            DispatchQueue.main.async {
-                switch result {
-                case .success:
-                    transfer.state = .done
-                    self?.status = "\(direction == .download ? "Downloaded" : "Uploaded") \(name)"
-                    onDone()
-                case .failure where flag.isCancelled:
-                    transfer.state = .cancelled
-                    self?.status = "Cancelled \(name)"
-                case .failure(let error):
-                    transfer.state = .failed(error.localizedDescription)
-                    self?.status = "Error: \(error.localizedDescription)"
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success:
+                        transfer.state = .done
+                        self?.status = "\(direction == .download ? "Downloaded" : "Uploaded") \(name)"
+                        onDone()
+                    case .failure where flag.isCancelled:
+                        transfer.state = .cancelled
+                        self?.status = "Cancelled \(name)"
+                    case .failure(let error):
+                        let isNetwork = (error as? CoreError)?.code == SCP_ERR_NETWORK
+                        if isNetwork, tryN < Self.maxAutoRetries, !flag.isCancelled {
+                            let next = tryN + 1
+                            self?.status =
+                                "Network error — retrying \(name) (\(next)/\(Self.maxAutoRetries))…"
+                            transfer.note(offset, total: size)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + Self.retryDelay(tryN)) {
+                                if !flag.isCancelled { attempt(next) }
+                            }
+                        } else {
+                            transfer.state = .failed(error.localizedDescription)
+                            self?.status = "Error: \(error.localizedDescription)"
+                        }
+                    }
                 }
             }
         }
+        attempt(0)
     }
 
     func downloadFolder(_ entry: FileEntry, policy: Int32 = 0) {
@@ -1330,33 +1361,46 @@ final class AppState: ObservableObject {
         let flag = transfer.cancelFlag
 
         let excludes = excludeMasks
-        session.transferPool.submit { [weak self] client in
-            let handler = Self.folderEventHandler(transfer: transfer, flag: flag)
-            let result = Result {
-                direction == .download
-                    ? try client.downloadDir(
-                        remote: remote, local: local, excludes: excludes,
-                        overwritePolicy: policy, onEvent: handler)
-                    : try client.uploadDir(
-                        local: local, remote: remote, excludes: excludes,
-                        overwritePolicy: policy, onEvent: handler)
-            }
-            DispatchQueue.main.async {
-                switch result {
-                case .success(let bytes):
-                    transfer.state = .done
-                    transfer.transferred = UInt64(max(0, bytes))
-                    self?.status = "Folder \(name): \(transfer.filesDone) file(s)"
-                    onDone()
-                case .failure where flag.isCancelled:
-                    transfer.state = .cancelled
-                    self?.status = "Cancelled \(name)"
-                case .failure(let error):
-                    transfer.state = .failed(error.localizedDescription)
-                    self?.status = "Error: \(error.localizedDescription)"
+        func attempt(_ tryN: Int) {
+            session.transferPool.submit { [weak self] client in
+                let handler = Self.folderEventHandler(transfer: transfer, flag: flag)
+                let result = Result {
+                    direction == .download
+                        ? try client.downloadDir(
+                            remote: remote, local: local, excludes: excludes,
+                            overwritePolicy: policy, onEvent: handler)
+                        : try client.uploadDir(
+                            local: local, remote: remote, excludes: excludes,
+                            overwritePolicy: policy, onEvent: handler)
+                }
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success(let bytes):
+                        transfer.state = .done
+                        transfer.transferred = UInt64(max(0, bytes))
+                        self?.status = "Folder \(name): \(transfer.filesDone) file(s)"
+                        onDone()
+                    case .failure where flag.isCancelled:
+                        transfer.state = .cancelled
+                        self?.status = "Cancelled \(name)"
+                    case .failure(let error):
+                        let isNetwork = (error as? CoreError)?.code == SCP_ERR_NETWORK
+                        if isNetwork, tryN < Self.maxAutoRetries, !flag.isCancelled {
+                            let next = tryN + 1
+                            self?.status =
+                                "Network error — retrying \(name) (\(next)/\(Self.maxAutoRetries))…"
+                            DispatchQueue.main.asyncAfter(deadline: .now() + Self.retryDelay(tryN)) {
+                                if !flag.isCancelled { attempt(next) }
+                            }
+                        } else {
+                            transfer.state = .failed(error.localizedDescription)
+                            self?.status = "Error: \(error.localizedDescription)"
+                        }
+                    }
                 }
             }
         }
+        attempt(0)
     }
 
     /// Shared multi-file event handler: updates the row, honours cancellation.

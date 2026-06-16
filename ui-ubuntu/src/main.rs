@@ -2536,6 +2536,7 @@ impl App {
                 | Event::FileDone { .. }
                 | Event::Done { .. }
                 | Event::Cancelled { .. }
+                | Event::Retrying { .. }
                 | Event::Failed { .. } => {}
                 Event::Error(m) => {
                     self.set_status(&format!("Transfer error: {m}"));
@@ -2771,7 +2772,15 @@ impl App {
                 self.edit_pending.borrow_mut().remove(&id);
                 self.set_status(&format!("Cancelled {name}"));
             }
-            Event::Failed { id, message } => {
+            Event::Retrying { id, attempt } => {
+                // Transient network error; the worker is re-attempting in place.
+                if let Some(row) = self.transfer_rows.borrow().get(&id) {
+                    row.title.set_text(&format!("Network error — retrying ({attempt}/3)…"));
+                }
+                self.set_status(&format!("Network error — retrying ({attempt}/3)…"));
+            }
+            Event::Failed { id, message, network: _ } => {
+                // The worker already exhausted auto-retries for transient errors.
                 self.finish_row(id, &format!("failed: {message}"), false);
                 self.pending_move.borrow_mut().remove(&id);
                 self.edit_pending.borrow_mut().remove(&id);
