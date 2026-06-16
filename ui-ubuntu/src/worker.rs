@@ -26,6 +26,17 @@ fn keepalive_interval() -> std::time::Duration {
     std::time::Duration::from_secs(KEEPALIVE_SECS.load(Ordering::Relaxed).max(5))
 }
 
+/// Directory order: folders first, then case-insensitive by name. Run on the
+/// worker thread for remote listings so a huge directory never sorts on the UI
+/// thread; reused by the local pane for a consistent order.
+pub fn sort_entries(entries: &mut [Entry]) {
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
 /// Sleep long enough that the bytes since `last_done` match the cap.
 fn throttle(last_done: &mut u64, done: u64) {
     let kbs = SPEED_LIMIT_KBS.load(Ordering::Relaxed);
@@ -164,7 +175,8 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                             session = Some(t);
                         } else {
                             match t.list_dir(&path) {
-                                Ok(entries) => {
+                                Ok(mut entries) => {
+                                    sort_entries(&mut entries);
                                     session = Some(t);
                                     send(Event::Connected { path, entries });
                                 }
@@ -181,7 +193,10 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                 },
                 Cmd::List { path } => {
                     with_session(&mut session, &send, |t| match t.list_dir(&path) {
-                        Ok(entries) => send(Event::Listed { path: path.clone(), entries }),
+                        Ok(mut entries) => {
+                            sort_entries(&mut entries);
+                            send(Event::Listed { path: path.clone(), entries });
+                        }
                         Err(e) => send(Event::Error(format!("list failed: {e}"))),
                     });
                 }

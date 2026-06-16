@@ -375,7 +375,7 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        sort_entries(&mut entries);
+        worker::sort_entries(&mut entries);
         self.local.show(&entries, &path.to_string_lossy(), self.show_hidden.get());
         self.arm_local_monitor(&path);
     }
@@ -2475,8 +2475,8 @@ impl App {
                         hist.1.clear();
                     }
                 }
-                let mut entries = entries;
-                sort_entries(&mut entries);
+                // Entries arrive already sorted from the worker thread
+                // (folders first, then case-insensitive by name).
                 let count = entries.len();
                 *session.remote_path.borrow_mut() = path.clone();
                 *session.cache.borrow_mut() = entries.clone();
@@ -5709,14 +5709,6 @@ fn parse_mode(perms: &str) -> Option<u32> {
         }
     }
     Some(mode)
-}
-
-fn sort_entries(entries: &mut [Entry]) {
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
 }
 
 fn join_posix(base: &str, name: &str) -> String {

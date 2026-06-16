@@ -930,15 +930,24 @@ private struct FilePane: View {
     /// Rendered width of the whole header row — drag clamp + sanity check.
     @State private var headerWidth: CGFloat = 0
 
-    private var sorted: [FileEntry] {
+    /// Memoized sorted/filtered rows. Recomputed only when an input changes
+    /// (see `recomputeDisplay`), never per render — large directories would
+    /// otherwise re-sort on every SwiftUI pass and stutter.
+    @State private var display: [FileEntry] = []
+
+    /// Pure sort+filter, safe to run off the main thread.
+    private static func sortFilter(
+        _ entries: [FileEntry], showHidden: Bool, filter: String,
+        key: SortKey, ascending: Bool
+    ) -> [FileEntry] {
         var v = showHidden ? entries : entries.filter { !$0.name.hasPrefix(".") }
-        if !filterText.isEmpty {
-            v = v.filter { $0.name.localizedCaseInsensitiveContains(filterText) }
+        if !filter.isEmpty {
+            v = v.filter { $0.name.localizedCaseInsensitiveContains(filter) }
         }
         v.sort { a, b in
             if a.isDir != b.isDir { return a.isDir }
             let result: Bool
-            switch sortKey {
+            switch key {
             case .name:
                 result = a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
             case .size:
@@ -955,8 +964,29 @@ private struct FilePane: View {
         return v
     }
 
+    /// Recompute `display` from the current inputs. Big lists sort on a
+    /// background queue so the UI never blocks; small lists stay synchronous
+    /// to avoid a frame of flicker.
+    private func recomputeDisplay() {
+        let input = entries
+        let hidden = showHidden
+        let filter = filterText
+        let key = sortKey
+        let asc = ascending
+        if input.count > 1500 {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = Self.sortFilter(
+                    input, showHidden: hidden, filter: filter, key: key, ascending: asc)
+                DispatchQueue.main.async { self.display = result }
+            }
+        } else {
+            display = Self.sortFilter(
+                input, showHidden: hidden, filter: filter, key: key, ascending: asc)
+        }
+    }
+
     private var selectedEntries: [FileEntry] {
-        sorted.filter { selection.contains($0.id) }
+        display.filter { selection.contains($0.id) }
     }
 
     /// The clicked row plus the rest of the selection when it's part of it.
@@ -972,7 +1002,7 @@ private struct FilePane: View {
             Divider()
             List(selection: $selection) {
                 parentRow
-                ForEach(sorted) { entry in
+                ForEach(display) { entry in
                     row(for: entry)
                 }
             }
@@ -980,11 +1010,17 @@ private struct FilePane: View {
             .background(DoubleClickMonitor {
                 if selection.contains("..") {
                     onUp()
-                } else if let entry = sorted.first(where: { selection.contains($0.id) }) {
+                } else if let entry = display.first(where: { selection.contains($0.id) }) {
                     onOpen(entry)
                 }
             })
             .onChange(of: selection) { _ in onFocus() }
+            .onAppear { recomputeDisplay() }
+            .onChange(of: entries) { _ in recomputeDisplay() }
+            .onChange(of: showHidden) { _ in recomputeDisplay() }
+            .onChange(of: filterText) { _ in recomputeDisplay() }
+            .onChange(of: sortKey) { _ in recomputeDisplay() }
+            .onChange(of: ascending) { _ in recomputeDisplay() }
             .dropDestination(for: DraggedFile.self) { items, _ in
                 for file in items where file.pane != kind { onDrop(file) }
                 return items.contains { $0.pane != kind }
@@ -1008,9 +1044,9 @@ private struct FilePane: View {
         let bytes = sel.filter { !$0.isDir }.reduce(UInt64(0)) { $0 + $1.size }
         return HStack(spacing: 5) {
             if sel.isEmpty {
-                Text("\(sorted.count) item\(sorted.count == 1 ? "" : "s")")
+                Text("\(display.count) item\(display.count == 1 ? "" : "s")")
             } else {
-                Text("\(sel.count) of \(sorted.count) selected")
+                Text("\(sel.count) of \(display.count) selected")
                 if bytes > 0 {
                     Text("·")
                     Text(humanSize(bytes))
