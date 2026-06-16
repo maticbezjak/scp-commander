@@ -11,6 +11,7 @@
 //!   cargo run -p scp-ubuntu
 
 mod pool;
+mod prefs;
 mod secrets;
 mod sites;
 mod worker;
@@ -2318,6 +2319,94 @@ impl App {
         }
     }
 
+    /// WinSCP-style Preferences: settings that don't belong to one session.
+    fn preferences_dialog(self: &Rc<Self>) {
+        let win = gtk::Window::builder()
+            .title("Preferences")
+            .transient_for(&self.login_window)
+            .modal(true)
+            .default_width(460)
+            .build();
+
+        let editor_entry = GtkEntry::builder()
+            .hexpand(true)
+            .text(prefs::get("editor").unwrap_or_default())
+            .placeholder_text("e.g. code, gedit — empty uses the system default")
+            .build();
+        let pool_spin = gtk::SpinButton::with_range(1.0, 8.0, 1.0);
+        pool_spin.set_value(prefs::get_int("pool_size", pool::DEFAULT_POOL_SIZE as i64) as f64);
+        let ka_spin = gtk::SpinButton::with_range(5.0, 300.0, 5.0);
+        ka_spin.set_value(prefs::get_int("keepalive_secs", 30) as f64);
+        let masks_entry = GtkEntry::builder()
+            .hexpand(true)
+            .text(prefs::get("exclude_masks").unwrap_or_default())
+            .placeholder_text("*.tmp; .git/")
+            .build();
+
+        let grid = gtk::Grid::builder()
+            .row_spacing(8).column_spacing(10)
+            .margin_top(14).margin_bottom(8).margin_start(14).margin_end(14)
+            .build();
+        let label = |t: &str| Label::builder().label(t).xalign(0.0).build();
+        grid.attach(&label("Editor command:"), 0, 0, 1, 1);
+        grid.attach(&editor_entry, 1, 0, 1, 1);
+        grid.attach(&label("Parallel connections:"), 0, 1, 1, 1);
+        grid.attach(&pool_spin, 1, 1, 1, 1);
+        grid.attach(&label("Keepalive (seconds):"), 0, 2, 1, 1);
+        grid.attach(&ka_spin, 1, 2, 1, 1);
+        grid.attach(&label("Default exclude masks:"), 0, 3, 1, 1);
+        grid.attach(&masks_entry, 1, 3, 1, 1);
+
+        let hint = Label::builder()
+            .label("Connection count applies to sessions opened afterwards.")
+            .xalign(0.0)
+            .build();
+        hint.add_css_class("caption");
+        hint.add_css_class("dim-label");
+
+        let save = Button::with_label("Save");
+        save.add_css_class("suggested-action");
+        let close = Button::with_label("Close");
+        let btns = GtkBox::builder()
+            .orientation(Orientation::Horizontal).spacing(8).halign(gtk::Align::End)
+            .margin_bottom(12).margin_end(14).margin_top(4)
+            .build();
+        btns.append(&close);
+        btns.append(&save);
+
+        let vbox = GtkBox::builder().orientation(Orientation::Vertical).spacing(4).build();
+        vbox.append(&grid);
+        let hint_box = GtkBox::builder().margin_start(14).margin_end(14).build();
+        hint_box.append(&hint);
+        vbox.append(&hint_box);
+        vbox.append(&btns);
+        win.set_child(Some(&vbox));
+
+        close.connect_clicked(glib::clone!(#[weak] win, move |_| win.close()));
+        save.connect_clicked(glib::clone!(
+            #[strong(rename_to = state)] self,
+            #[weak] win,
+            #[weak] editor_entry,
+            #[weak] pool_spin,
+            #[weak] ka_spin,
+            #[weak] masks_entry,
+            move |_| {
+                prefs::set("editor", &editor_entry.text());
+                prefs::set("pool_size", &pool_spin.value_as_int().to_string());
+                let ka = ka_spin.value_as_int();
+                prefs::set("keepalive_secs", &ka.to_string());
+                prefs::set("exclude_masks", &masks_entry.text());
+                // Apply live where possible.
+                worker::KEEPALIVE_SECS
+                    .store(ka.max(5) as u64, std::sync::atomic::Ordering::Relaxed);
+                state.exclude_entry.set_text(&masks_entry.text());
+                state.set_status("Preferences saved");
+                win.close();
+            }
+        ));
+        win.present();
+    }
+
     fn refresh_sites_list(&self) {
         while let Some(row) = self.sites_list.first_child() {
             self.sites_list.remove(&row);
@@ -2522,10 +2611,20 @@ impl App {
                     let mtime = std::fs::metadata(&local)
                         .and_then(|m| m.modified())
                         .unwrap_or(SystemTime::UNIX_EPOCH);
-                    let uri = format!("file://{}", local.display());
-                    if let Err(e) =
+                    // Use the editor command set in Preferences, else the
+                    // system default app for the file's type.
+                    let opened = if let Some(editor) = prefs::get("editor") {
+                        std::process::Command::new(&editor)
+                            .arg(&local)
+                            .spawn()
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    } else {
+                        let uri = format!("file://{}", local.display());
                         gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>)
-                    {
+                            .map_err(|e| e.to_string())
+                    };
+                    if let Err(e) = opened {
                         self.set_status(&format!("Could not open editor: {e}"));
                     } else {
                         self.set_status(&format!("Editing {name} — saves upload automatically"));
@@ -2664,7 +2763,8 @@ fn create_session(state: &Rc<App>) -> Rc<Session> {
     let (event_tx, event_rx) = async_channel::unbounded::<Event>();
     let cmd = worker::spawn(event_tx);
     let (xfer_tx, xfer_rx) = async_channel::unbounded::<Event>();
-    let xfer_pool = pool::TransferPool::new(xfer_tx);
+    let pool_size = prefs::get_int("pool_size", pool::DEFAULT_POOL_SIZE as i64) as usize;
+    let xfer_pool = pool::TransferPool::new(xfer_tx, pool_size);
     let session = Rc::new(Session {
         cmd,
         xfer_pool,
@@ -2903,6 +3003,10 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         .max_width_chars(22)
         .tooltip_text("Exclusion masks for folder transfers and sync")
         .build();
+    // Pre-fill with the default masks set in Preferences.
+    if let Some(masks) = prefs::get("exclude_masks") {
+        exclude_entry.set_text(&masks);
+    }
     let find_btn = Button::from_icon_name("system-search-symbolic");
     find_btn.set_tooltip_text(Some("Find remote files (mask, e.g. *.log)"));
     let terminal_btn = Button::from_icon_name("utilities-terminal-symbolic");
@@ -3090,6 +3194,10 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     // Restore the persisted cap.
     let saved_kbs = load_column_widths().get("transfer.speed_kbs").copied().unwrap_or(0) as u64;
     worker::SPEED_LIMIT_KBS.store(saved_kbs, std::sync::atomic::Ordering::Relaxed);
+    // Apply the configured keepalive interval to the worker threads.
+    worker::KEEPALIVE_SECS.store(
+        prefs::get_int("keepalive_secs", 30).max(5) as u64,
+        std::sync::atomic::Ordering::Relaxed);
     if let Some(idx) = SPEED_CHOICES.iter().position(|(_, k)| *k == saved_kbs) {
         speed_dd.set_selected(idx as u32);
     }
@@ -3162,7 +3270,9 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     winscp_btn.add_css_class("flat");
     let sshcfg_btn = Button::with_label("Import from ~/.ssh/config");
     sshcfg_btn.add_css_class("flat");
-    for b in [&import_btn, &winscp_btn, &sshcfg_btn, &export_btn] {
+    let prefs_btn = Button::with_label("Preferences…");
+    prefs_btn.add_css_class("flat");
+    for b in [&import_btn, &winscp_btn, &sshcfg_btn, &export_btn, &prefs_btn] {
         if let Some(child) = b.child().and_downcast::<Label>() {
             child.set_xalign(0.0);
         }
@@ -3387,6 +3497,14 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         move |_| {
             tools_popover.popdown();
             state.import_ssh_config();
+        }
+    ));
+    prefs_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        #[strong] tools_popover,
+        move |_| {
+            tools_popover.popdown();
+            state.preferences_dialog();
         }
     ));
     sync_up_btn.connect_clicked(glib::clone!(

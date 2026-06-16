@@ -109,6 +109,20 @@ don't retype them:
 - **Import / Export sites** — move sites between machines via a shared JSON
   file (passwords stay in the system keychain, never in the file).
 
+### Preferences
+
+A Preferences window collects the cross-session settings in one place:
+
+- **Editor** — the app/command used for *Edit* on remote files (empty = the
+  system default for each file type).
+- **Parallel connections** — how many simultaneous transfer connections each
+  session opens (1–8; applies to sessions connected afterwards).
+- **Keepalive interval** — how often idle sessions send a NAT keepalive.
+- **Default exclude masks** — masks pre-filled for folder transfers and sync.
+
+On macOS it's the standard ⌘, window; on Ubuntu it's under the Login dialog's
+**Tools** menu.
+
 ### Browsing
 
 - The **left pane** always shows your local filesystem; the **right pane** shows

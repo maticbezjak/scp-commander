@@ -17,6 +17,15 @@ use std::thread;
 /// throughput can reach 3× this value when transfers run in parallel.
 pub static SPEED_LIMIT_KBS: AtomicU64 = AtomicU64::new(0);
 
+/// Idle keepalive interval in seconds (NAT/dead-session probe). Configurable
+/// in Preferences; read by every worker's receive loop. Clamped to ≥ 5s.
+pub static KEEPALIVE_SECS: AtomicU64 = AtomicU64::new(30);
+
+/// Current keepalive interval, never below 5s.
+fn keepalive_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(KEEPALIVE_SECS.load(Ordering::Relaxed).max(5))
+}
+
 /// Sleep long enough that the bytes since `last_done` match the cap.
 fn throttle(last_done: &mut u64, done: u64) {
     let kbs = SPEED_LIMIT_KBS.load(Ordering::Relaxed);
@@ -135,10 +144,10 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
         };
 
         loop {
-            // Idle keepalive: ping every 30s so NAT mappings stay warm and a
+            // Idle keepalive: ping periodically so NAT mappings stay warm and a
             // dead session is detected (the AutoReconnect wrapper revives it
-            // on the next real operation).
-            let cmd = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            // on the next real operation). Interval is configurable.
+            let cmd = match rx.recv_timeout(keepalive_interval()) {
                 Ok(cmd) => cmd,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Some(t) = session.as_mut() {
@@ -474,7 +483,7 @@ fn pool_run(rx: mpsc::Receiver<Cmd>, events: async_channel::Sender<Event>) {
     }
 
     loop {
-        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        match rx.recv_timeout(keepalive_interval()) {
             Ok(cmd) => match cmd {
                 Cmd::Connect { creds: c, .. } => {
                     // Silent connect — no Event::Connected; failures retried on first use.

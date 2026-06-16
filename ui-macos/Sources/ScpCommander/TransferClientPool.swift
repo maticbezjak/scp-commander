@@ -4,7 +4,12 @@ import Foundation
 /// Each slot has its own `CoreClient` and serial `DispatchQueue` so transfers
 /// can run concurrently without contending on a single connection.
 final class TransferClientPool {
-    static let size = 3
+    /// Parallel connections per session, configurable in Preferences
+    /// (clamped 1…8; read when a pool is created, i.e. at connect time).
+    static var size: Int {
+        let v = UserDefaults.standard.integer(forKey: "transferPoolSize")
+        return v == 0 ? 3 : min(8, max(1, v))
+    }
 
     private struct Slot {
         let client: CoreClient

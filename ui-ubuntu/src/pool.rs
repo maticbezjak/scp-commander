@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use crate::worker::{self, Cmd, Event};
 use scp_core::types::Credentials;
 
-const POOL_SIZE: usize = 3;
+pub const DEFAULT_POOL_SIZE: usize = 3;
 
 /// Round-robin pool of N persistent transfer worker threads.
 /// Each worker has its own TCP connection; files are dispatched to whichever
@@ -16,8 +16,9 @@ pub struct TransferPool {
 }
 
 impl TransferPool {
-    pub fn new(events: async_channel::Sender<Event>) -> Self {
-        let txs = worker::spawn_pool(POOL_SIZE, events);
+    /// `size` is the number of parallel connections (clamped 1…8).
+    pub fn new(events: async_channel::Sender<Event>, size: usize) -> Self {
+        let txs = worker::spawn_pool(size.clamp(1, 8), events);
         Self { txs, next: Arc::new(AtomicUsize::new(0)) }
     }
 

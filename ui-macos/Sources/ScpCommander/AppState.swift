@@ -257,17 +257,7 @@ final class AppState: ObservableObject {
         loadLocal()
         startLocalWatch()
         restoreQueue()
-        // NAT keepalive every 30s for every connected tab; a session that
-        // died anyway is revived by the core on the next operation.
-        keepaliveTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) {
-            [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                for session in self.sessions where session.connected {
-                    session.queue.async { [client = session.client] in client.keepalive() }
-                }
-            }
-        }
+        restartKeepalive()
         // Save the workspace on quit; restore last session's tab on launch.
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
@@ -277,6 +267,24 @@ final class AppState: ObservableObject {
         AppStateRegistry.shared = self
         if restoreWorkspace() {
             showLogin = false
+        }
+    }
+
+    /// (Re)start the NAT keepalive timer using the configured interval. A
+    /// session that died anyway is revived by the core on the next operation.
+    func restartKeepalive() {
+        keepaliveTimer?.invalidate()
+        let stored = UserDefaults.standard.integer(forKey: "keepaliveSeconds")
+        let interval = stored == 0 ? 30 : min(300, max(10, stored))
+        keepaliveTimer = Timer.scheduledTimer(
+            withTimeInterval: TimeInterval(interval), repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                for session in self.sessions where session.connected {
+                    session.queue.async { [client = session.client] in client.keepalive() }
+                }
+            }
         }
     }
 
@@ -1423,7 +1431,16 @@ final class AppState: ObservableObject {
                     as? Date) ?? Date()
             self.edits.append(
                 EditSession(remote: remote, local: local, lastModified: mtime, session: session))
-            NSWorkspace.shared.open(local)
+            // Open in the configured editor app if set, else the system default.
+            let editor = UserDefaults.standard.string(forKey: "editorPath") ?? ""
+            if !editor.isEmpty, FileManager.default.fileExists(atPath: editor) {
+                let cfg = NSWorkspace.OpenConfiguration()
+                NSWorkspace.shared.open(
+                    [local], withApplicationAt: URL(fileURLWithPath: editor),
+                    configuration: cfg)
+            } else {
+                NSWorkspace.shared.open(local)
+            }
             self.status = "Editing \(entry.name) — saves upload automatically"
             self.startEditTimerIfNeeded()
         }

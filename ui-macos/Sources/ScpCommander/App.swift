@@ -119,6 +119,9 @@ struct ScpCommanderApp: App {
                 .keyboardShortcut("/", modifiers: [.command, .shift])
             }
         }
+        Settings {
+            PreferencesView().environmentObject(state)
+        }
     }
 
     /// Shared Left/Right pane menu: navigation commands for one pane.
