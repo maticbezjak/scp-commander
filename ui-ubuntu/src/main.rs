@@ -249,12 +249,7 @@ impl App {
         let path = session.remote_path.borrow().clone();
         let cache = session.cache.borrow().clone();
         self.remote.show(&cache, &path, self.show_hidden.get());
-        let title = session.title.borrow().clone();
-        self.window.set_title(Some(&if session.connected.get() {
-            format!("{title} — SCP Commander")
-        } else {
-            "SCP Commander".to_string()
-        }));
+        self.update_transfer_title();
         self.refresh_tabs();
     }
 
@@ -981,6 +976,7 @@ impl App {
                 speed: 0.0,
             },
         );
+        self.update_transfer_title();
         (id, cancel, pause)
     }
 
@@ -1011,6 +1007,25 @@ impl App {
     /// Transfers still running — used by the quit guard.
     fn active_transfers(&self) -> usize {
         self.transfer_rows.borrow().values().filter(|r| !r.finished).count()
+    }
+
+    /// The plain window title for the active session (no transfer indicator).
+    fn base_title(&self) -> String {
+        let s = self.session();
+        if s.connected.get() {
+            format!("{} — SCP Commander", s.title.borrow())
+        } else {
+            "SCP Commander".to_string()
+        }
+    }
+
+    /// Reflect running transfers in the window title (and thus the taskbar /
+    /// window list) — GTK has no portable Unity launcher badge.
+    fn update_transfer_title(&self) {
+        let n = self.active_transfers();
+        let base = self.base_title();
+        let title = if n > 0 { format!("[⇅ {n}] {base}") } else { base };
+        self.window.set_title(Some(&title));
     }
 
     /// Show a prompt to execute a command on the remote (SFTP only).
@@ -1075,6 +1090,7 @@ impl App {
             }
             row.pause.resume(); // unblock worker if it was paused
         }
+        self.update_transfer_title();
     }
 
     /// Attach a retry closure to a transfer row (shows the ↻ button on failure).
@@ -2285,10 +2301,7 @@ impl App {
                     self.set_status(&format!("{path} ({count} items)"));
                     if first_connect || self.login_window.is_visible() {
                         self.login_window.set_visible(false);
-                        self.window.set_title(Some(&format!(
-                            "{} — SCP Commander",
-                            session.title.borrow()
-                        )));
+                        self.update_transfer_title();
                     }
                 }
             }

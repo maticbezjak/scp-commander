@@ -500,6 +500,33 @@ final class AppState: ObservableObject {
         localEntries = entries
     }
 
+    // MARK: - Dock badge (active transfer count)
+
+    private var dockBadgeTimer: Timer?
+
+    /// Show the number of running transfers on the Dock icon while any are
+    /// active; a self-cancelling poll keeps it current as transfers finish.
+    func startDockBadge() {
+        updateDockBadge()
+        guard dockBadgeTimer == nil else { return }
+        dockBadgeTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) {
+            [weak self] timer in
+            Task { @MainActor in
+                guard let self else { timer.invalidate(); return }
+                self.updateDockBadge()
+                if self.transfers.activeCount == 0 {
+                    timer.invalidate()
+                    self.dockBadgeTimer = nil
+                }
+            }
+        }
+    }
+
+    private func updateDockBadge() {
+        let n = transfers.activeCount
+        NSApp.dockTile.badgeLabel = n > 0 ? String(n) : nil
+    }
+
     // MARK: - Local directory auto-refresh (FSEvents-style vnode watch)
 
     private var localWatchSource: DispatchSourceFileSystemObject?
@@ -964,6 +991,7 @@ final class AppState: ObservableObject {
                 direction: direction, resumeUpload: resumeUpload, onDone: onDone)
         }
         transfers.add(transfer)
+        startDockBadge()
         TransferWindowController.shared.show(queue: transfers, state: self)
         let flag = transfer.cancelFlag
         let pause = transfer.pauseFlag
@@ -1126,6 +1154,7 @@ final class AppState: ObservableObject {
         let title = download ? "Sync ⬇ \(remote)" : "Sync ⬆ \(remote)"
         let transfer = Transfer(name: title, direction: download ? .download : .upload)
         transfers.add(transfer)
+        startDockBadge()
         TransferWindowController.shared.show(queue: transfers, state: self)
         let flag = transfer.cancelFlag
 
@@ -1172,6 +1201,7 @@ final class AppState: ObservableObject {
                 remote: remote, local: local, policy: policy, onDone: onDone)
         }
         transfers.add(transfer)
+        startDockBadge()
         TransferWindowController.shared.show(queue: transfers, state: self)
         let flag = transfer.cancelFlag
 
