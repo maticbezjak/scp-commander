@@ -110,6 +110,12 @@ To delete or rename a site, right-click it in the sidebar.
   to jump directly.
 - Toggle **show hidden files** with the eye-icon button (macOS toolbar) or the
   reveal button (Ubuntu toolbar).
+- A **status line** under each pane shows the item count, or the number and
+  total size of the current selection.
+- The **local pane refreshes itself** when files change on disk (e.g. a download
+  from another app), so you rarely need to refresh manually.
+- Right-click any item for **Copy path**; local items also offer **Reveal in
+  Finder** (macOS) / **Show in Files** (Ubuntu).
 
 ### Transferring files
 

@@ -19,7 +19,7 @@ mod workspace;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::SystemTime;
@@ -77,6 +77,8 @@ struct Pane {
     selection: MultiSelection,
     entries: Rc<RefCell<Vec<Entry>>>,
     path_entry: GtkEntry,
+    /// WinSCP-style status line: item count, or size of the selection.
+    info_label: Label,
 }
 
 struct TransferRow {
@@ -206,6 +208,13 @@ struct App {
     /// Set once the user confirms "Quit Anyway" so the close handler stops
     /// re-prompting and lets the window actually close.
     quit_confirmed: Cell<bool>,
+    /// Watches the current local directory so externally-changed files refresh
+    /// automatically; re-armed by `load_local` for the displayed directory.
+    local_monitor: RefCell<Option<gio::FileMonitor>>,
+    local_reload_pending: Cell<bool>,
+    /// Weak self, set once after construction, so `&self` methods can hand an
+    /// owned handle to async callbacks (the local monitor).
+    me: RefCell<Weak<App>>,
 }
 
 impl App {
@@ -355,6 +364,38 @@ impl App {
             .unwrap_or_default();
         sort_entries(&mut entries);
         self.local.show(&entries, &path.to_string_lossy(), self.show_hidden.get());
+        self.arm_local_monitor(&path);
+    }
+
+    /// (Re)watch `path` so files created/removed by other apps refresh the
+    /// local pane automatically. Bursts are debounced into one reload.
+    fn arm_local_monitor(&self, path: &Path) {
+        let file = gio::File::for_path(path);
+        let monitor = match file.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE) {
+            Ok(m) => m,
+            Err(_) => {
+                *self.local_monitor.borrow_mut() = None;
+                return;
+            }
+        };
+        let me = self.me.borrow().clone();
+        monitor.connect_changed(move |_, _, _, _| {
+            let Some(state) = me.upgrade() else { return };
+            if state.local_reload_pending.replace(true) {
+                return; // a reload is already scheduled
+            }
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(300),
+                glib::clone!(
+                    #[strong] state,
+                    move || {
+                        state.local_reload_pending.set(false);
+                        state.load_local();
+                    }
+                ),
+            );
+        });
+        *self.local_monitor.borrow_mut() = Some(monitor);
     }
 
     fn open_local(self: &Rc<Self>, index: u32) {
@@ -1772,6 +1813,33 @@ impl App {
         }
     }
 
+    /// Copy the selected item's full path (local filesystem or remote POSIX).
+    fn menu_copy_path(self: &Rc<Self>, local_pane: bool) {
+        let Some(entry) = self.menu_entry(local_pane) else { return };
+        let path = if local_pane {
+            self.local_path.borrow().join(&entry.name).display().to_string()
+        } else {
+            join_posix(&self.session().remote_path.borrow(), &entry.name)
+        };
+        if let Some(display) = gdk::Display::default() {
+            display.clipboard().set_text(&path);
+            self.set_status(&format!("Copied {path}"));
+        }
+    }
+
+    /// Open the system file manager with the selected local item highlighted.
+    fn menu_show_in_files(self: &Rc<Self>) {
+        let Some(entry) = self.menu_entry(true) else { return };
+        let path = self.local_path.borrow().join(&entry.name);
+        let file = gio::File::for_path(&path);
+        let launcher = gtk::FileLauncher::new(Some(&file));
+        launcher.open_containing_folder(
+            Some(&self.window),
+            gio::Cancellable::NONE,
+            |_| {},
+        );
+    }
+
     /// Persist the open tabs (settings + paths) for the next launch.
     fn save_workspace(&self) {
         let mut ws = workspace::Workspace::default();
@@ -3098,7 +3166,12 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         sites_list,
         log_buf: RefCell::new(Vec::new()),
         quit_confirmed: Cell::new(false),
+        local_monitor: RefCell::new(None),
+        local_reload_pending: Cell::new(false),
+        me: RefCell::new(Weak::new()),
     });
+    // Stash a weak self so &self methods can hand owned handles to callbacks.
+    *state.me.borrow_mut() = Rc::downgrade(&state);
 
     // First session tab.
     let first = create_session(&state);
@@ -4335,6 +4408,26 @@ fn make_pane(
 
     let scroller = ScrolledWindow::builder().vexpand(true).child(&view).build();
 
+    // WinSCP-style status line under the list: item count or selection size.
+    let info_label = Label::builder().xalign(0.0).label("0 items").build();
+    info_label.add_css_class("caption");
+    info_label.add_css_class("dim-label");
+    info_label.set_margin_start(6);
+    info_label.set_margin_top(2);
+    info_label.set_margin_bottom(2);
+    info_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+
+    selection.connect_selection_changed(glib::clone!(
+        #[weak] model,
+        #[weak] info_label,
+        move |sel, _, _| info_label.set_text(&pane_summary(sel, &model)),
+    ));
+    model.connect_items_changed(glib::clone!(
+        #[weak] selection,
+        #[weak] info_label,
+        move |model, _, _, _| info_label.set_text(&pane_summary(&selection, model)),
+    ));
+
     let pane_box = GtkBox::builder()
         .orientation(Orientation::Vertical)
         .spacing(0)
@@ -4342,14 +4435,43 @@ fn make_pane(
     pane_box.append(&header);
     pane_box.append(&addr_bar);
     pane_box.append(&scroller);
+    pane_box.append(&info_label);
 
     let pane = Pane {
         model,
         selection,
         entries: Rc::new(RefCell::new(Vec::new())),
         path_entry,
+        info_label,
     };
     (pane_box, pane, view, header)
+}
+
+/// Status-line text: total item count, or the count + total size of the
+/// current selection.
+fn pane_summary(selection: &MultiSelection, model: &gio::ListStore) -> String {
+    use gtk::prelude::SelectionModelExt;
+    let total = model.n_items();
+    let bits = selection.selection();
+    let n_sel = bits.size();
+    if n_sel == 0 {
+        return format!("{total} item{}", if total == 1 { "" } else { "s" });
+    }
+    let mut bytes = 0u64;
+    for i in 0..n_sel as u32 {
+        let pos = bits.nth(i);
+        if let Some(obj) = model.item(pos).and_downcast::<glib::BoxedAnyObject>() {
+            let entry = obj.borrow::<Entry>();
+            if !entry.is_dir {
+                bytes += entry.size;
+            }
+        }
+    }
+    if bytes > 0 {
+        format!("{n_sel} of {total} selected · {}", human_size(bytes))
+    } else {
+        format!("{n_sel} of {total} selected")
+    }
 }
 
 /// Wire a pane's right-click context menu: a Popover of action buttons
@@ -4405,6 +4527,14 @@ fn setup_context_menu(state: &Rc<App>, view: &ColumnView, hook: &MenuHook, local
         add_item("Execute command…", false, Box::new(move || s.menu_exec_command()));
         let s = state.clone();
         add_item("Copy URL", false, Box::new(move || s.copy_remote_url()));
+    }
+    {
+        let s = state.clone();
+        add_item("Copy path", false, Box::new(move || s.menu_copy_path(local_pane)));
+    }
+    if local_pane {
+        let s = state.clone();
+        add_item("Show in Files", false, Box::new(move || s.menu_show_in_files()));
     }
     {
         let s = state.clone();

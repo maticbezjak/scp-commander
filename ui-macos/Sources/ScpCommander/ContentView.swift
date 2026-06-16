@@ -993,10 +993,35 @@ private struct FilePane: View {
                 onExternalDrop(urls)
                 return true
             }
+            Divider()
+            selectionFooter
         }
         .frame(minWidth: 380)
         .contentShape(Rectangle())
         .onTapGesture { onFocus() }
+    }
+
+    /// WinSCP-style status line: total items, or the size of the selection.
+    private var selectionFooter: some View {
+        let sel = selectedEntries
+        let bytes = sel.filter { !$0.isDir }.reduce(UInt64(0)) { $0 + $1.size }
+        return HStack(spacing: 5) {
+            if sel.isEmpty {
+                Text("\(sorted.count) item\(sorted.count == 1 ? "" : "s")")
+            } else {
+                Text("\(sel.count) of \(sorted.count) selected")
+                if bytes > 0 {
+                    Text("·")
+                    Text(humanSize(bytes))
+                }
+            }
+            Spacer()
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
     }
 
     /// WinSCP-style per-pane header: title + nav buttons, then address bar.
@@ -1393,6 +1418,21 @@ private struct FilePane: View {
             }
             if let onExec {
                 Button("Execute command…") { onExec(entry) }
+            }
+            Divider()
+            Button("Copy Path") {
+                let sep = path.hasSuffix("/") ? "" : "/"
+                let full = "\(path)\(sep)\(entry.name)"
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(full, forType: .string)
+            }
+            if kind == "local" {
+                Button("Reveal in Finder") {
+                    let sep = path.hasSuffix("/") ? "" : "/"
+                    let full = "\(path)\(sep)\(entry.name)"
+                    NSWorkspace.shared.activateFileViewerSelecting(
+                        [URL(fileURLWithPath: full)])
+                }
             }
             Divider()
             Button("Rename…") { onRename(entry) }

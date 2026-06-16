@@ -48,7 +48,9 @@ final class AppState: ObservableObject {
     @Published private(set) var activeTab = 0
 
     // Active tab's view of the panes
-    @Published var localPath = FileManager.default.homeDirectoryForCurrentUser.path
+    @Published var localPath = FileManager.default.homeDirectoryForCurrentUser.path {
+        didSet { if localPath != oldValue { startLocalWatch() } }
+    }
     @Published var localEntries: [FileEntry] = []
     @Published var remotePath = "/"
     @Published var remoteEntries: [FileEntry] = []
@@ -253,6 +255,7 @@ final class AppState: ObservableObject {
 
     init() {
         loadLocal()
+        startLocalWatch()
         // NAT keepalive every 30s for every connected tab; a session that
         // died anyway is revived by the core on the next operation.
         keepaliveTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) {
@@ -480,6 +483,38 @@ final class AppState: ObservableObject {
         }
         sortEntries(&entries)
         localEntries = entries
+    }
+
+    // MARK: - Local directory auto-refresh (FSEvents-style vnode watch)
+
+    private var localWatchSource: DispatchSourceFileSystemObject?
+    private var localReloadWork: DispatchWorkItem?
+
+    /// Watch the current local directory so externally-created/-deleted files
+    /// show up without a manual refresh. Re-armed whenever `localPath` changes.
+    func startLocalWatch() {
+        localWatchSource?.cancel()
+        localWatchSource = nil
+        let fd = open(localPath, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .delete, .rename, .extend, .link],
+            queue: DispatchQueue.global(qos: .utility))
+        src.setEventHandler {
+            Task { @MainActor [weak self] in self?.scheduleLocalReload() }
+        }
+        src.setCancelHandler { close(fd) }
+        localWatchSource = src
+        src.resume()
+    }
+
+    /// Debounce bursts of filesystem events into a single reload.
+    private func scheduleLocalReload() {
+        localReloadWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.loadLocal() }
+        localReloadWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 
     func openLocal(_ entry: FileEntry) {
