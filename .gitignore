@@ -7,6 +7,9 @@ ui-macos/.build/
 ui-macos/.swiftpm/
 *.xcodeproj
 
+# Local dev .app bundle (regenerate with scripts/package-macos.sh)
+ui-macos/ScpCommander.app/
+
 # macOS
 .DS_Store
 dist/

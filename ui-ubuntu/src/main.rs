@@ -3430,7 +3430,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         view.add_controller(focus_click);
     }
 
-    // Keyboard commander: F5 copy, F6 move, F2 rename, Del, Backspace, Tab.
+    // Keyboard commander: F5 copy, F6 move, F2 rename, F3 view, Del, Backspace, Tab.
     let local_view_for_keys = local_view.clone();
     let remote_view_for_keys = remote_view.clone();
     let keys = gtk::EventControllerKey::new();
@@ -3458,6 +3458,12 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
                 gdk::Key::F2 => {
                     if state.select_for_menu(local) {
                         state.menu_rename(local);
+                    }
+                    glib::Propagation::Stop
+                }
+                gdk::Key::F3 => {
+                    if state.select_for_menu(local) {
+                        state.menu_view(local);
                     }
                     glib::Propagation::Stop
                 }
@@ -4294,7 +4300,7 @@ fn setup_context_menu(state: &Rc<App>, view: &ColumnView, hook: &MenuHook, local
     }
     {
         let s = state.clone();
-        add_item("View", false, Box::new(move || s.menu_view(local_pane)));
+        add_item("View (F3)", false, Box::new(move || s.menu_view(local_pane)));
     }
     if !local_pane {
         let s = state.clone();

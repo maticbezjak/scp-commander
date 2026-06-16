@@ -74,6 +74,108 @@ Both apps (SwiftUI + GTK4) have:
 The core's multi-file ops (recursive transfers, sync, recursive delete) are
 unit-tested against an in-memory fake transport (`cargo test -p scp-core`).
 
+## Using the app
+
+### Connecting
+
+1. Launch the app — the **Login dialog** opens automatically.
+2. Choose a **protocol** (SFTP · FTP · FTPS · S3) and fill in the host, port,
+   and credentials.
+   - SFTP supports **password**, **private key file**, or **ssh-agent** auth
+     (pick from the Authentication drop-down).
+   - S3: leave the host blank for AWS, or enter a custom endpoint (e.g. MinIO).
+3. Tick **Remember password** to store the password securely (macOS Keychain /
+   GNOME Keyring). Next time you type the same host + user, the password fills
+   in automatically.
+4. Click **Login** (or press Enter).  
+   If the server's host key is new, a fingerprint prompt appears — review it and
+   click **Trust & Connect** to accept.
+
+### Saving sites
+
+Click **Save site…** in the Login dialog to bookmark the current credentials
+under a name (optionally in a `Folder/Name` group). Saved sites appear in the
+left sidebar; double-click one to connect instantly.
+
+To delete or rename a site, right-click it in the sidebar.
+
+### Browsing
+
+- The **left pane** always shows your local filesystem; the **right pane** shows
+  the remote server.
+- Click a column header (**Name / Size / Type / Changed / Rights**) to sort.
+- Double-click a **folder** to enter it; double-click the **`..`** row at the
+  top (or press **Backspace**) to go up one level.
+- The **path bar** below the toolbar is editable — type a path and press Enter
+  to jump directly.
+- Toggle **show hidden files** with the eye-icon button (macOS toolbar) or the
+  reveal button (Ubuntu toolbar).
+
+### Transferring files
+
+| Action | How |
+|---|---|
+| Upload file(s) | Select in the local pane → press **F5** or click the ↑ button |
+| Download file(s) | Select in the remote pane → press **F5** or click the ↓ button |
+| Drag and drop | Drag files between the two panes |
+| Move instead of copy | Select → **F6** |
+
+Folders are transferred recursively. If the destination already has a file with
+the same name you'll get an **Overwrite / Skip / Cancel** prompt.
+
+Transfers run in the background on a dedicated connection — you can keep
+browsing while files copy. Watch progress in the **transfer queue** panel at the
+bottom; each row has its own **×** cancel button.
+
+### Multi-select
+
+- **Click** to select one item; **Shift-click** extends the selection;
+  **Ctrl/Cmd-click** (macOS) or **Ctrl-click** (Ubuntu) toggles individual
+  items.
+- All selected items transfer together when you press F5/F6 or drag.
+
+### Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| `F5` | Copy (transfer) selected items to the other pane |
+| `F6` | Move selected items to the other pane |
+| `F2` | Rename selected item |
+| `F3` | View selected file in the built-in read-only viewer |
+| `Del` | Delete selected item(s) |
+| `Backspace` | Navigate to parent directory |
+| `Tab` | Switch focus between left and right pane |
+| `Enter` | Open folder / transfer file |
+
+### Directory sync
+
+Click the **↑ sync** or **↓ sync** button in the toolbar to synchronise a pair
+of local/remote directories.  
+A **preview checklist** shows exactly which files will be copied or deleted —
+review it, tick/untick items, then confirm.  
+Tick **Mirror** to also delete destination items that have no source counterpart.
+
+### Finding files
+
+Click the 🔍 (search) button to search the current remote directory recursively
+by name mask (e.g. `*.log`).  
+Results appear in a list; double-click any hit to navigate to its directory.
+
+### Remote editing
+
+Right-click a remote file → **Edit**.  
+The file downloads to a temp location and opens in your default editor.  
+Every time you save, it uploads automatically.
+
+### Open in terminal / Copy URL
+
+- **Open terminal** (🖥 button) — opens an SSH session to the current remote
+  host in your system terminal (SFTP only).
+- **Copy URL** — copies an `sftp://user@host/path` URL for the selected item to
+  the clipboard.
+
+---
+
 ## Build & run
 
 ### Prerequisites (macOS)

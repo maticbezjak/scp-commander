@@ -2036,6 +2036,7 @@ dependencies = [
  "rust-s3",
  "ssh2",
  "suppaftp",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
