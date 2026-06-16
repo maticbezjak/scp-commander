@@ -73,6 +73,10 @@ struct ScpCommanderApp: App {
             CommandMenu("Commands") {
                 Button("Synchronize Local → Remote") { state.sync(download: false) }
                 Button("Synchronize Remote → Local") { state.sync(download: true) }
+                Button(
+                    state.keepUpToDate == nil
+                        ? "Keep Remote Directory Up To Date" : "Stop Keeping Up To Date"
+                ) { state.toggleKeepUpToDate() }
                 Divider()
                 Button("Find Files…") { state.showFind = true }
                     .keyboardShortcut("f", modifiers: .command)

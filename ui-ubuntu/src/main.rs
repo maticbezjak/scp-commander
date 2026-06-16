@@ -239,6 +239,11 @@ struct App {
     /// automatically; re-armed by `load_local` for the displayed directory.
     local_monitor: RefCell<Option<gio::FileMonitor>>,
     local_reload_pending: Cell<bool>,
+    /// "Keep up to date": pinned (local, remote) pair + its own watcher, pushing
+    /// local changes to the remote automatically.
+    keep_pair: RefCell<Option<(PathBuf, String)>>,
+    keep_monitor: RefCell<Option<gio::FileMonitor>>,
+    keep_pending: Cell<bool>,
     /// Weak self, set once after construction, so `&self` methods can hand an
     /// owned handle to async callbacks (the local monitor).
     me: RefCell<Weak<App>>,
@@ -418,6 +423,61 @@ impl App {
             );
         });
         *self.local_monitor.borrow_mut() = Some(monitor);
+    }
+
+    /// Toggle continuous local→remote sync of the current directory pair.
+    fn toggle_keep_up_to_date(self: &Rc<Self>) {
+        if self.keep_pair.borrow().is_some() {
+            *self.keep_monitor.borrow_mut() = None;
+            *self.keep_pair.borrow_mut() = None;
+            self.set_status("Stopped keeping directory up to date");
+            return;
+        }
+        if !self.session().connected.get() {
+            self.set_status("Connect first to keep a directory up to date");
+            return;
+        }
+        let local = self.local_path.borrow().clone();
+        let remote = self.session().remote_path.borrow().clone();
+        *self.keep_pair.borrow_mut() = Some((local.clone(), remote.clone()));
+
+        // Watch the pinned local dir; push on change (debounced).
+        let file = gio::File::for_path(&local);
+        if let Ok(monitor) =
+            file.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+        {
+            let me = self.me.borrow().clone();
+            monitor.connect_changed(move |_, _, _, _| {
+                let Some(state) = me.upgrade() else { return };
+                if state.keep_pending.replace(true) {
+                    return;
+                }
+                glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(1000),
+                    glib::clone!(#[strong] state, move || {
+                        state.keep_pending.set(false);
+                        state.run_keep_sync();
+                    }),
+                );
+            });
+            *self.keep_monitor.borrow_mut() = Some(monitor);
+        }
+        self.set_status(&format!("Keeping {remote} up to date from {}", local.display()));
+        self.run_keep_sync(); // initial push
+    }
+
+    /// Send a silent local→remote sync for the pinned pair to the worker.
+    fn run_keep_sync(&self) {
+        let Some((local, remote)) = self.keep_pair.borrow().clone() else { return };
+        if !self.session().connected.get() {
+            return;
+        }
+        let _ = self.session().cmd.send(Cmd::KeepSync {
+            local,
+            remote,
+            excludes: self.exclude_masks(),
+            mirror: self.mirror_sync.get(),
+        });
     }
 
     fn open_local(self: &Rc<Self>, index: u32) {
@@ -3299,6 +3359,10 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     sync_up_btn.set_tooltip_text(Some("Sync local → remote (upload changes)"));
     let sync_down_btn = Button::from_icon_name("go-down-symbolic");
     sync_down_btn.set_tooltip_text(Some("Sync remote → local (download changes)"));
+    let keep_toggle = gtk::ToggleButton::new();
+    keep_toggle.set_icon_name("emblem-synchronizing-symbolic");
+    keep_toggle.set_tooltip_text(Some(
+        "Keep remote directory up to date: auto-push local changes to the current remote dir"));
 
     let main_toolbar = GtkBox::builder()
         .orientation(Orientation::Horizontal)
@@ -3343,6 +3407,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     main_toolbar.append(&gtk::Separator::new(Orientation::Vertical));
     main_toolbar.append(&sync_up_btn);
     main_toolbar.append(&sync_down_btn);
+    main_toolbar.append(&keep_toggle);
     main_toolbar.append(&find_btn);
     main_toolbar.append(&terminal_btn);
     main_toolbar.append(&exec_btn);
@@ -3754,6 +3819,9 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         quit_confirmed: Cell::new(false),
         local_monitor: RefCell::new(None),
         local_reload_pending: Cell::new(false),
+        keep_pair: RefCell::new(None),
+        keep_monitor: RefCell::new(None),
+        keep_pending: Cell::new(false),
         me: RefCell::new(Weak::new()),
     });
     // Stash a weak self so &self methods can hand owned handles to callbacks.
@@ -3849,6 +3917,18 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     sync_down_btn.connect_clicked(glib::clone!(
         #[strong] state,
         move |_| state.sync(true)
+    ));
+    keep_toggle.connect_toggled(glib::clone!(
+        #[strong] state,
+        move |btn| {
+            let on = state.keep_pair.borrow().is_some();
+            // Only act when the toggle's new state disagrees with reality —
+            // toggle_keep flips it; sync the button back if it couldn't start.
+            if btn.is_active() != on {
+                state.toggle_keep_up_to_date();
+                btn.set_active(state.keep_pair.borrow().is_some());
+            }
+        }
     ));
     find_btn.connect_clicked(glib::clone!(
         #[strong] state,

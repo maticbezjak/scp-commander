@@ -198,6 +198,14 @@ A **preview checklist** shows exactly which files will be copied or deleted —
 review it, tick/untick items, then confirm.  
 Tick **Mirror** to also delete destination items that have no source counterpart.
 
+### Keep remote directory up to date
+
+Turn on **Commands → Keep Remote Directory Up To Date** (macOS) or the
+sync-toggle button in the toolbar (Ubuntu) to pin the current local/remote
+directory pair. From then on, any change under the local folder is pushed to
+the remote automatically (debounced; honors exclude masks, and deletes
+extraneous remote files when Mirror mode is on). Toggle it off to stop.
+
 ### Finding files
 
 Click the 🔍 (search) button to search the current remote directory recursively

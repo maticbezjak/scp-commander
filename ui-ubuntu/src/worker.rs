@@ -105,6 +105,8 @@ pub enum Cmd {
     DownloadDir { id: u64, name: String, remote: String, local: PathBuf, excludes: String, overwrite: i32, cancel: Arc<AtomicBool>, pause: Arc<PauseFlag> },
     UploadDir { id: u64, name: String, local: PathBuf, remote: String, excludes: String, overwrite: i32, cancel: Arc<AtomicBool>, pause: Arc<PauseFlag> },
     Sync { id: u64, download: bool, local: PathBuf, remote: String, excludes: String, cancel: Arc<AtomicBool>, pause: Arc<PauseFlag> },
+    /// Silent local→remote sync for "keep up to date" (no transfer row).
+    KeepSync { local: PathBuf, remote: String, excludes: String, mirror: bool },
     /// Sync dry run; result arrives as Event::SyncPlanReady.
     SyncPlan { download: bool, local: PathBuf, remote: String, excludes: String, delete_extraneous: bool },
     /// Execute a remote command (SFTP only); result arrives as Event::ExecResult.
@@ -247,6 +249,26 @@ pub fn spawn(events: async_channel::Sender<Event>) -> mpsc::Sender<Cmd> {
                         ops::sync_dir(t, &local, &remote, dir, &filter, cb)
                             .map(|s| s.copied as u64)
                     });
+                }
+
+                Cmd::KeepSync { local, remote, excludes, mirror } => {
+                    // Silent local→remote sync for "keep up to date" — no row,
+                    // only a summary when something actually changed.
+                    if let Some(t) = session.as_mut() {
+                        let filter = Filter::parse(&excludes);
+                        let opts = SyncOptions { delete: mirror };
+                        let mut noop = |_ev: XferEvent| true;
+                        if let Ok(stats) = ops::sync_dir_opts(
+                            t.as_mut(), &local, &remote, SyncDirection::Upload, &filter, &mut noop, &opts)
+                        {
+                            if stats.copied > 0 {
+                                send(Event::OpOk {
+                                    message: format!(
+                                        "Auto-sync: pushed {} change(s) to {remote}", stats.copied),
+                                });
+                            }
+                        }
+                    }
                 }
 
                 Cmd::SyncPlan { download, local, remote, excludes, delete_extraneous } => {

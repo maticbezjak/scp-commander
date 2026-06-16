@@ -628,6 +628,83 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Keep remote directory up to date
+
+    /// Pinned (local, remote) pair being kept in sync, or nil when off.
+    @Published var keepUpToDate: (local: String, remote: String)?
+    private var keepWatchSource: DispatchSourceFileSystemObject?
+    private var keepSyncWork: DispatchWorkItem?
+
+    /// Toggle continuous local→remote sync of the current directory pair. While
+    /// on, local changes are pushed to the pinned remote dir (debounced).
+    func toggleKeepUpToDate() {
+        if keepUpToDate != nil {
+            stopKeepUpToDate()
+            return
+        }
+        guard active.connected else {
+            status = "Connect first to keep a directory up to date"
+            return
+        }
+        let pair = (local: localPath, remote: active.remotePath)
+        keepUpToDate = pair
+        startKeepWatch(localDir: pair.local)
+        status = "Keeping \(pair.remote) up to date from \(pair.local)"
+        runKeepSync()  // initial push
+    }
+
+    func stopKeepUpToDate() {
+        keepWatchSource?.cancel()
+        keepWatchSource = nil
+        keepSyncWork?.cancel()
+        if keepUpToDate != nil { status = "Stopped keeping directory up to date" }
+        keepUpToDate = nil
+    }
+
+    private func startKeepWatch(localDir: String) {
+        keepWatchSource?.cancel()
+        let fd = open(localDir, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .delete, .rename, .extend, .link],
+            queue: DispatchQueue.global(qos: .utility))
+        src.setEventHandler {
+            Task { @MainActor [weak self] in self?.scheduleKeepSync() }
+        }
+        src.setCancelHandler { close(fd) }
+        keepWatchSource = src
+        src.resume()
+    }
+
+    private func scheduleKeepSync() {
+        keepSyncWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.runKeepSync() }
+        keepSyncWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+    }
+
+    /// Silent local→remote sync of the pinned pair (honors masks + mirror).
+    private func runKeepSync() {
+        guard let pair = keepUpToDate else { return }
+        let session = active
+        guard session.connected else { return }
+        let excludes = excludeMasks
+        let mirror = mirrorSync
+        session.queue.async { [weak self, client = session.client] in
+            let copied = (try? client.syncDir(
+                local: pair.local, remote: pair.remote, download: false,
+                excludes: excludes, deleteExtraneous: mirror) { _, _, _, _ in true }) ?? 0
+            DispatchQueue.main.async {
+                guard self?.keepUpToDate != nil else { return }
+                if copied > 0 {
+                    self?.status = "Auto-sync: pushed \(copied) change(s) to \(pair.remote)"
+                    if self?.active.remotePath == pair.remote { self?.refreshSession(session) }
+                }
+            }
+        }
+    }
+
     // MARK: - Dock badge (active transfer count)
 
     private var dockBadgeTimer: Timer?
