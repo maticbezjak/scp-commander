@@ -78,6 +78,14 @@ struct ScpCommanderApp: App {
                     .keyboardShortcut("f", modifiers: .command)
                 Button("Execute Command…") { state.beginExecCommand() }
                     .disabled(state.proto != .sftp || !state.isConnected)
+                Menu("Custom Commands") {
+                    ForEach(state.customCommands) { cmd in
+                        Button(cmd.name) { state.runCustomCommand(cmd) }
+                            .disabled(state.proto != .sftp || !state.isConnected)
+                    }
+                    if !state.customCommands.isEmpty { Divider() }
+                    Button("Manage Custom Commands…") { state.showCustomCommands = true }
+                }
                 Button("Open Terminal") { state.openTerminal() }
                     .disabled(state.proto != .sftp || !state.isConnected)
                 Divider()

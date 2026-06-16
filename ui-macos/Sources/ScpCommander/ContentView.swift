@@ -230,6 +230,10 @@ struct ContentView: View {
                 .environmentObject(state)
             }
         }
+        .sheet(isPresented: $state.showCustomCommands) {
+            CustomCommandsSheet { state.showCustomCommands = false }
+                .environmentObject(state)
+        }
         .alert(
             "Rename",
             isPresented: Binding(
@@ -738,6 +742,67 @@ private struct KnownHostsSheet: View {
     }
 
     private func reload() { hosts = CoreClient.listKnownHosts() }
+}
+
+/// Manage and run custom remote command templates. "{}" expands to the
+/// selected remote file paths; Run executes against the current selection.
+private struct CustomCommandsSheet: View {
+    @EnvironmentObject var state: AppState
+    let onClose: () -> Void
+    @State private var newName = ""
+    @State private var newTemplate = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Custom commands").font(.headline)
+            Text("Run a templated command on the selected remote file(s). \u{201C}{}\u{201D} expands to their shell-quoted paths.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if state.customCommands.isEmpty {
+                Text("No custom commands yet.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+            } else {
+                List {
+                    ForEach(state.customCommands) { cmd in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(cmd.name)
+                                Text(cmd.template).font(.caption).foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            Button("Run") {
+                                state.runCustomCommand(cmd)
+                                onClose()
+                            }
+                            .disabled(state.proto != .sftp || !state.isConnected)
+                            Button(role: .destructive) { state.removeCustomCommand(cmd) } label: {
+                                Image(systemName: "trash")
+                            }
+                        }
+                    }
+                }
+                .frame(minHeight: 150)
+            }
+            Divider()
+            HStack {
+                TextField("Name", text: $newName).frame(width: 120)
+                TextField("Command (use {} for files)", text: $newTemplate)
+                Button("Add") {
+                    state.addCustomCommand(name: newName, template: newTemplate)
+                    newName = ""; newTemplate = ""
+                }
+                .disabled(newName.isEmpty || newTemplate.isEmpty)
+            }
+            HStack {
+                Spacer()
+                Button("Close") { onClose() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 480)
+    }
 }
 
 /// The right-hand "Session" form of the Login dialog.

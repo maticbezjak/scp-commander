@@ -210,6 +210,14 @@ Right-click a remote file → **Edit**.
 The file downloads to a temp location and opens in your default editor.  
 Every time you save, it uploads automatically.
 
+### Custom commands
+
+Save reusable remote command templates and run them on the current selection
+(SFTP). `{}` in a template expands to the shell-quoted paths of the selected
+files — e.g. `tar -czf backup.tgz {}` or `md5sum {}`. Manage them from the
+**Commands → Custom Commands** menu (macOS) or the Login dialog's **Tools →
+Custom commands…** (Ubuntu); output appears in the command-result window.
+
 ### Open in terminal / Copy URL
 
 - **Open terminal** (🖥 button) — opens an SSH session to the current remote

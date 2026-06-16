@@ -3,6 +3,14 @@ import CScpCore
 import Foundation
 import SwiftUI
 
+/// A reusable remote command template. "{}" expands to the selected file
+/// paths when run; e.g. name "Extract", template "tar -xzf {}".
+struct CustomCommand: Codable, Identifiable {
+    var id = UUID()
+    var name: String
+    var template: String
+}
+
 /// One server session, WinSCP-tab-style. Each tab owns its own connection,
 /// serial worker queue, and cached remote listing; `AppState` publishes the
 /// active tab's view of the world.
@@ -130,6 +138,21 @@ final class AppState: ObservableObject {
     @Published var showExecResult = false
     @Published var showExecDialog = false
     @Published var execCmd = ""
+    @Published var showCustomCommands = false
+
+    /// User-defined remote command templates ("{}" = the selected file paths).
+    @Published var customCommands: [CustomCommand] = AppState.loadCustomCommands() {
+        didSet {
+            if let data = try? JSONEncoder().encode(customCommands) {
+                UserDefaults.standard.set(data, forKey: "customCommands")
+            }
+        }
+    }
+
+    private static func loadCustomCommands() -> [CustomCommand] {
+        guard let data = UserDefaults.standard.data(forKey: "customCommands") else { return [] }
+        return (try? JSONDecoder().decode([CustomCommand].self, from: data)) ?? []
+    }
 
     /// Files awaiting an overwrite decision (destination already exists).
     @Published var overwritePrompt: (pane: PaneKind, entries: [FileEntry])?
@@ -1768,6 +1791,48 @@ final class AppState: ObservableObject {
             self?.showExecResult = true
             self?.status = "Command exited \(result.exitCode)"
         }
+    }
+
+    // MARK: - Custom commands
+
+    func addCustomCommand(name: String, template: String) {
+        let n = name.trimmingCharacters(in: .whitespaces)
+        let t = template.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty, !t.isEmpty else { return }
+        customCommands.append(CustomCommand(name: n, template: t))
+    }
+
+    func removeCustomCommand(_ cmd: CustomCommand) {
+        customCommands.removeAll { $0.id == cmd.id }
+    }
+
+    /// Run a custom command on the current remote selection. "{}" in the
+    /// template is replaced with the shell-quoted absolute paths of the
+    /// selected files (joined by spaces); templates without "{}" run as-is.
+    func runCustomCommand(_ cmd: CustomCommand) {
+        let session = active
+        guard session.connected, proto == .sftp else {
+            status = "Custom commands need a connected SFTP session"
+            return
+        }
+        let paths = selectedEntries(in: .remote)
+            .map { Self.shellQuote(pathJoinPosix(session.remotePath, $0.name)) }
+            .joined(separator: " ")
+        let final = cmd.template.contains("{}")
+            ? cmd.template.replacingOccurrences(of: "{}", with: paths)
+            : cmd.template
+        runBusy(on: session, "Running \(cmd.name)…") { [client = session.client] in
+            try client.execCommand(final)
+        } onSuccess: { [weak self] result in
+            self?.execResult = result
+            self?.showExecResult = true
+            self?.status = "\(cmd.name) exited \(result.exitCode)"
+        }
+    }
+
+    /// Single-quote a string for a POSIX shell ('' around it, escaping quotes).
+    static func shellQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Server-side duplicate of a remote file (same directory, new name).

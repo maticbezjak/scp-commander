@@ -114,6 +114,13 @@ struct TransferRow {
     speed: f64,
 }
 
+/// A reusable remote command template ("{}" expands to selected file paths).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CustomCommand {
+    name: String,
+    template: String,
+}
+
 /// One unfinished transfer persisted across launches (re-offered as retryable).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct PendingTransfer {
@@ -2436,6 +2443,176 @@ impl App {
         win.present();
     }
 
+    fn load_custom_commands() -> Vec<CustomCommand> {
+        prefs::get("custom_commands")
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_custom_commands(cmds: &[CustomCommand]) {
+        if let Ok(j) = serde_json::to_string(cmds) {
+            prefs::set("custom_commands", &j);
+        }
+    }
+
+    /// Run a custom command on the selected remote files. "{}" expands to their
+    /// shell-quoted absolute paths; templates without it run unchanged.
+    fn run_custom_command(self: &Rc<Self>, template: &str) {
+        let session = self.session();
+        if !session.connected.get()
+            || session.creds.borrow().as_ref().map(|c| c.protocol)
+                != Some(scp_core::types::Protocol::Sftp)
+        {
+            self.set_status("Custom commands need a connected SFTP session");
+            return;
+        }
+        let base = session.remote_path.borrow().clone();
+        let paths: String = self
+            .selected_entries(false)
+            .iter()
+            .map(|e| shell_quote(&join_posix(&base, &e.name)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let cmd = if template.contains("{}") {
+            template.replace("{}", &paths)
+        } else {
+            template.to_string()
+        };
+        self.set_status(&format!("Executing: {cmd}…"));
+        let _ = session.cmd.send(Cmd::Exec { cmd });
+    }
+
+    /// Manage and run custom remote command templates.
+    fn custom_commands_dialog(self: &Rc<Self>) {
+        let win = gtk::Window::builder()
+            .title("Custom Commands")
+            .transient_for(&self.window)
+            .modal(true)
+            .default_width(520)
+            .default_height(360)
+            .build();
+
+        let intro = Label::builder()
+            .label("Run a templated command on the selected remote file(s). \"{}\" expands to their shell-quoted paths.")
+            .xalign(0.0).wrap(true).build();
+        intro.add_css_class("caption");
+        intro.add_css_class("dim-label");
+
+        let list = ListBox::new();
+        list.add_css_class("boxed-list");
+        let scroll = ScrolledWindow::builder().vexpand(true).child(&list).build();
+
+        let rebuild: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let rebuild_impl: Rc<dyn Fn()> = {
+            let list = list.clone();
+            let state = self.clone();
+            let rebuild = rebuild.clone();
+            let win = win.clone();
+            Rc::new(move || {
+                while let Some(row) = list.first_child() {
+                    list.remove(&row);
+                }
+                let cmds = Self::load_custom_commands();
+                if cmds.is_empty() {
+                    let l = Label::builder().label("No custom commands yet.").build();
+                    l.add_css_class("dim-label");
+                    l.set_margin_top(12);
+                    l.set_margin_bottom(12);
+                    list.append(&l);
+                    return;
+                }
+                for (idx, c) in cmds.iter().enumerate() {
+                    let row = GtkBox::builder()
+                        .orientation(Orientation::Horizontal).spacing(8)
+                        .margin_top(4).margin_bottom(4).margin_start(8).margin_end(8)
+                        .build();
+                    let info = GtkBox::builder()
+                        .orientation(Orientation::Vertical).hexpand(true).build();
+                    let name_l = Label::builder().label(&c.name).xalign(0.0).build();
+                    let tmpl_l = Label::builder().label(&c.template).xalign(0.0).build();
+                    tmpl_l.add_css_class("caption");
+                    tmpl_l.add_css_class("dim-label");
+                    tmpl_l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    info.append(&name_l);
+                    info.append(&tmpl_l);
+                    let run = Button::with_label("Run");
+                    run.add_css_class("suggested-action");
+                    let template = c.template.clone();
+                    let st = state.clone();
+                    let w = win.clone();
+                    run.connect_clicked(move |_| {
+                        st.run_custom_command(&template);
+                        w.close();
+                    });
+                    let del = Button::from_icon_name("user-trash-symbolic");
+                    del.add_css_class("flat");
+                    let rb = rebuild.clone();
+                    del.connect_clicked(move |_| {
+                        let mut cmds = Self::load_custom_commands();
+                        if idx < cmds.len() {
+                            cmds.remove(idx);
+                            Self::save_custom_commands(&cmds);
+                        }
+                        if let Some(f) = rb.borrow().clone() {
+                            f();
+                        }
+                    });
+                    row.append(&info);
+                    row.append(&run);
+                    row.append(&del);
+                    list.append(&row);
+                }
+            })
+        };
+        *rebuild.borrow_mut() = Some(rebuild_impl.clone());
+        rebuild_impl();
+
+        // Add row.
+        let name_entry = GtkEntry::builder().placeholder_text("Name").max_width_chars(14).build();
+        let tmpl_entry = GtkEntry::builder()
+            .placeholder_text("Command (use {} for files)").hexpand(true).build();
+        let add = Button::with_label("Add");
+        {
+            let rb = rebuild_impl.clone();
+            let name_entry = name_entry.clone();
+            let tmpl_entry = tmpl_entry.clone();
+            add.connect_clicked(move |_| {
+                let name = name_entry.text().trim().to_string();
+                let template = tmpl_entry.text().trim().to_string();
+                if name.is_empty() || template.is_empty() {
+                    return;
+                }
+                let mut cmds = Self::load_custom_commands();
+                cmds.push(CustomCommand { name, template });
+                Self::save_custom_commands(&cmds);
+                name_entry.set_text("");
+                tmpl_entry.set_text("");
+                rb();
+            });
+        }
+        let add_row = GtkBox::builder().orientation(Orientation::Horizontal).spacing(6).build();
+        add_row.append(&name_entry);
+        add_row.append(&tmpl_entry);
+        add_row.append(&add);
+
+        let close = Button::with_label("Close");
+        close.connect_clicked(glib::clone!(#[weak] win, move |_| win.close()));
+        let btns = GtkBox::builder()
+            .orientation(Orientation::Horizontal).halign(gtk::Align::End).build();
+        btns.append(&close);
+
+        let vbox = GtkBox::builder()
+            .orientation(Orientation::Vertical).spacing(8)
+            .margin_top(12).margin_bottom(12).margin_start(12).margin_end(12)
+            .build();
+        vbox.append(&intro);
+        vbox.append(&scroll);
+        vbox.append(&add_row);
+        vbox.append(&btns);
+        win.set_child(Some(&vbox));
+        win.present();
+    }
+
     /// View and forget SCP Commander's trusted SSH host keys (its own store).
     fn known_hosts_dialog(self: &Rc<Self>) {
         let win = gtk::Window::builder()
@@ -3407,7 +3584,12 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     prefs_btn.add_css_class("flat");
     let knownhosts_btn = Button::with_label("Manage known hosts…");
     knownhosts_btn.add_css_class("flat");
-    for b in [&import_btn, &winscp_btn, &sshcfg_btn, &export_btn, &knownhosts_btn, &prefs_btn] {
+    let customcmd_btn = Button::with_label("Custom commands…");
+    customcmd_btn.add_css_class("flat");
+    for b in [
+        &import_btn, &winscp_btn, &sshcfg_btn, &export_btn,
+        &customcmd_btn, &knownhosts_btn, &prefs_btn,
+    ] {
         if let Some(child) = b.child().and_downcast::<Label>() {
             child.set_xalign(0.0);
         }
@@ -3650,6 +3832,14 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         move |_| {
             tools_popover.popdown();
             state.known_hosts_dialog();
+        }
+    ));
+    customcmd_btn.connect_clicked(glib::clone!(
+        #[strong] state,
+        #[strong] tools_popover,
+        move |_| {
+            tools_popover.popdown();
+            state.custom_commands_dialog();
         }
     ));
     sync_up_btn.connect_clicked(glib::clone!(
@@ -5887,6 +6077,11 @@ fn join_posix(base: &str, name: &str) -> String {
     } else {
         format!("{base}/{name}")
     }
+}
+
+/// Single-quote a string for a POSIX shell (wrap in '', escaping any quotes).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn parent_posix(path: &str) -> String {
