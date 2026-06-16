@@ -726,6 +726,7 @@ final class AppState: ObservableObject {
                 if self.transfers.activeCount == 0 {
                     timer.invalidate()
                     self.dockBadgeTimer = nil
+                    self.notifyQueueDrained()
                 }
             }
         }
@@ -734,6 +735,14 @@ final class AppState: ObservableObject {
     private func updateDockBadge() {
         let n = transfers.activeCount
         NSApp.dockTile.badgeLabel = n > 0 ? String(n) : nil
+    }
+
+    /// The transfer queue just drained. If the user is in another app, bounce
+    /// the Dock icon and play a sound so they know it finished.
+    private func notifyQueueDrained() {
+        guard !NSApp.isActive else { return }
+        NSApp.requestUserAttention(.informationalRequest)
+        NSSound(named: "Glass")?.play()
     }
 
     // MARK: - Local directory auto-refresh (FSEvents-style vnode watch)

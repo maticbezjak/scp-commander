@@ -127,6 +127,16 @@ final class TransferQueue: ObservableObject {
         items.reduce(0) { $0 + ($1.state == .active ? 1 : 0) }
     }
 
+    /// Summed bytes transferred / total across active transfers (for the
+    /// aggregate progress header). Returns nil when nothing is active.
+    var aggregate: (transferred: UInt64, total: UInt64)? {
+        let active = items.filter { $0.state == .active }
+        guard !active.isEmpty else { return nil }
+        let transferred = active.reduce(UInt64(0)) { $0 + $1.transferred }
+        let total = active.reduce(UInt64(0)) { $0 + $1.total }
+        return (transferred, total)
+    }
+
     func clearFinished() {
         items.removeAll { $0.state != .active }
     }

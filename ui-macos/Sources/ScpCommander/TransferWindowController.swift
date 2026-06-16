@@ -38,6 +38,10 @@ struct TransferQueueView: View {
     @ObservedObject var queue: TransferQueue
     var state: AppState?
 
+    static func bytes(_ n: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -52,6 +56,22 @@ struct TransferQueueView: View {
                     .disabled(queue.items.allSatisfy { $0.state == .active })
             }
             .padding(.horizontal, 12).padding(.vertical, 8)
+            if let agg = queue.aggregate {
+                let pct = agg.total > 0
+                    ? Int((Double(agg.transferred) / Double(agg.total) * 100).rounded()) : 0
+                VStack(spacing: 3) {
+                    HStack {
+                        Text("\(queue.activeCount) active")
+                        Spacer()
+                        Text("\(Self.bytes(agg.transferred)) / \(Self.bytes(agg.total)) · \(pct)%")
+                    }
+                    .font(.caption).foregroundStyle(.secondary)
+                    ProgressView(
+                        value: Double(agg.transferred),
+                        total: Double(max(agg.total, 1)))
+                }
+                .padding(.horizontal, 12).padding(.bottom, 6)
+            }
             Divider()
             if queue.items.isEmpty {
                 Spacer()

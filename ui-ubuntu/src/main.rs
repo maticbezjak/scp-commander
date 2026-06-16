@@ -110,6 +110,8 @@ struct TransferRow {
     target: String,
     started: std::time::Instant,
     last_done: u64,
+    /// Latest known total bytes (0 = unknown); summed for aggregate progress.
+    total: u64,
     last_at: Option<std::time::Instant>,
     speed: f64,
 }
@@ -181,6 +183,8 @@ struct App {
     transfers_window: gtk::Window,
     transfers_box: GtkBox,
     transfers_panel: GtkBox,
+    /// In-panel header label; shows aggregate bytes/% across active transfers.
+    xfer_title: Label,
     transfer_rows: RefCell<HashMap<u64, TransferRow>>,
     next_id: RefCell<u64>,
     // Connection form
@@ -1090,6 +1094,7 @@ impl App {
                 target: target.to_string(),
                 started: std::time::Instant::now(),
                 last_done: 0,
+                total,
                 last_at: None,
                 speed: 0.0,
             },
@@ -1144,6 +1149,24 @@ impl App {
         let base = self.base_title();
         let title = if n > 0 { format!("[⇅ {n}] {base}") } else { base };
         self.window.set_title(Some(&title));
+
+        // In-panel header: aggregate bytes/% across active transfers.
+        if n == 0 {
+            self.xfer_title.set_text("Transfers");
+        } else {
+            let (done, total) = self.transfer_rows.borrow().values().filter(|r| !r.finished).fold(
+                (0u64, 0u64),
+                |(d, t), r| (d + r.last_done, t + r.total),
+            );
+            if total > 0 {
+                let pct = (done as f64 / total as f64 * 100.0).round() as u32;
+                self.xfer_title.set_text(&format!(
+                    "Transfers — {n} active · {} / {} ({pct}%)",
+                    human_size(done), human_size(total)));
+            } else {
+                self.xfer_title.set_text(&format!("Transfers — {n} active"));
+            }
+        }
     }
 
     fn queue_file() -> PathBuf {
@@ -1311,6 +1334,20 @@ impl App {
             row.pause.resume(); // unblock worker if it was paused
         }
         self.update_transfer_title();
+        self.maybe_notify_drained();
+    }
+
+    /// When the queue drains and the window isn't focused, post a desktop
+    /// notification so the user knows their transfers finished.
+    fn maybe_notify_drained(&self) {
+        if self.active_transfers() != 0 || self.window.is_active() {
+            return;
+        }
+        if let Some(app) = self.window.application() {
+            let note = gio::Notification::new("Transfers complete");
+            note.set_body(Some("All transfers have finished."));
+            app.send_notification(Some("scp-transfers"), &note);
+        }
     }
 
     /// Attach a retry closure to a transfer row (shows the ↻ button on failure).
@@ -2899,6 +2936,9 @@ impl App {
             }
             Event::Progress { id, done, total } => {
                 if let Some(row) = self.transfer_rows.borrow_mut().get_mut(&id) {
+                    if total > 0 {
+                        row.total = total;
+                    }
                     // Smoothed speed + ETA, WinSCP-style.
                     let now = std::time::Instant::now();
                     if let Some(at) = row.last_at {
@@ -2945,6 +2985,7 @@ impl App {
                     }
                     row.detail.set_text(&detail);
                 }
+                self.update_transfer_title(); // refresh aggregate header
             }
             Event::FileStart { id, file, total } => {
                 if let Some(row) = self.transfer_rows.borrow().get(&id) {
@@ -3791,6 +3832,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         transfers_window,
         transfers_box,
         transfers_panel,
+        xfer_title: transfers_title.clone(),
         transfer_rows: RefCell::new(HashMap::new()),
         next_id: RefCell::new(0),
         proto_dd,
