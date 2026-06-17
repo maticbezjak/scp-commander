@@ -40,6 +40,18 @@ pub enum HostKeyPolicy {
     AcceptFingerprint(String),
 }
 
+/// A bastion/jump host to tunnel through. The real session is established to
+/// the target *over* an SSH direct-tcpip channel opened on this host (ProxyJump).
+#[derive(Debug, Clone)]
+pub struct JumpHost {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth: Auth,
+    /// How to treat the bastion's host key (defaults to trust-on-first-use).
+    pub host_key: HostKeyPolicy,
+}
+
 /// Everything needed to open a session.
 ///
 /// For SFTP/FTP/FTPS: `host`/`port`/`username`/`auth` are used. For S3,
@@ -59,6 +71,8 @@ pub struct Credentials {
     pub region: Option<String>,
     /// SFTP only: how to treat servers whose host key isn't known yet.
     pub host_key: HostKeyPolicy,
+    /// SFTP only: optional bastion to tunnel the connection through.
+    pub jump: Option<JumpHost>,
 }
 
 impl Credentials {
@@ -73,6 +87,7 @@ impl Credentials {
             bucket: None,
             region: None,
             host_key: HostKeyPolicy::Strict,
+            jump: None,
         }
     }
 

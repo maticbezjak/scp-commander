@@ -17,7 +17,7 @@ use std::thread;
 use std::time::Instant;
 
 use scp_core::connect;
-use scp_core::types::{Auth, Credentials, HostKeyPolicy, Protocol};
+use scp_core::types::{Auth, Credentials, HostKeyPolicy, JumpHost, Protocol};
 
 const POOL_SIZE: usize = 3;
 const FILE_BYTES: usize = 2 * 1024 * 1024; // 2 MB per file
@@ -32,6 +32,7 @@ fn sftp_creds() -> Credentials {
         host_key: HostKeyPolicy::AcceptNew,
         bucket: None,
         region: None,
+        jump: None,
     }
 }
 
@@ -45,6 +46,7 @@ fn ftp_creds() -> Credentials {
         host_key: HostKeyPolicy::AcceptNew,
         bucket: None,
         region: None,
+        jump: None,
     }
 }
 
@@ -59,6 +61,7 @@ fn s3_creds() -> Credentials {
         host_key: HostKeyPolicy::AcceptNew,
         bucket: Some("test".into()),
         region: None,
+        jump: None,
     }
 }
 
@@ -156,6 +159,38 @@ fn sftp_three_parallel_uploads() {
 #[ignore = "needs the docker rig: docker compose -f tests/integration/docker-compose.yml up -d ftp"]
 fn ftp_three_parallel_uploads() {
     parallel_uploads(ftp_creds, "/ftp/demo/");
+}
+
+/// Jump-host tunnel, validated with a single container: connect to the openssh
+/// bastion (host 2223 → in-container sshd 2222) and tunnel a direct-tcpip
+/// channel back to that same sshd at 127.0.0.1:2222, then run SFTP end-to-end
+/// through it. Proves the bastion auth + channel bridge + nested SSH/SFTP path.
+///   docker compose -f tests/integration/docker-compose.yml up -d ssh
+#[test]
+#[ignore = "needs the docker rig: docker compose -f tests/integration/docker-compose.yml up -d ssh"]
+fn jump_host_loopback() {
+    isolate_home();
+    let jump = JumpHost {
+        host: "127.0.0.1".into(),
+        port: 2223,
+        username: "demo".into(),
+        auth: Auth::Password("demopass".into()),
+        host_key: HostKeyPolicy::AcceptNew,
+    };
+    let creds = Credentials {
+        protocol: Protocol::Sftp,
+        host: "127.0.0.1".into(),
+        port: 2222, // the bastion's own in-container sshd, reached via the tunnel
+        username: "demo".into(),
+        auth: Auth::Password("demopass".into()),
+        bucket: None,
+        region: None,
+        host_key: HostKeyPolicy::AcceptNew,
+        jump: Some(jump),
+    };
+    let mut t = connect(&creds).expect("connect through jump host");
+    let entries = t.list_dir("/").expect("list / through the jump tunnel");
+    println!("Listed {} entries through the jump host", entries.len());
 }
 
 #[cfg(feature = "s3")]

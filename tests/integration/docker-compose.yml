@@ -17,6 +17,10 @@ services:
       PASSWORD_ACCESS: "true"
       USER_NAME: "demo"
       USER_PASSWORD: "demopass"
+    volumes:
+      # Enable TCP forwarding so the jump-host test can tunnel through this
+      # bastion (see enable-forwarding.sh).
+      - ./enable-forwarding.sh:/custom-cont-init.d/99-enable-forwarding:ro
     ports:
       - "127.0.0.1:2223:2222"
 

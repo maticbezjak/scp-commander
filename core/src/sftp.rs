@@ -8,18 +8,36 @@ use ssh2::{
 };
 
 use crate::transport::{copy_with_progress, Progress, Transport};
-use crate::types::{Auth, Credentials, Entry, Error, ExecResult, HostKeyPolicy, Result};
+use crate::types::{
+    Auth, Credentials, Entry, Error, ExecResult, HostKeyPolicy, JumpHost, Protocol, Result,
+};
 
 /// SFTP backend backed by libssh2 (synchronous).
 pub struct SftpTransport {
     session: Session,
     sftp: ssh2::Sftp,
+    /// Kept alive for the session's lifetime when tunneling through a bastion;
+    /// dropping it tears the jump tunnel down.
+    _tunnel: Option<crate::jump::Tunnel>,
 }
 
 impl SftpTransport {
     pub fn connect(creds: &Credentials) -> Result<Self> {
-        let tcp = TcpStream::connect((creds.host.as_str(), creds.port))
-            .map_err(|e| Error::Connect(e.to_string()))?;
+        // With a jump host, open a tunnel to the target and connect through the
+        // localhost forward; otherwise connect directly.
+        let (tcp, tunnel) = match &creds.jump {
+            Some(jump) => {
+                let tunnel = crate::jump::open(jump, &creds.host, creds.port)?;
+                let stream = TcpStream::connect(("127.0.0.1", tunnel.local_port))
+                    .map_err(|e| Error::Connect(format!("jump tunnel: {e}")))?;
+                (stream, Some(tunnel))
+            }
+            None => (
+                TcpStream::connect((creds.host.as_str(), creds.port))
+                    .map_err(|e| Error::Connect(e.to_string()))?,
+                None,
+            ),
+        };
 
         let mut session = Session::new().map_err(|e| Error::Connect(e.to_string()))?;
         session.set_tcp_stream(tcp);
@@ -27,37 +45,12 @@ impl SftpTransport {
             .handshake()
             .map_err(|e| Error::Connect(e.to_string()))?;
 
-        // Verify the server's identity BEFORE sending any credentials.
+        // Verify the server's identity BEFORE sending any credentials. Through a
+        // tunnel the handshake is end-to-end with the target, so this is still
+        // the target's key (recorded under creds.host).
         verify_host_key(&session, creds)?;
 
-        match &creds.auth {
-            Auth::Password(pw) => {
-                // Plain password first. Many servers (especially with 2FA/OTP)
-                // only offer keyboard-interactive; fall back to it, feeding the
-                // same secret to every prompt. A wrong secret simply fails both.
-                let _ = session.userauth_password(&creds.username, pw);
-                if !session.authenticated() {
-                    let mut responder = SingleResponse { secret: pw };
-                    session
-                        .userauth_keyboard_interactive(&creds.username, &mut responder)
-                        .map_err(auth_or_connect)?;
-                }
-            }
-            Auth::KeyFile { path, passphrase } => session
-                .userauth_pubkey_file(
-                    &creds.username,
-                    None,
-                    Path::new(path),
-                    passphrase.as_deref(),
-                )
-                .map_err(auth_or_connect)?,
-            Auth::Agent => session
-                .userauth_agent(&creds.username)
-                .map_err(auth_or_connect)?,
-            Auth::Anonymous => {
-                return Err(Error::Auth("SFTP requires credentials".into()));
-            }
-        }
+        authenticate(&session, &creds.username, &creds.auth)?;
 
         if !session.authenticated() {
             return Err(Error::Auth("authentication rejected".into()));
@@ -67,8 +60,33 @@ impl SftpTransport {
         session.set_keepalive(true, 30);
 
         let sftp = session.sftp().map_err(|e| Error::Protocol(e.to_string()))?;
-        Ok(Self { session, sftp })
+        Ok(Self { session, sftp, _tunnel: tunnel })
     }
+}
+
+/// Authenticate `session` as `username` with `auth`. Password auth falls back
+/// to keyboard-interactive (2FA/OTP) feeding the same secret to each prompt.
+/// Shared by the target connection and the jump-host tunnel.
+pub(crate) fn authenticate(session: &Session, username: &str, auth: &Auth) -> Result<()> {
+    match auth {
+        Auth::Password(pw) => {
+            let _ = session.userauth_password(username, pw);
+            if !session.authenticated() {
+                let mut responder = SingleResponse { secret: pw };
+                session
+                    .userauth_keyboard_interactive(username, &mut responder)
+                    .map_err(auth_or_connect)?;
+            }
+        }
+        Auth::KeyFile { path, passphrase } => session
+            .userauth_pubkey_file(username, None, Path::new(path), passphrase.as_deref())
+            .map_err(auth_or_connect)?,
+        Auth::Agent => session.userauth_agent(username).map_err(auth_or_connect)?,
+        Auth::Anonymous => {
+            return Err(Error::Auth("SFTP requires credentials".into()));
+        }
+    }
+    Ok(())
 }
 
 impl Transport for SftpTransport {
@@ -441,6 +459,23 @@ fn verify_host_key(session: &Session, creds: &Credentials) -> Result<()> {
             }
         }
     }
+}
+
+/// Verify a bastion's host key using its own policy (defaults to TOFU). Reuses
+/// the target path by synthesizing Credentials for the jump host.
+pub(crate) fn verify_jump_host_key(session: &Session, jump: &JumpHost) -> Result<()> {
+    let creds = Credentials {
+        protocol: Protocol::Sftp,
+        host: jump.host.clone(),
+        port: jump.port,
+        username: jump.username.clone(),
+        auth: jump.auth.clone(),
+        bucket: None,
+        region: None,
+        host_key: jump.host_key.clone(),
+        jump: None,
+    };
+    verify_host_key(session, &creds)
 }
 
 /// Append the key to the app's known_hosts store.

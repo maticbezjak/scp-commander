@@ -7,6 +7,7 @@
 
 pub mod ffi;
 pub mod ftp;
+pub mod jump;
 pub mod ops;
 pub mod s3;
 pub mod sftp;
