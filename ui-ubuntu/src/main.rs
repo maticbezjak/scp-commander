@@ -123,6 +123,15 @@ struct CustomCommand {
     template: String,
 }
 
+/// Pane clipboard: entries copied from one pane, pasted (transferred) into the
+/// other. `source_dir` is the local fs path or remote posix path at copy time.
+#[derive(Clone)]
+struct Clipboard {
+    from_local: bool,
+    source_dir: String,
+    entries: Vec<Entry>,
+}
+
 /// One unfinished transfer persisted across launches (re-offered as retryable).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct PendingTransfer {
@@ -236,6 +245,8 @@ struct App {
     sites_list: ListBox,
     /// Session log: timestamped copy of every status line (ring buffer).
     log_buf: RefCell<Vec<String>>,
+    /// Pane clipboard for copy-in-one-pane / paste-in-the-other transfers.
+    clipboard: RefCell<Option<Clipboard>>,
     /// Set once the user confirms "Quit Anyway" so the close handler stops
     /// re-prompting and lets the window actually close.
     quit_confirmed: Cell<bool>,
@@ -833,6 +844,99 @@ impl App {
                 pause,
             });
             return Some(id);
+        }
+    }
+
+    // -- Pane clipboard (copy here, paste in the other pane) ------------------
+
+    /// Copy the pane's selection plus its current directory.
+    fn clipboard_copy(&self, local_pane: bool) {
+        let entries = self.selected_entries(local_pane);
+        if entries.is_empty() {
+            self.set_status("Select files to copy first");
+            return;
+        }
+        let source_dir = if local_pane {
+            self.local_path.borrow().display().to_string()
+        } else {
+            self.session().remote_path.borrow().clone()
+        };
+        let n = entries.len();
+        *self.clipboard.borrow_mut() = Some(Clipboard { from_local: local_pane, source_dir, entries });
+        self.set_status(&format!("Copied {n} item(s) — paste in the other pane"));
+    }
+
+    /// Paste the clipboard into the given pane (a transfer across sides).
+    fn clipboard_paste(self: &Rc<Self>, target_local: bool) {
+        let Some(clip) = self.clipboard.borrow().clone() else {
+            self.set_status("Nothing to paste");
+            return;
+        };
+        if clip.from_local == target_local {
+            self.set_status("Paste targets the other pane");
+            return;
+        }
+        if !self.session().connected.get() {
+            self.set_status("Connect first to paste");
+            return;
+        }
+        let n = clip.entries.len();
+        for e in &clip.entries {
+            if clip.from_local {
+                let local = PathBuf::from(&clip.source_dir).join(&e.name);
+                let remote = join_posix(&self.session().remote_path.borrow(), &e.name);
+                self.paste_send(e, local, remote, true);
+            } else {
+                let remote = join_posix(&clip.source_dir, &e.name);
+                let local = self.local_path.borrow().join(&e.name);
+                self.paste_send(e, local, remote, false);
+            }
+        }
+        self.set_status(&format!("Pasting {n} item(s)"));
+    }
+
+    /// One paste transfer with explicit source/dest paths (+ a retry hook).
+    fn paste_send(self: &Rc<Self>, entry: &Entry, local: PathBuf, remote: String, upload: bool) -> Option<u64> {
+        let id = self.paste_send_inner(entry, &local, &remote, upload)?;
+        let st = self.clone();
+        let e = entry.clone();
+        let (l, r) = (local, remote);
+        self.set_retry(id, Rc::new(move || { st.paste_send(&e, l.clone(), r.clone(), upload); }));
+        Some(id)
+    }
+
+    fn paste_send_inner(self: &Rc<Self>, entry: &Entry, local: &Path, remote: &str, upload: bool) -> Option<u64> {
+        let local_s = local.display().to_string();
+        if upload {
+            if entry.is_dir {
+                let (id, cancel, pause) = self.add_transfer(
+                    &format!("{}/", entry.name), false, 0, &local_s, remote);
+                let _ = self.session().xfer_pool.send(Cmd::UploadDir {
+                    id, name: entry.name.clone(), local: local.to_path_buf(), remote: remote.to_string(),
+                    excludes: self.exclude_masks(), overwrite: 0, cancel, pause });
+                Some(id)
+            } else {
+                let (id, cancel, pause) = self.add_transfer(
+                    &entry.name, false, entry.size, &local_s, remote);
+                let _ = self.session().xfer_pool.send(Cmd::Upload {
+                    id, name: entry.name.clone(), local: local.to_path_buf(), remote: remote.to_string(),
+                    resume: false, cancel, pause });
+                Some(id)
+            }
+        } else if entry.is_dir {
+            let (id, cancel, pause) = self.add_transfer(
+                &format!("{}/", entry.name), true, 0, remote, &local_s);
+            let _ = self.session().xfer_pool.send(Cmd::DownloadDir {
+                id, name: entry.name.clone(), remote: remote.to_string(), local: local.to_path_buf(),
+                excludes: self.exclude_masks(), overwrite: 0, cancel, pause });
+            Some(id)
+        } else {
+            let (id, cancel, pause) = self.add_transfer(
+                &entry.name, true, entry.size, remote, &local_s);
+            let _ = self.session().xfer_pool.send(Cmd::Download {
+                id, name: entry.name.clone(), remote: remote.to_string(), local: local.to_path_buf(),
+                resume: 0, cancel, pause });
+            Some(id)
         }
     }
 
@@ -3904,6 +4008,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         sites: RefCell::new(SitesStore::load()),
         sites_list,
         log_buf: RefCell::new(Vec::new()),
+        clipboard: RefCell::new(None),
         quit_confirmed: Cell::new(false),
         local_monitor: RefCell::new(None),
         local_reload_pending: Cell::new(false),
@@ -4363,7 +4468,7 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     let keys = gtk::EventControllerKey::new();
     keys.connect_key_pressed(glib::clone!(
         #[strong] state,
-        move |_, key, _, _| {
+        move |_, key, _, modifier| {
             // Don't steal keys while typing in an entry.
             let editing_text = gtk::prelude::RootExt::focus(&state.window)
                 .is_some_and(|w| {
@@ -4373,6 +4478,20 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
                 return glib::Propagation::Proceed;
             }
             let local = state.focused_local.get();
+            // Ctrl+C / Ctrl+V: pane clipboard (copy here, paste in the other).
+            if modifier.contains(gdk::ModifierType::CONTROL_MASK) {
+                match key {
+                    gdk::Key::c | gdk::Key::C => {
+                        state.clipboard_copy(local);
+                        return glib::Propagation::Stop;
+                    }
+                    gdk::Key::v | gdk::Key::V => {
+                        state.clipboard_paste(local);
+                        return glib::Propagation::Stop;
+                    }
+                    _ => {}
+                }
+            }
             match key {
                 gdk::Key::F5 => {
                     state.transfer_selected();
@@ -5334,6 +5453,14 @@ fn setup_context_menu(state: &Rc<App>, view: &ColumnView, hook: &MenuHook, local
     if local_pane {
         let s = state.clone();
         add_item("Show in Files", false, Box::new(move || s.menu_show_in_files()));
+    }
+    {
+        let s = state.clone();
+        add_item("Copy", false, Box::new(move || s.clipboard_copy(local_pane)));
+    }
+    {
+        let s = state.clone();
+        add_item("Paste", false, Box::new(move || s.clipboard_paste(local_pane)));
     }
     {
         let s = state.clone();

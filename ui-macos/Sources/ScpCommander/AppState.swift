@@ -1731,6 +1731,75 @@ final class AppState: ObservableObject {
         return entries(in: pane).filter { ids.contains($0.id) }
     }
 
+    // MARK: - Pane clipboard (copy here, paste in the other pane)
+
+    /// Entries marked with Copy, plus where they came from. Paste transfers
+    /// them into the opposite pane's current directory.
+    struct PaneClipboard {
+        let sourcePane: PaneKind
+        let sourceDir: String  // local fs path, or remote posix path
+        let entries: [FileEntry]
+    }
+    @Published var paneClipboard: PaneClipboard?
+
+    /// Copy a pane's selection (remembering its directory).
+    func copySelection(from pane: PaneKind) {
+        let entries = selectedEntries(in: pane)
+        guard !entries.isEmpty else {
+            status = "Select files to copy first"
+            return
+        }
+        let dir = pane == .local ? localPath : active.remotePath
+        paneClipboard = PaneClipboard(sourcePane: pane, sourceDir: dir, entries: entries)
+        status = "Copied \(entries.count) item(s) — paste in the other pane"
+    }
+
+    /// Paste the clipboard into `pane`'s current directory (a transfer, since
+    /// the panes are on different sides).
+    func paste(into pane: PaneKind) {
+        guard let clip = paneClipboard, !clip.entries.isEmpty else {
+            status = "Nothing to paste"
+            return
+        }
+        guard pane != clip.sourcePane else {
+            status = "Paste targets the other pane"
+            return
+        }
+        let session = active
+        guard session.connected else {
+            status = "Connect first to paste"
+            return
+        }
+        for e in clip.entries {
+            if clip.sourcePane == .local {
+                let local = pathJoin(clip.sourceDir, e.name)
+                let remote = pathJoinPosix(session.remotePath, e.name)
+                if e.isDir {
+                    runFolderOp(on: session, name: e.name, direction: .upload,
+                        remote: remote, local: local) { [weak self] in self?.refreshSession(session) }
+                } else {
+                    transferFile(on: session, remote: remote, local: local,
+                        name: e.name, size: e.size, direction: .upload) {
+                        [weak self] in self?.refreshSession(session)
+                    }
+                }
+            } else {
+                let remote = pathJoinPosix(clip.sourceDir, e.name)
+                let local = pathJoin(localPath, e.name)
+                if e.isDir {
+                    runFolderOp(on: session, name: e.name, direction: .download,
+                        remote: remote, local: local) { [weak self] in self?.loadLocal() }
+                } else {
+                    transferFile(on: session, remote: remote, local: local,
+                        name: e.name, size: e.size, direction: .download) {
+                        [weak self] in self?.loadLocal()
+                    }
+                }
+            }
+        }
+        status = "Pasting \(clip.entries.count) item(s)"
+    }
+
     func navigateLocal(_ path: String) {
         let expanded = (path as NSString).expandingTildeInPath
         guard FileManager.default.fileExists(atPath: expanded) else {

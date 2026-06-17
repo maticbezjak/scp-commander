@@ -126,6 +126,9 @@ struct ContentView: View {
                     onProperties: { propertiesTarget = (.local, $0) },
                     onExternalDrop: nil,
                     onView: { state.viewFile($0, pane: .local) },
+                    onClipboardCopy: { state.copySelection(from: .local) },
+                    onClipboardPaste: { state.paste(into: .local) },
+                    canPaste: state.paneClipboard?.sourcePane == .remote,
                     onBack: { state.goBack(.local) },
                     onForward: { state.goForward(.local) },
                     onHome: { state.goHome(.local) },
@@ -159,6 +162,9 @@ struct ContentView: View {
                     onCopyFile: { e in copyNameText = e.name; copyTarget = e },
                     onExec: state.proto == .sftp ? { _ in state.beginExecCommand() } : nil,
                     onView: { state.viewFile($0, pane: .remote) },
+                    onClipboardCopy: { state.copySelection(from: .remote) },
+                    onClipboardPaste: { state.paste(into: .remote) },
+                    canPaste: state.paneClipboard?.sourcePane == .local,
                     onBack: { state.goBack(.remote) },
                     onForward: { state.goForward(.remote) },
                     onHome: { state.goHome(.remote) },
@@ -425,6 +431,15 @@ struct ContentView: View {
         if NSApp.keyWindow?.firstResponder is NSTextView { return false }
 
         let pane = state.focusedPane
+        // ⌘C / ⌘V: pane clipboard (copy here, paste in the other pane). Safe to
+        // bind here because text fields/dialogs already returned above.
+        if event.modifierFlags.contains(.command), !event.modifierFlags.contains(.option) {
+            switch event.charactersIgnoringModifiers {
+            case "c": state.copySelection(from: pane); return true
+            case "v": state.paste(into: pane); return true
+            default: break
+            }
+        }
         switch event.keyCode {
         case 48:  // Tab — switch panes
             state.focusedPane = pane == .local ? .remote : .local
@@ -1047,6 +1062,9 @@ private struct FilePane: View {
     var onCopyFile: ((FileEntry) -> Void)? = nil
     var onExec: ((FileEntry) -> Void)? = nil
     var onView: ((FileEntry) -> Void)? = nil
+    var onClipboardCopy: (() -> Void)? = nil
+    var onClipboardPaste: (() -> Void)? = nil
+    var canPaste: Bool = false
     // Navigation history (WinSCP back/forward/home)
     var onBack: (() -> Void)? = nil
     var onForward: (() -> Void)? = nil
@@ -1596,6 +1614,15 @@ private struct FilePane: View {
             }
             if let onExec {
                 Button("Execute command…") { onExec(entry) }
+            }
+            if onClipboardCopy != nil || (canPaste && onClipboardPaste != nil) {
+                Divider()
+                if let onClipboardCopy {
+                    Button("Copy") { onClipboardCopy() }
+                }
+                if canPaste, let onClipboardPaste {
+                    Button("Paste") { onClipboardPaste() }
+                }
             }
             Divider()
             Button("Copy Path") {
