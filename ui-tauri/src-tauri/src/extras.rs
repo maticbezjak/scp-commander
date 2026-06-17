@@ -25,8 +25,13 @@ pub struct ExecDto {
 }
 
 #[tauri::command]
-pub fn remote_exec(cmd: String, session: State<crate::Session>) -> Result<ExecDto, String> {
-    let mut g = session.0.lock().unwrap();
+pub fn remote_exec(
+    session_id: u32,
+    cmd: String,
+    sessions: State<crate::Sessions>,
+) -> Result<ExecDto, String> {
+    let s = sessions.get(session_id).ok_or("not connected")?;
+    let mut g = s.transport.lock().unwrap();
     let t = g.as_mut().ok_or("not connected")?;
     let r = t.exec_command(&cmd).map_err(|e| e.to_string())?;
     Ok(ExecDto {

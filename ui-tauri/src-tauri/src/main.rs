@@ -1,6 +1,12 @@
 // SCP Commander — Tauri frontend. All transport logic (SFTP/FTP/FTPS/S3, the
 // transfer engine, jump host, sync, …) lives in the shared `scp-core` crate;
 // this layer exposes it to the Svelte UI as Tauri commands + events.
+//
+// Sessions: the app supports multiple concurrent server connections (tabs).
+// Each lives in a `SessionState` (its own transport + transfer pool + sync
+// engine) keyed by a numeric id in the `Sessions` registry; every remote
+// command takes a `session_id`, and transfer/sync events carry it so the UI
+// routes them to the right tab.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod extras;
@@ -8,20 +14,65 @@ mod sites;
 mod sync;
 mod transfers;
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
 use scp_core::types::{Auth, Credentials, Entry, Error, HostKeyPolicy, JumpHost, Protocol};
 use scp_core::{connect, Transport};
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use transfers::TransferManager;
 
-/// The live remote session (single session for now; tabs come later).
+/// One live server connection (a tab): its browse transport plus the per-session
+/// transfer pool and sync engine.
+pub struct SessionState {
+    pub transport: Mutex<Option<Box<dyn Transport>>>,
+    pub transfers: TransferManager,
+    pub sync: sync::SyncManager,
+}
+
+impl SessionState {
+    fn new(id: u32) -> Arc<Self> {
+        Arc::new(Self {
+            transport: Mutex::new(None),
+            transfers: TransferManager::new(id),
+            sync: sync::SyncManager::new(id),
+        })
+    }
+}
+
+/// Registry of all open sessions, keyed by id.
 #[derive(Default)]
-pub struct Session(pub Mutex<Option<Box<dyn Transport>>>);
+pub struct Sessions {
+    map: Mutex<HashMap<u32, Arc<SessionState>>>,
+    next_id: AtomicU32,
+    /// Default parallel-transfer count applied to new sessions (from prefs).
+    default_parallel: AtomicU32,
+}
+
+impl Sessions {
+    pub fn get(&self, id: u32) -> Option<Arc<SessionState>> {
+        self.map.lock().unwrap().get(&id).cloned()
+    }
+    /// Allocate a fresh session slot and return its id + state.
+    fn create(&self) -> (u32, Arc<SessionState>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let s = SessionState::new(id);
+        let p = self.default_parallel.load(Ordering::Relaxed);
+        if p > 0 {
+            s.transfers.set_max(p);
+        }
+        self.map.lock().unwrap().insert(id, s.clone());
+        (id, s)
+    }
+    fn remove(&self, id: u32) {
+        self.map.lock().unwrap().remove(&id);
+    }
+}
 
 #[derive(Deserialize)]
 pub struct ConnectForm {
@@ -89,7 +140,7 @@ impl From<&Entry> for EntryDto {
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ConnectResult {
-    Connected { entries: Vec<EntryDto>, path: String },
+    Connected { session_id: u32, entries: Vec<EntryDto>, path: String },
     UnknownHostKey { fingerprint: String },
     HostKeyMismatch { fingerprint: String },
     Error { message: String },
@@ -147,16 +198,15 @@ fn build_creds(form: &ConnectForm, host_key: HostKeyPolicy) -> Result<Credential
     Ok(creds)
 }
 
-/// Connect to the server. With no `trust_fingerprint`, uses Strict host-key
-/// checking and returns `unknown_host_key`/`host_key_mismatch` so the UI can
-/// prompt; the UI then re-calls with the approved fingerprint.
+/// Connect to a server, opening a NEW session on success and returning its id.
+/// With no `trust_fingerprint`, uses Strict host-key checking and returns
+/// `unknown_host_key`/`host_key_mismatch` so the UI can prompt; the UI then
+/// re-calls with the approved fingerprint.
 #[tauri::command]
 fn connect_session(
     form: ConnectForm,
     trust_fingerprint: Option<String>,
-    session: State<Session>,
-    transfers: State<TransferManager>,
-    sync: State<sync::SyncManager>,
+    sessions: State<Sessions>,
 ) -> ConnectResult {
     let host_key = match trust_fingerprint {
         Some(fp) => HostKeyPolicy::AcceptFingerprint(fp),
@@ -171,12 +221,12 @@ fn connect_session(
         Ok(mut transport) => match transport.list_dir(&start) {
             Ok(entries) => {
                 let dto = entries.iter().map(EntryDto::from).collect();
-                *session.0.lock().unwrap() = Some(transport);
-                // The transfer worker and sync engine each open their own link
-                // from these creds.
-                transfers.set_creds(creds.clone());
-                sync.set_creds(creds);
-                ConnectResult::Connected { entries: dto, path: start }
+                let (id, s) = sessions.create();
+                *s.transport.lock().unwrap() = Some(transport);
+                // The transfer worker and sync engine each open their own link.
+                s.transfers.set_creds(creds.clone());
+                s.sync.set_creds(creds);
+                ConnectResult::Connected { session_id: id, entries: dto, path: start }
             }
             Err(e) => ConnectResult::Error { message: e.to_string() },
         },
@@ -190,32 +240,40 @@ fn connect_session(
     }
 }
 
-/// List a remote directory on the live session.
+/// Resolve a session or return a "not connected" error string.
+fn session_of(sessions: &State<Sessions>, id: u32) -> Result<Arc<SessionState>, String> {
+    sessions.get(id).ok_or_else(|| "not connected".to_string())
+}
+
+/// List a remote directory on the given session.
 #[tauri::command]
-fn list_remote(path: String, session: State<Session>) -> Result<Vec<EntryDto>, String> {
-    let mut guard = session.0.lock().unwrap();
+fn list_remote(session_id: u32, path: String, sessions: State<Sessions>) -> Result<Vec<EntryDto>, String> {
+    let s = session_of(&sessions, session_id)?;
+    let mut guard = s.transport.lock().unwrap();
     let transport = guard.as_mut().ok_or("not connected")?;
     let entries = transport.list_dir(&path).map_err(|e| e.to_string())?;
     Ok(entries.iter().map(EntryDto::from).collect())
 }
 
 #[tauri::command]
-fn disconnect(session: State<Session>) {
-    *session.0.lock().unwrap() = None;
+fn disconnect(session_id: u32, sessions: State<Sessions>) {
+    sessions.remove(session_id);
 }
 
 // --- Remote file management -------------------------------------------------
 
 #[tauri::command]
-fn remote_mkdir(path: String, session: State<Session>) -> Result<(), String> {
-    let mut g = session.0.lock().unwrap();
+fn remote_mkdir(session_id: u32, path: String, sessions: State<Sessions>) -> Result<(), String> {
+    let s = session_of(&sessions, session_id)?;
+    let mut g = s.transport.lock().unwrap();
     let t = g.as_mut().ok_or("not connected")?;
     t.mkdir(&path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn remote_delete(path: String, is_dir: bool, session: State<Session>) -> Result<(), String> {
-    let mut g = session.0.lock().unwrap();
+fn remote_delete(session_id: u32, path: String, is_dir: bool, sessions: State<Sessions>) -> Result<(), String> {
+    let s = session_of(&sessions, session_id)?;
+    let mut g = s.transport.lock().unwrap();
     let t = g.as_mut().ok_or("not connected")?;
     if is_dir {
         scp_core::ops::remove_dir_all(t.as_mut(), &path).map_err(|e| e.to_string())
@@ -225,17 +283,84 @@ fn remote_delete(path: String, is_dir: bool, session: State<Session>) -> Result<
 }
 
 #[tauri::command]
-fn remote_rename(from: String, to: String, session: State<Session>) -> Result<(), String> {
-    let mut g = session.0.lock().unwrap();
+fn remote_rename(session_id: u32, from: String, to: String, sessions: State<Sessions>) -> Result<(), String> {
+    let s = session_of(&sessions, session_id)?;
+    let mut g = s.transport.lock().unwrap();
     let t = g.as_mut().ok_or("not connected")?;
     t.rename(&from, &to).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn remote_chmod(path: String, mode: u32, session: State<Session>) -> Result<(), String> {
-    let mut g = session.0.lock().unwrap();
+fn remote_chmod(session_id: u32, path: String, mode: u32, sessions: State<Sessions>) -> Result<(), String> {
+    let s = session_of(&sessions, session_id)?;
+    let mut g = s.transport.lock().unwrap();
     let t = g.as_mut().ok_or("not connected")?;
     t.set_permissions(&path, mode).map_err(|e| e.to_string())
+}
+
+// --- Transfers (per session) ------------------------------------------------
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn enqueue(
+    session_id: u32,
+    upload: bool,
+    is_dir: bool,
+    name: String,
+    local: String,
+    remote: String,
+    overwrite: Option<i32>,
+    app: AppHandle,
+    sessions: State<Sessions>,
+) -> Result<u64, String> {
+    let s = session_of(&sessions, session_id)?;
+    s.transfers.enqueue_job(upload, is_dir, name, local, remote, overwrite, app)
+}
+
+#[tauri::command]
+fn cancel_transfer(session_id: u32, id: u64, sessions: State<Sessions>) {
+    if let Some(s) = sessions.get(session_id) {
+        s.transfers.cancel(id);
+    }
+}
+
+/// Set the max concurrent transfers for every session and remember it as the
+/// default for sessions opened later.
+#[tauri::command]
+fn set_max_parallel(n: u32, sessions: State<Sessions>) {
+    sessions.default_parallel.store(n.max(1), Ordering::Relaxed);
+    for s in sessions.map.lock().unwrap().values() {
+        s.transfers.set_max(n);
+    }
+}
+
+// --- Sync (per session) -----------------------------------------------------
+
+#[tauri::command]
+fn sync_plan(
+    session_id: u32,
+    local: String,
+    remote: String,
+    direction: String,
+    mirror: bool,
+    sessions: State<Sessions>,
+) -> Result<sync::SyncPlanDto, String> {
+    let s = session_of(&sessions, session_id)?;
+    s.sync.plan(local, remote, direction, mirror)
+}
+
+#[tauri::command]
+fn sync_run(
+    session_id: u32,
+    local: String,
+    remote: String,
+    direction: String,
+    mirror: bool,
+    app: AppHandle,
+    sessions: State<Sessions>,
+) -> Result<(), String> {
+    let s = session_of(&sessions, session_id)?;
+    s.sync.run(local, remote, direction, mirror, app)
 }
 
 // --- Local filesystem -------------------------------------------------------
@@ -316,9 +441,7 @@ fn parent_local(path: String) -> String {
 
 fn main() {
     tauri::Builder::default()
-        .manage(Session::default())
-        .manage(TransferManager::default())
-        .manage(sync::SyncManager::default())
+        .manage(Sessions::default())
         .invoke_handler(tauri::generate_handler![
             connect_session,
             list_remote,
@@ -336,16 +459,16 @@ fn main() {
             sites::list_sites,
             sites::save_site,
             sites::delete_site,
-            sync::sync_plan,
-            sync::sync_run,
+            sync_plan,
+            sync_run,
             extras::remote_exec,
             extras::known_hosts_list,
             extras::known_hosts_remove,
             extras::load_prefs,
             extras::save_prefs,
-            transfers::enqueue,
-            transfers::cancel_transfer,
-            transfers::set_max_parallel,
+            enqueue,
+            cancel_transfer,
+            set_max_parallel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SCP Commander");

@@ -111,10 +111,17 @@
   let showKnownHosts = $state(false);
   let showPrefs = $state(false);
 
-  let connected = $state(false);
   let status = $state("Not connected");
   let busy = $state(false);
   let hostKey = $state(null);
+
+  // Sessions / tabs. Each tab is one backend session (id) with its own remote
+  // pane state; the local pane is shared across all tabs.
+  let tabs = $state([]); // [{ id, label }]
+  let activeId = $state(null); // active session id, or null when none open
+  const connected = $derived(activeId !== null);
+  const activeLabel = $derived(tabs.find((t) => t.id === activeId)?.label ?? "");
+  const tabRemote = {}; // id -> { remote, remoteSel, remoteNav, remoteRecents, remoteHome }
 
   let local = $state({ path: "", entries: [] });
   let remote = $state({ path: "", entries: [] });
@@ -164,6 +171,50 @@
     loadRemote(remoteHome);
   }
 
+  // --- tabs (sessions) ---
+  function snapshotActive() {
+    if (activeId == null) return;
+    tabRemote[activeId] = { remote, remoteSel, remoteNav, remoteRecents, remoteHome };
+  }
+  function switchTab(id) {
+    if (id === activeId) return;
+    snapshotActive();
+    const s = tabRemote[id];
+    if (s) {
+      remote = s.remote;
+      remoteSel = s.remoteSel;
+      remoteNav = s.remoteNav;
+      remoteRecents = s.remoteRecents;
+      remoteHome = s.remoteHome;
+    }
+    activeId = id;
+    busy = false;
+    status = `${remote.path} — ${remote.entries.length} item(s)`;
+  }
+  async function closeTab(id) {
+    await invoke("disconnect", { sessionId: id });
+    delete tabRemote[id];
+    const idx = tabs.findIndex((t) => t.id === id);
+    tabs = tabs.filter((t) => t.id !== id);
+    if (activeId === id) {
+      if (tabs.length) {
+        const next = tabs[Math.min(idx, tabs.length - 1)];
+        activeId = null; // force switchTab to load the snapshot
+        switchTab(next.id);
+      } else {
+        activeId = null;
+        remote = { path: "", entries: [] };
+        remoteSel = [];
+        status = "Disconnected";
+      }
+    }
+  }
+  function newSession() {
+    selectedSite = "";
+    hostKey = null;
+    showLogin = true;
+  }
+
   // Phase 3: context menu + dialogs
   let ctx = $state(null); // { x, y, items }
   let renameTarget = $state(null); // { isLocal, entry, value }
@@ -181,19 +232,22 @@
     return () => un.then((f) => f());
   });
   function onXfer(p) {
-    const t = queue.find((x) => x.id === p.id);
+    // Transfer ids are per-session, so match on both.
+    const t = queue.find((x) => x.id === p.id && x.session === p.session);
     switch (p.event) {
       case "started":
         if (!t)
-          queue.push({ id: p.id, name: p.name, upload: p.upload, done: 0, total: p.total, state: "active" });
+          queue.push({ id: p.id, session: p.session, name: p.name, upload: p.upload, done: 0, total: p.total, state: "active" });
         break;
       case "progress":
         if (t) { t.done = p.done; t.total = p.total; }
         break;
       case "done":
         if (t) { t.state = "done"; t.done = t.total || t.done; }
-        if (p.upload) loadRemote(remote.path);
-        else loadLocal(local.path);
+        // Refresh the affected pane: remote only for the active session; local
+        // is shared so always refresh on a download.
+        if (p.upload) { if (p.session === activeId) loadRemote(remote.path, false); }
+        else loadLocal(local.path, false);
         break;
       case "failed":
         if (t) { t.state = "failed"; t.error = p.message; }
@@ -235,7 +289,7 @@
     busy = true;
     try {
       const prev = remote.path;
-      const entries = await invoke("list_remote", { path });
+      const entries = await invoke("list_remote", { sessionId: activeId, path });
       if (record && prev && prev !== path) {
         remoteNav.back = [...remoteNav.back, prev];
         remoteNav.fwd = [];
@@ -280,6 +334,7 @@
   // --- transfers (with overwrite prompt) ---
   function enqueueEntry(e, upload, policy) {
     return invoke("enqueue", {
+      sessionId: activeId,
       upload,
       isDir: e.is_dir,
       name: e.name,
@@ -385,7 +440,7 @@
     const from = fullPath(isLocal, entry.name);
     const to = fullPath(isLocal, v);
     try {
-      await invoke(isLocal ? "local_rename" : "remote_rename", { from, to });
+      await invoke(isLocal ? "local_rename" : "remote_rename", { sessionId: activeId, from, to });
       refresh(isLocal);
     } catch (e) {
       status = `Rename failed: ${e}`;
@@ -397,7 +452,7 @@
     newFolder = null;
     if (!v) return;
     try {
-      await invoke(isLocal ? "local_mkdir" : "remote_mkdir", { path: fullPath(isLocal, v) });
+      await invoke(isLocal ? "local_mkdir" : "remote_mkdir", { sessionId: activeId, path: fullPath(isLocal, v) });
       refresh(isLocal);
     } catch (e) {
       status = `New folder failed: ${e}`;
@@ -407,6 +462,7 @@
     for (const e of entries) {
       try {
         await invoke(isLocal ? "local_delete" : "remote_delete", {
+          sessionId: activeId,
           path: fullPath(isLocal, e.name),
           isDir: e.is_dir,
         });
@@ -442,7 +498,7 @@
     propsTarget = null;
     if (Number.isNaN(m)) return;
     try {
-      await invoke("remote_chmod", { path: fullPath(false, entry.name), mode: m });
+      await invoke("remote_chmod", { sessionId: activeId, path: fullPath(false, entry.name), mode: m });
       refresh(false);
     } catch (e) {
       status = `chmod failed: ${e}`;
@@ -458,8 +514,8 @@
   function fmtTime(mtime) {
     return mtime ? new Date(mtime * 1000).toLocaleString() : "—";
   }
-  async function cancelTransfer(id) {
-    await invoke("cancel_transfer", { id });
+  async function cancelTransfer(item) {
+    await invoke("cancel_transfer", { sessionId: item.session, id: item.id });
   }
   function clearFinished() {
     queue = queue.filter((t) => t.state === "active");
@@ -487,17 +543,23 @@
         trustFingerprint: trustFingerprint ?? null,
       });
       switch (res.status) {
-        case "connected":
-          connected = true;
+        case "connected": {
           hostKey = null;
           showLogin = false;
+          // Save the current tab's pane state, then open the new session's tab.
+          snapshotActive();
+          const label =
+            (form.username ? form.username + "@" : "") + (form.host || form.bucket || "session");
+          tabs = [...tabs, { id: res.session_id, label }];
           remote = { path: res.path, entries: res.entries };
           remoteSel = [];
           remoteHome = res.path;
           remoteNav = { back: [], fwd: [] };
           remoteRecents = [res.path];
+          activeId = res.session_id;
           status = `Connected — ${res.entries.length} item(s)`;
           break;
+        }
         case "unknown_host_key":
           hostKey = { fingerprint: res.fingerprint, mismatch: false };
           status = "Unknown host key — confirm to continue";
@@ -515,12 +577,7 @@
     }
   }
   async function disconnect() {
-    await invoke("disconnect");
-    connected = false;
-    remote = { path: "", entries: [] };
-    remoteNav = { back: [], fwd: [] };
-    showLogin = true;
-    status = "Disconnected";
+    if (activeId != null) await closeTab(activeId);
   }
 </script>
 
@@ -529,7 +586,7 @@
 <header class="topbar">
   <span class="brand"><span class="logodot"></span> SCP Commander</span>
   {#if connected}
-    <span class="hostpill">{form.username ? form.username + "@" : ""}{form.host || form.bucket}</span>
+    <span class="hostpill">{activeLabel}</span>
   {/if}
   <span class="grow"></span>
   {#if connected}
@@ -548,6 +605,19 @@
     <button class="act primary" onclick={() => (showLogin = true)}>Connect…</button>
   {/if}
 </header>
+
+{#if tabs.length}
+  <div class="tabstrip">
+    {#each tabs as t (t.id)}
+      <div class="tab" class:active={t.id === activeId} onclick={() => switchTab(t.id)} role="button" tabindex="0">
+        <span class="tdot"></span>
+        <span class="tlabel">{t.label}</span>
+        <button class="tclose" title="Close session" onclick={(e) => (e.stopPropagation(), closeTab(t.id))}>×</button>
+      </div>
+    {/each}
+    <button class="tnew" title="New session" onclick={newSession}>＋</button>
+  </div>
+{/if}
 
 <div class="panes">
   <Pane
@@ -718,11 +788,11 @@
 {/if}
 
 {#if showSync}
-  <SyncDialog localPath={local.path} remotePath={remote.path} onClose={() => (showSync = false)} />
+  <SyncDialog sessionId={activeId} localPath={local.path} remotePath={remote.path} onClose={() => (showSync = false)} />
 {/if}
 
 {#if showConsole}
-  <ConsoleDialog remotePath={remote.path} selection={remoteSel} onClose={() => (showConsole = false)} />
+  <ConsoleDialog sessionId={activeId} remotePath={remote.path} selection={remoteSel} onClose={() => (showConsole = false)} />
 {/if}
 
 {#if showKnownHosts}
@@ -889,6 +959,67 @@
     height: 18px;
     background: var(--border);
     margin: 0 3px;
+  }
+
+  /* Tab strip */
+  .tabstrip {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 5px 10px 0;
+    overflow-x: auto;
+  }
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px 4px 10px;
+    border: 1px solid var(--border);
+    border-bottom: none;
+    border-radius: 7px 7px 0 0;
+    background: var(--panel-2);
+    color: var(--text-2);
+    font-size: 12px;
+    cursor: pointer;
+    max-width: 220px;
+    white-space: nowrap;
+  }
+  .tab.active {
+    background: var(--panel);
+    color: var(--text);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  }
+  .tab .tdot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--ok);
+    flex: none;
+  }
+  .tab .tlabel {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tclose {
+    border: none;
+    background: transparent;
+    color: var(--text-3);
+    padding: 0 2px;
+    font-size: 13px;
+    line-height: 1;
+    border-radius: 4px;
+  }
+  .tclose:hover {
+    background: var(--hover);
+    color: var(--danger);
+  }
+  .tnew {
+    border: none;
+    background: transparent;
+    color: var(--text-2);
+    font-size: 14px;
+    padding: 2px 8px;
+    border-radius: 6px;
   }
 
   /* Panes */

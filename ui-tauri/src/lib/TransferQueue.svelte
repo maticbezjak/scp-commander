@@ -44,7 +44,7 @@
           <progress max="100" value={pctOf(t)}></progress>
           <span class="qstat">{label(t)}</span>
           {#if t.state === "active"}
-            <button class="qcancel" onclick={() => onCancel(t.id)} title="Cancel">✕</button>
+            <button class="qcancel" onclick={() => onCancel(t)} title="Cancel">✕</button>
           {/if}
         </div>
       {/each}

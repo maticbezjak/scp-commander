@@ -2,7 +2,7 @@
   import { invoke, listen, humanSize } from "./api.js";
   import Modal from "./Modal.svelte";
 
-  let { localPath, remotePath, onClose } = $props();
+  let { sessionId, localPath, remotePath, onClose } = $props();
 
   let direction = $state("upload"); // "upload" = local→remote, "download" = remote→local
   let mirror = $state(false);
@@ -13,10 +13,11 @@
   let result = $state(null); // { copied, skipped, bytes }
   let error = $state("");
 
-  // Live sync progress from the backend worker.
+  // Live sync progress from the backend worker (this session only).
   $effect(() => {
     const un = listen("sync", (e) => {
       const p = e.payload;
+      if (p.session !== sessionId) return;
       if (p.event === "progress") progress = { done: p.done, total: p.total };
       else if (p.event === "done") { result = p; running = false; }
       else if (p.event === "failed") { error = p.message; running = false; }
@@ -30,6 +31,7 @@
     result = null;
     try {
       plan = await invoke("sync_plan", {
+        sessionId,
         local: localPath,
         remote: remotePath,
         direction,
@@ -50,6 +52,7 @@
     running = true;
     try {
       await invoke("sync_run", {
+        sessionId,
         local: localPath,
         remote: remotePath,
         direction,

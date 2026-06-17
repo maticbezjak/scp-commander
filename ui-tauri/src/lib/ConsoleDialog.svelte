@@ -2,7 +2,7 @@
   import { invoke } from "./api.js";
   import Modal from "./Modal.svelte";
 
-  let { remotePath, selection = [], onClose } = $props();
+  let { sessionId, remotePath, selection = [], onClose } = $props();
 
   let input = $state("");
   let log = $state([]); // { cmd, code, stdout, stderr, error }
@@ -33,7 +33,7 @@
     if (!c || busy) return;
     busy = true;
     try {
-      const r = await invoke("remote_exec", { cmd: c });
+      const r = await invoke("remote_exec", { sessionId, cmd: c });
       log = [...log, { cmd: c, code: r.exit_code, stdout: r.stdout, stderr: r.stderr }];
     } catch (e) {
       log = [...log, { cmd: c, error: String(e) }];
