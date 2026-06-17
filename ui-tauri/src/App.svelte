@@ -1,7 +1,9 @@
 <script>
-  import { invoke, listen, joinPath } from "./lib/api.js";
+  import { invoke, listen, joinPath, humanSize } from "./lib/api.js";
   import Pane from "./lib/Pane.svelte";
   import TransferQueue from "./lib/TransferQueue.svelte";
+  import Modal from "./lib/Modal.svelte";
+  import ContextMenu from "./lib/ContextMenu.svelte";
 
   const PROTOS = ["sftp", "ftp", "ftps", "s3"];
 
@@ -31,6 +33,14 @@
   let remoteAnchor = -1;
 
   let queue = $state([]);
+
+  // Phase 3: context menu + dialogs
+  let ctx = $state(null); // { x, y, items }
+  let renameTarget = $state(null); // { isLocal, entry, value }
+  let newFolder = $state(null); // { isLocal, value }
+  let deleteTarget = $state(null); // { isLocal, entries }
+  let propsTarget = $state(null); // { isLocal, entry, mode }
+  let overwrite = $state(null); // { entries, upload, count }
 
   const isSftp = $derived(form.protocol === "sftp");
   const isS3 = $derived(form.protocol === "s3");
@@ -123,23 +133,153 @@
     if (isLocal) localSel = sel; else remoteSel = sel;
   }
 
-  // --- transfers ---
-  async function transfer(entries, upload) {
-    if (!connected) return;
+  // --- transfers (with overwrite prompt) ---
+  function enqueueEntry(e, upload, policy) {
+    return invoke("enqueue", {
+      upload,
+      isDir: e.is_dir,
+      name: e.name,
+      local: joinPath(local.path, e.name, "/"),
+      remote: joinPath(remote.path, e.name),
+      overwrite: policy,
+    });
+  }
+  function transfer(entries, upload) {
+    if (!connected || !entries.length) return;
+    const dest = upload ? remote : local;
+    const destNames = new Set(dest.entries.map((e) => e.name));
+    const collisions = entries.filter((e) => destNames.has(e.name));
+    if (collisions.length) {
+      overwrite = { entries, upload, count: collisions.length };
+    } else {
+      for (const e of entries) enqueueEntry(e, upload, 0);
+    }
+  }
+  function resolveOverwrite(decision) {
+    const { entries, upload } = overwrite;
+    overwrite = null;
+    if (decision === "cancel") return;
+    const dest = upload ? remote : local;
+    const byName = new Map(dest.entries.map((e) => [e.name, e]));
+    const policy = decision === "skip" ? 1 : decision === "newer" ? 2 : 0;
     for (const e of entries) {
-      await invoke("enqueue", {
-        upload,
-        isDir: e.is_dir,
-        name: e.name,
-        local: joinPath(local.path, e.name, "/"),
-        remote: joinPath(remote.path, e.name),
-      });
+      const d = byName.get(e.name);
+      if (e.is_dir) {
+        enqueueEntry(e, upload, policy); // backend applies the policy per-file
+      } else if (!d) {
+        enqueueEntry(e, upload, 0);
+      } else if (decision === "skip") {
+        continue;
+      } else if (decision === "newer") {
+        if (e.mtime && d.mtime && e.mtime > d.mtime) enqueueEntry(e, upload, 0);
+      } else {
+        enqueueEntry(e, upload, 0);
+      }
     }
   }
   function transferSelected(fromLocal) {
     const src = fromLocal ? local : remote;
     const sel = fromLocal ? localSel : remoteSel;
     transfer(src.entries.filter((e) => sel.includes(e.name)), fromLocal);
+  }
+
+  // --- file operations (context menu + dialogs) ---
+  function fullPath(isLocal, name) {
+    return isLocal ? joinPath(local.path, name, "/") : joinPath(remote.path, name);
+  }
+  function refresh(isLocal) {
+    if (isLocal) loadLocal(local.path);
+    else loadRemote(remote.path);
+  }
+  function openContext(isLocal, entry, index, ev) {
+    rowClick(isLocal, entry, index, ev); // select the row under the cursor
+    const sel = isLocal ? localSel : remoteSel;
+    const entries = (isLocal ? local.entries : remote.entries).filter((e) =>
+      sel.includes(e.name),
+    );
+    const targets = entries.length && sel.includes(entry.name) ? entries : [entry];
+    const items = [
+      {
+        label: isLocal ? "Upload →" : "← Download",
+        action: () => transfer(targets, isLocal),
+      },
+      { label: "Rename…", action: () => (renameTarget = { isLocal, entry, value: entry.name }) },
+      {
+        label: `Delete${targets.length > 1 ? ` (${targets.length})` : ""}…`,
+        danger: true,
+        action: () => (deleteTarget = { isLocal, entries: targets }),
+      },
+      { label: "New folder…", action: () => (newFolder = { isLocal, value: "" }) },
+      {
+        label: "Properties…",
+        action: () =>
+          (propsTarget = { isLocal, entry, mode: octalPerms(entry.perms) }),
+      },
+    ];
+    ctx = { x: ev.clientX, y: ev.clientY, items };
+  }
+  async function doRename() {
+    const { isLocal, entry, value } = renameTarget;
+    const v = value.trim();
+    renameTarget = null;
+    if (!v || v === entry.name) return;
+    const from = fullPath(isLocal, entry.name);
+    const to = fullPath(isLocal, v);
+    try {
+      await invoke(isLocal ? "local_rename" : "remote_rename", { from, to });
+      refresh(isLocal);
+    } catch (e) {
+      status = `Rename failed: ${e}`;
+    }
+  }
+  async function doNewFolder() {
+    const { isLocal, value } = newFolder;
+    const v = value.trim();
+    newFolder = null;
+    if (!v) return;
+    try {
+      await invoke(isLocal ? "local_mkdir" : "remote_mkdir", { path: fullPath(isLocal, v) });
+      refresh(isLocal);
+    } catch (e) {
+      status = `New folder failed: ${e}`;
+    }
+  }
+  async function doDelete() {
+    const { isLocal, entries } = deleteTarget;
+    deleteTarget = null;
+    for (const e of entries) {
+      try {
+        await invoke(isLocal ? "local_delete" : "remote_delete", {
+          path: fullPath(isLocal, e.name),
+          isDir: e.is_dir,
+        });
+      } catch (err) {
+        status = `Delete failed: ${err}`;
+      }
+    }
+    refresh(isLocal);
+  }
+  async function doChmod() {
+    const { entry, mode } = propsTarget;
+    const m = parseInt(mode, 8);
+    propsTarget = null;
+    if (Number.isNaN(m)) return;
+    try {
+      await invoke("remote_chmod", { path: fullPath(false, entry.name), mode: m });
+      refresh(false);
+    } catch (e) {
+      status = `chmod failed: ${e}`;
+    }
+  }
+  // Extract the octal mode (e.g. "755") from a perms string like "-rwxr-xr-x".
+  function octalPerms(perms) {
+    if (!perms || perms.length < 10) return "644";
+    const tri = (s) =>
+      (s[0] === "r" ? 4 : 0) + (s[1] === "w" ? 2 : 0) + (s[2] === "x" ? 1 : 0);
+    return `${tri(perms.slice(1, 4))}${tri(perms.slice(4, 7))}${tri(perms.slice(7, 10))}`;
+  }
+  function fmtTime(mtime) {
+    return mtime ? new Date(mtime * 1000).toLocaleString() : "—";
   }
   async function cancelTransfer(id) {
     await invoke("cancel_transfer", { id });
@@ -265,6 +405,9 @@
       onTransferOne={(e) => transfer([e], true)}
       onTransfer={() => transferSelected(true)}
       onRowClick={(e, i, ev) => rowClick(true, e, i, ev)}
+      onContext={(e, i, ev) => openContext(true, e, i, ev)}
+      onNewFolder={() => (newFolder = { isLocal: true, value: "" })}
+      onRefresh={() => loadLocal(local.path)}
     />
   </div>
   <div class="panewrap" onfocusin={() => (focusLocal = false)} onpointerdown={() => (focusLocal = false)}>
@@ -283,6 +426,9 @@
         onTransferOne={(e) => transfer([e], false)}
         onTransfer={() => transferSelected(false)}
         onRowClick={(e, i, ev) => rowClick(false, e, i, ev)}
+        onContext={(e, i, ev) => openContext(false, e, i, ev)}
+        onNewFolder={() => (newFolder = { isLocal: false, value: "" })}
+        onRefresh={() => loadRemote(remote.path)}
       />
     {:else}
       <div class="placeholder">Connect to a server to browse the remote side.</div>
@@ -291,6 +437,81 @@
 </div>
 
 <TransferQueue {queue} onCancel={cancelTransfer} onClear={clearFinished} />
+
+{#if ctx}
+  <ContextMenu x={ctx.x} y={ctx.y} items={ctx.items} onClose={() => (ctx = null)} />
+{/if}
+
+{#if renameTarget}
+  <Modal title="Rename" onClose={() => (renameTarget = null)}>
+    <form onsubmit={(e) => (e.preventDefault(), doRename())}>
+      <input class="dlg-input" bind:value={renameTarget.value} autofocus />
+      <div class="dlg-actions">
+        <button type="button" onclick={() => (renameTarget = null)}>Cancel</button>
+        <button type="submit">Rename</button>
+      </div>
+    </form>
+  </Modal>
+{/if}
+
+{#if newFolder}
+  <Modal title="New folder" onClose={() => (newFolder = null)}>
+    <form onsubmit={(e) => (e.preventDefault(), doNewFolder())}>
+      <input class="dlg-input" placeholder="folder name" bind:value={newFolder.value} autofocus />
+      <div class="dlg-actions">
+        <button type="button" onclick={() => (newFolder = null)}>Cancel</button>
+        <button type="submit">Create</button>
+      </div>
+    </form>
+  </Modal>
+{/if}
+
+{#if deleteTarget}
+  <Modal title="Delete" onClose={() => (deleteTarget = null)}>
+    <p>
+      Delete {deleteTarget.entries.length === 1
+        ? `“${deleteTarget.entries[0].name}”`
+        : `${deleteTarget.entries.length} items`}?
+      {#if deleteTarget.entries.some((e) => e.is_dir)}<br /><small>Folders are removed recursively.</small>{/if}
+    </p>
+    <div class="dlg-actions">
+      <button onclick={() => (deleteTarget = null)}>Cancel</button>
+      <button class="danger" onclick={doDelete}>Delete</button>
+    </div>
+  </Modal>
+{/if}
+
+{#if propsTarget}
+  <Modal title={propsTarget.entry.name} onClose={() => (propsTarget = null)}>
+    <div class="props">
+      <span>Type</span><span>{propsTarget.entry.is_dir ? "Folder" : propsTarget.entry.is_symlink ? "Symlink" : "File"}</span>
+      <span>Size</span><span>{humanSize(propsTarget.entry.size)}</span>
+      <span>Modified</span><span>{fmtTime(propsTarget.entry.mtime)}</span>
+      {#if propsTarget.entry.perms}<span>Perms</span><span class="mono">{propsTarget.entry.perms}</span>{/if}
+    </div>
+    {#if !propsTarget.isLocal}
+      <form class="chmod" onsubmit={(e) => (e.preventDefault(), doChmod())}>
+        <label>Permissions (octal) <input class="mono" size="4" bind:value={propsTarget.mode} /></label>
+        <button type="submit">Apply</button>
+      </form>
+    {/if}
+    <div class="dlg-actions">
+      <button onclick={() => (propsTarget = null)}>Close</button>
+    </div>
+  </Modal>
+{/if}
+
+{#if overwrite}
+  <Modal title="Files already exist" onClose={() => (overwrite = null)}>
+    <p>{overwrite.count} item(s) already exist at the destination. What should happen?</p>
+    <div class="dlg-actions wrap">
+      <button class="danger" onclick={() => resolveOverwrite("overwrite")}>Overwrite</button>
+      <button onclick={() => resolveOverwrite("newer")}>Only newer</button>
+      <button onclick={() => resolveOverwrite("skip")}>Skip existing</button>
+      <button onclick={() => resolveOverwrite("cancel")}>Cancel</button>
+    </div>
+  </Modal>
+{/if}
 
 <style>
   header {
@@ -335,6 +556,47 @@
     border: 1px dashed var(--border);
     border-radius: 6px;
     opacity: 0.6;
+    font-size: 13px;
+  }
+  .dlg-input {
+    width: 100%;
+    font: inherit;
+    padding: 5px 7px;
+    margin-bottom: 12px;
+  }
+  .dlg-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .dlg-actions.wrap {
+    flex-wrap: wrap;
+  }
+  .dlg-actions button {
+    padding: 5px 12px;
+  }
+  button.danger {
+    border-color: tomato;
+    color: tomato;
+  }
+  .props {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 16px;
+    font-size: 13px;
+    margin-bottom: 12px;
+  }
+  .props span:nth-child(odd) {
+    opacity: 0.6;
+  }
+  .mono {
+    font-family: ui-monospace, monospace;
+  }
+  .chmod {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
     font-size: 13px;
   }
 </style>

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use scp_core::ops::{self, Filter, XferEvent};
+use scp_core::ops::{self, Filter, OverwritePolicy, XferEvent};
 use scp_core::types::{Credentials, Error};
 use scp_core::{connect, Transport};
 use serde::Serialize;
@@ -23,6 +23,8 @@ struct Job {
     name: String,
     local: String,
     remote: String,
+    /// Folder overwrite policy (0 overwrite, 1 skip, 2 only-newer).
+    overwrite: i32,
     cancel: Arc<AtomicBool>,
 }
 
@@ -76,6 +78,7 @@ pub fn enqueue(
     name: String,
     local: String,
     remote: String,
+    #[allow(non_snake_case)] overwrite: Option<i32>,
     app: AppHandle,
     mgr: State<TransferManager>,
 ) -> Result<u64, String> {
@@ -93,7 +96,11 @@ pub fn enqueue(
         let worker_app = app.clone();
         std::thread::spawn(move || worker(worker_inner, rx, worker_app));
     }
-    let job = Job { id, upload, is_dir, name, local, remote, cancel };
+    let job = Job {
+        id, upload, is_dir, name, local, remote,
+        overwrite: overwrite.unwrap_or(0),
+        cancel,
+    };
     sender
         .as_ref()
         .unwrap()
@@ -165,10 +172,11 @@ fn run_job(t: &mut dyn Transport, job: &Job, app: &AppHandle) -> scp_core::Resul
             true
         };
         let filter = Filter::empty();
+        let policy = OverwritePolicy::from_code(job.overwrite);
         if job.upload {
-            ops::upload_dir(t, Path::new(&job.local), &job.remote, &filter, &mut cb)
+            ops::upload_dir_opts(t, Path::new(&job.local), &job.remote, &filter, policy, &mut cb)
         } else {
-            ops::download_dir(t, &job.remote, Path::new(&job.local), &filter, &mut cb)
+            ops::download_dir_opts(t, &job.remote, Path::new(&job.local), &filter, policy, &mut cb)
         }
     } else {
         let mut progress = |done: u64, total: u64| {

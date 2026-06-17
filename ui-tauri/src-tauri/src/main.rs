@@ -161,7 +161,61 @@ fn disconnect(session: State<Session>) {
     *session.0.lock().unwrap() = None;
 }
 
+// --- Remote file management -------------------------------------------------
+
+#[tauri::command]
+fn remote_mkdir(path: String, session: State<Session>) -> Result<(), String> {
+    let mut g = session.0.lock().unwrap();
+    let t = g.as_mut().ok_or("not connected")?;
+    t.mkdir(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remote_delete(path: String, is_dir: bool, session: State<Session>) -> Result<(), String> {
+    let mut g = session.0.lock().unwrap();
+    let t = g.as_mut().ok_or("not connected")?;
+    if is_dir {
+        scp_core::ops::remove_dir_all(t.as_mut(), &path).map_err(|e| e.to_string())
+    } else {
+        t.remove_file(&path).map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+fn remote_rename(from: String, to: String, session: State<Session>) -> Result<(), String> {
+    let mut g = session.0.lock().unwrap();
+    let t = g.as_mut().ok_or("not connected")?;
+    t.rename(&from, &to).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remote_chmod(path: String, mode: u32, session: State<Session>) -> Result<(), String> {
+    let mut g = session.0.lock().unwrap();
+    let t = g.as_mut().ok_or("not connected")?;
+    t.set_permissions(&path, mode).map_err(|e| e.to_string())
+}
+
 // --- Local filesystem -------------------------------------------------------
+
+#[tauri::command]
+fn local_mkdir(path: String) -> Result<(), String> {
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn local_delete(path: String, is_dir: bool) -> Result<(), String> {
+    if is_dir {
+        std::fs::remove_dir_all(&path)
+    } else {
+        std::fs::remove_file(&path)
+    }
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn local_rename(from: String, to: String) -> Result<(), String> {
+    std::fs::rename(&from, &to).map_err(|e| e.to_string())
+}
 
 #[derive(Serialize)]
 pub struct LocalEntry {
@@ -228,6 +282,13 @@ fn main() {
             list_local,
             home_local,
             parent_local,
+            remote_mkdir,
+            remote_delete,
+            remote_rename,
+            remote_chmod,
+            local_mkdir,
+            local_delete,
+            local_rename,
             transfers::enqueue,
             transfers::cancel_transfer,
         ])

@@ -15,6 +15,9 @@
     onTransferOne, // file double-click
     onTransfer, // toolbar button (selection)
     onRowClick, // (entry, index, event)
+    onContext, // (entry, event) right-click
+    onNewFolder,
+    onRefresh,
   } = $props();
 
   let pathInput = $state("");
@@ -42,6 +45,8 @@
   <div class="pane-head">
     <span class="pane-title">{title}</span>
     <button onclick={onUp} title="Parent directory">⬆</button>
+    <button onclick={onRefresh} title="Refresh">⟳</button>
+    <button onclick={onNewFolder} title="New folder">＋</button>
     <input
       class="pathbar"
       bind:value={pathInput}
@@ -67,6 +72,7 @@
             class:sel={selected.includes(e.name)}
             onclick={(ev) => onRowClick(e, i, ev)}
             ondblclick={() => dbl(e)}
+            oncontextmenu={(ev) => (ev.preventDefault(), onContext(e, i, ev))}
           >
             <td class="name">{e.name}</td>
             <td class="size">{e.is_dir ? "" : humanSize(e.size)}</td>
