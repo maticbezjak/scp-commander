@@ -66,6 +66,8 @@ pub struct EntryDto {
     size: u64,
     mtime: Option<i64>,
     perms: Option<String>,
+    uid: Option<u32>,
+    gid: Option<u32>,
 }
 
 impl From<&Entry> for EntryDto {
@@ -77,6 +79,8 @@ impl From<&Entry> for EntryDto {
             size: e.size,
             mtime: e.mtime,
             perms: e.perms.clone(),
+            uid: e.uid,
+            gid: e.gid,
         }
     }
 }

@@ -115,14 +115,53 @@
   let busy = $state(false);
   let hostKey = $state(null);
 
-  let local = $state({ path: "/", entries: [] });
-  let remote = $state({ path: "/", entries: [] });
+  let local = $state({ path: "", entries: [] });
+  let remote = $state({ path: "", entries: [] });
   let localSel = $state([]);
   let remoteSel = $state([]);
   let localAnchor = -1;
   let remoteAnchor = -1;
 
+  // Per-pane navigation history + recent locations.
+  let localNav = $state({ back: [], fwd: [] });
+  let remoteNav = $state({ back: [], fwd: [] });
+  let localRecents = $state([]);
+  let remoteRecents = $state([]);
+  let remoteHome = $state("/");
+  let showLogin = $state(true);
+
   let queue = $state([]);
+
+  function pushRecent(isLocal, p) {
+    const arr = isLocal ? localRecents : remoteRecents;
+    const next = [p, ...arr.filter((x) => x !== p)].slice(0, 12);
+    if (isLocal) localRecents = next;
+    else remoteRecents = next;
+  }
+  function goBack(isLocal) {
+    const nav = isLocal ? localNav : remoteNav;
+    if (!nav.back.length) return;
+    const target = nav.back[nav.back.length - 1];
+    const cur = isLocal ? local.path : remote.path;
+    nav.back = nav.back.slice(0, -1);
+    nav.fwd = [cur, ...nav.fwd];
+    isLocal ? loadLocal(target, false) : loadRemote(target, false);
+  }
+  function goForward(isLocal) {
+    const nav = isLocal ? localNav : remoteNav;
+    if (!nav.fwd.length) return;
+    const target = nav.fwd[0];
+    const cur = isLocal ? local.path : remote.path;
+    nav.fwd = nav.fwd.slice(1);
+    nav.back = [...nav.back, cur];
+    isLocal ? loadLocal(target, false) : loadRemote(target, false);
+  }
+  function goHomeLocal() {
+    invoke("home_local").then((h) => loadLocal(h));
+  }
+  function goHomeRemote() {
+    loadRemote(remoteHome);
+  }
 
   // Phase 3: context menu + dialogs
   let ctx = $state(null); // { x, y, items }
@@ -171,11 +210,17 @@
     started = true;
     invoke("home_local").then(loadLocal);
   });
-  async function loadLocal(path) {
+  async function loadLocal(path, record = true) {
     try {
+      const prev = local.path;
       const entries = await invoke("list_local", { path });
+      if (record && prev && prev !== path) {
+        localNav.back = [...localNav.back, prev];
+        localNav.fwd = [];
+      }
       local = { path, entries };
       localSel = [];
+      pushRecent(true, path);
     } catch (e) {
       status = `Local: ${e}`;
     }
@@ -185,12 +230,18 @@
   }
 
   // --- remote pane ---
-  async function loadRemote(path) {
+  async function loadRemote(path, record = true) {
     busy = true;
     try {
+      const prev = remote.path;
       const entries = await invoke("list_remote", { path });
+      if (record && prev && prev !== path) {
+        remoteNav.back = [...remoteNav.back, prev];
+        remoteNav.fwd = [];
+      }
       remote = { path, entries };
       remoteSel = [];
+      pushRecent(false, path);
       status = `${path} — ${entries.length} item(s)`;
     } catch (e) {
       status = `Error: ${e}`;
@@ -369,6 +420,21 @@
     deleteTarget = null;
     await doDeleteEntries(isLocal, entries);
   }
+  // Toolbar delete/properties — honor the confirm-delete preference.
+  function requestDelete(isLocal, entries) {
+    if (!entries || !entries.length) return;
+    if (prefs.confirm_delete) deleteTarget = { isLocal, entries };
+    else doDeleteEntries(isLocal, entries);
+  }
+  function openProps(isLocal, entry) {
+    if (!entry) return;
+    propsTarget = { isLocal, entry, mode: octalPerms(entry.perms) };
+  }
+  async function toggleHidden() {
+    const next = { ...prefs, show_hidden: !prefs.show_hidden };
+    prefs = next;
+    await invoke("save_prefs", { prefs: next });
+  }
   async function doChmod() {
     const { entry, mode } = propsTarget;
     const m = parseInt(mode, 8);
@@ -423,8 +489,12 @@
         case "connected":
           connected = true;
           hostKey = null;
+          showLogin = false;
           remote = { path: res.path, entries: res.entries };
           remoteSel = [];
+          remoteHome = res.path;
+          remoteNav = { back: [], fwd: [] };
+          remoteRecents = [res.path];
           status = `Connected — ${res.entries.length} item(s)`;
           break;
         case "unknown_host_key":
@@ -446,151 +516,113 @@
   async function disconnect() {
     await invoke("disconnect");
     connected = false;
-    remote = { path: "/", entries: [] };
+    remote = { path: "", entries: [] };
+    remoteNav = { back: [], fwd: [] };
+    showLogin = true;
     status = "Disconnected";
   }
 </script>
 
 <svelte:window onkeydown={onKey} />
 
-<header>
-  <strong>SCP Commander</strong>
-  <span class="muted">— Tauri</span>
-  <span class="status">{status}</span>
+<header class="topbar">
+  <span class="brand"><span class="logodot"></span> SCP Commander</span>
+  {#if connected}
+    <span class="hostpill">{form.username ? form.username + "@" : ""}{form.host || form.bucket}</span>
+  {/if}
+  <span class="grow"></span>
+  {#if connected}
+    <button class="act" onclick={() => (showSync = true)}>Synchronize</button>
+    <button class="act" onclick={compareDirs}>Compare</button>
+    <button class="act" onclick={() => (showConsole = true)}>Console</button>
+    <span class="tvsep"></span>
+  {/if}
+  <button class="act" class:on={prefs.show_hidden} onclick={toggleHidden} title="Show hidden files">Hidden</button>
+  <button class="act" onclick={() => (showKnownHosts = true)} title="Trusted host keys">Hosts</button>
+  <button class="act" onclick={() => (showPrefs = true)} title="Preferences">Preferences</button>
+  <span class="tvsep"></span>
+  {#if connected}
+    <button class="act" onclick={disconnect}>Disconnect</button>
+  {:else}
+    <button class="act primary" onclick={() => (showLogin = true)}>Connect…</button>
+  {/if}
 </header>
 
-<form class="login" onsubmit={(e) => (e.preventDefault(), connect())}>
-  <select bind:value={form.protocol} onchange={() => (form.port = defaultPort(form.protocol))}>
-    {#each PROTOS as p}<option value={p}>{p.toUpperCase()}</option>{/each}
-  </select>
-  <input class="host" placeholder={isS3 ? "endpoint (blank = AWS)" : "host"} bind:value={form.host} />
-  <input class="port" bind:value={form.port} />
-  <input placeholder={isS3 ? "access key" : "user"} bind:value={form.username} />
-  {#if isSftp}
-    <select bind:value={form.auth_mode}>
-      <option value="password">Password</option>
-      <option value="key">Key file</option>
-      <option value="agent">Agent</option>
-    </select>
-  {/if}
-  {#if form.auth_mode === "key" && isSftp}
-    <input placeholder="~/.ssh/id_ed25519" bind:value={form.key_path} />
-  {:else if !(isSftp && form.auth_mode === "agent")}
-    <input type="password" placeholder={isS3 ? "secret key" : "password"} bind:value={form.password} />
-  {/if}
-  {#if isS3}<input placeholder="bucket" bind:value={form.bucket} />{/if}
-  {#if isSftp}
-    <label class="jump-toggle" title="Connect via a bastion / jump host">
-      <input type="checkbox" bind:checked={form.use_jump} /> Jump
-    </label>
-  {/if}
-  <span class="sites">
-    <select bind:value={selectedSite} onchange={applySite} title="Saved sites">
-      <option value="">— Sites —</option>
-      {#each sites as s}<option value={s.name}>{s.name}</option>{/each}
-    </select>
-    <button type="button" title="Save current as a site" onclick={() => (saveSiteName = form.host)}>
-      Save
-    </button>
-    <button type="button" title="Delete selected site" disabled={!selectedSite} onclick={deleteSite}>
-      🗑
-    </button>
-  </span>
-  {#if !connected}
-    <button type="submit" disabled={busy}>Connect</button>
+<div class="panes">
+  <Pane
+    kind="local"
+    title="Local"
+    path={local.path}
+    entries={local.entries}
+    showHidden={prefs.show_hidden}
+    focused={focusLocal}
+    selected={localSel}
+    transferLabel="Upload"
+    canTransfer={connected}
+    recents={localRecents}
+    canBack={localNav.back.length > 0}
+    canForward={localNav.fwd.length > 0}
+    onFocus={() => (focusLocal = true)}
+    onUp={localUp}
+    onHome={goHomeLocal}
+    onBack={() => goBack(true)}
+    onForward={() => goForward(true)}
+    onRefresh={() => loadLocal(local.path, false)}
+    onNavigate={(p) => loadLocal(p)}
+    onOpen={(e) => loadLocal(joinPath(local.path, e.name, "/"))}
+    onTransferOne={(e) => transfer([e], true)}
+    onTransfer={() => transferSelected(true)}
+    onRowClick={(e, i, ev) => rowClick(true, e, i, ev)}
+    onContext={(e, i, ev) => openContext(true, e, i, ev)}
+    onNewFolder={() => (newFolder = { isLocal: true, value: "" })}
+    onDelete={(entries) => requestDelete(true, entries)}
+    onProperties={(e) => openProps(true, e)}
+  />
+  {#if connected}
+    <Pane
+      kind="remote"
+      title="Remote"
+      path={remote.path}
+      entries={remote.entries}
+      showHidden={prefs.show_hidden}
+      showRights={true}
+      focused={!focusLocal}
+      {busy}
+      selected={remoteSel}
+      transferLabel="Download"
+      canTransfer={connected}
+      recents={remoteRecents}
+      canBack={remoteNav.back.length > 0}
+      canForward={remoteNav.fwd.length > 0}
+      onFocus={() => (focusLocal = false)}
+      onUp={remoteUp}
+      onHome={goHomeRemote}
+      onBack={() => goBack(false)}
+      onForward={() => goForward(false)}
+      onRefresh={() => loadRemote(remote.path, false)}
+      onNavigate={(p) => loadRemote(p)}
+      onOpen={(e) => loadRemote(joinPath(remote.path, e.name))}
+      onTransferOne={(e) => transfer([e], false)}
+      onTransfer={() => transferSelected(false)}
+      onRowClick={(e, i, ev) => rowClick(false, e, i, ev)}
+      onContext={(e, i, ev) => openContext(false, e, i, ev)}
+      onNewFolder={() => (newFolder = { isLocal: false, value: "" })}
+      onDelete={(entries) => requestDelete(false, entries)}
+      onProperties={(e) => openProps(false, e)}
+    />
   {:else}
-    <button type="button" onclick={disconnect}>Disconnect</button>
+    <div class="placeholder">
+      <div>
+        <p>Not connected.</p>
+        <button class="act primary" onclick={() => (showLogin = true)}>Connect…</button>
+      </div>
+    </div>
   {/if}
-</form>
-
-{#if isSftp && form.use_jump}
-  <div class="jumprow">
-    <span class="jump-label">via</span>
-    <input class="host" placeholder="jump host" bind:value={form.jump_host} />
-    <input class="port" placeholder="22" bind:value={form.jump_port} />
-    <input placeholder="jump user" bind:value={form.jump_user} />
-    <select bind:value={form.jump_auth_mode}>
-      <option value="password">Password</option>
-      <option value="key">Key file</option>
-      <option value="agent">Agent</option>
-    </select>
-    {#if form.jump_auth_mode === "key"}
-      <input placeholder="~/.ssh/id_ed25519" bind:value={form.jump_key_path} />
-    {:else if form.jump_auth_mode !== "agent"}
-      <input type="password" placeholder="jump password" bind:value={form.jump_password} />
-    {/if}
-  </div>
-{/if}
-
-{#if hostKey}
-  <div class="hostkey" class:mismatch={hostKey.mismatch}>
-    {#if hostKey.mismatch}
-      ⚠ The server's host key <code>{hostKey.fingerprint}</code> contradicts the stored one —
-      possible man-in-the-middle. Connection refused.
-      <button onclick={() => (hostKey = null)}>Dismiss</button>
-    {:else}
-      Unknown server key: <code>{hostKey.fingerprint}</code>
-      <button onclick={() => connect(hostKey.fingerprint)}>Trust & Connect</button>
-      <button onclick={() => (hostKey = null)}>Cancel</button>
-    {/if}
-  </div>
-{/if}
-
-<div class="toolbar">
-  <button disabled={!connected} onclick={() => (showSync = true)} title="Synchronize directories">⇄ Sync</button>
-  <button disabled={!connected} onclick={compareDirs} title="Select differing files">⇌ Compare</button>
-  <button disabled={!connected} onclick={() => (showConsole = true)} title="Run remote commands">⌘ Console</button>
-  <span class="sep"></span>
-  <button onclick={() => (showKnownHosts = true)} title="Manage trusted host keys">🔑 Hosts</button>
-  <button onclick={() => (showPrefs = true)} title="Preferences">⚙ Preferences</button>
 </div>
 
-<div class="panes">
-  <div class="panewrap" onfocusin={() => (focusLocal = true)} onpointerdown={() => (focusLocal = true)}>
-    <Pane
-      title="Local"
-      path={local.path}
-      entries={local.entries}
-      showHidden={prefs.show_hidden}
-      selected={localSel}
-      transferLabel="Upload →"
-      canTransfer={connected}
-      onUp={localUp}
-      onNavigate={loadLocal}
-      onOpen={(e) => loadLocal(joinPath(local.path, e.name, "/"))}
-      onTransferOne={(e) => transfer([e], true)}
-      onTransfer={() => transferSelected(true)}
-      onRowClick={(e, i, ev) => rowClick(true, e, i, ev)}
-      onContext={(e, i, ev) => openContext(true, e, i, ev)}
-      onNewFolder={() => (newFolder = { isLocal: true, value: "" })}
-      onRefresh={() => loadLocal(local.path)}
-    />
-  </div>
-  <div class="panewrap" onfocusin={() => (focusLocal = false)} onpointerdown={() => (focusLocal = false)}>
-    {#if connected}
-      <Pane
-        title="Remote"
-        path={remote.path}
-        entries={remote.entries}
-        showHidden={prefs.show_hidden}
-        {busy}
-        selected={remoteSel}
-        transferLabel="← Download"
-        canTransfer={connected}
-        onUp={remoteUp}
-        onNavigate={loadRemote}
-        onOpen={(e) => loadRemote(joinPath(remote.path, e.name))}
-        onTransferOne={(e) => transfer([e], false)}
-        onTransfer={() => transferSelected(false)}
-        onRowClick={(e, i, ev) => rowClick(false, e, i, ev)}
-        onContext={(e, i, ev) => openContext(false, e, i, ev)}
-        onNewFolder={() => (newFolder = { isLocal: false, value: "" })}
-        onRefresh={() => loadRemote(remote.path)}
-      />
-    {:else}
-      <div class="placeholder">Connect to a server to browse the remote side.</div>
-    {/if}
-  </div>
+<div class="statusbar">
+  <span class="dot" class:on={connected}></span>
+  <span class="stxt">{status}</span>
 </div>
 
 <TransferQueue {queue} onCancel={cancelTransfer} onClear={clearFinished} />
@@ -699,98 +731,301 @@
   <PrefsDialog {prefs} onSave={savePrefs} onClose={() => (showPrefs = false)} />
 {/if}
 
+{#if showLogin}
+  <Modal title="Connect to server" onClose={() => (showLogin = false)}>
+    <form class="login" onsubmit={(e) => (e.preventDefault(), connect())}>
+      <div class="lrow">
+        <label>Protocol</label>
+        <select bind:value={form.protocol} onchange={() => (form.port = defaultPort(form.protocol))}>
+          {#each PROTOS as p}<option value={p}>{p.toUpperCase()}</option>{/each}
+        </select>
+        <span class="grow"></span>
+        <select class="sitepick" bind:value={selectedSite} onchange={applySite} title="Load a saved site">
+          <option value="">— Saved sites —</option>
+          {#each sites as s}<option value={s.name}>{s.name}</option>{/each}
+        </select>
+      </div>
+
+      <div class="lrow">
+        <label>{isS3 ? "Endpoint" : "Host"}</label>
+        <input class="grow" placeholder={isS3 ? "blank = AWS" : "host"} bind:value={form.host} />
+        <label class="lbl2">Port</label>
+        <input class="port" bind:value={form.port} />
+      </div>
+
+      <div class="lrow">
+        <label>{isS3 ? "Access key" : "User"}</label>
+        <input class="grow" bind:value={form.username} />
+        {#if isSftp}
+          <select bind:value={form.auth_mode}>
+            <option value="password">Password</option>
+            <option value="key">Key file</option>
+            <option value="agent">Agent</option>
+          </select>
+        {/if}
+      </div>
+
+      {#if form.auth_mode === "key" && isSftp}
+        <div class="lrow"><label>Private key</label><input class="grow" placeholder="~/.ssh/id_ed25519" bind:value={form.key_path} /></div>
+        <div class="lrow"><label>Passphrase</label><input class="grow" type="password" bind:value={form.password} /></div>
+      {:else if !(isSftp && form.auth_mode === "agent")}
+        <div class="lrow"><label>{isS3 ? "Secret key" : "Password"}</label><input class="grow" type="password" bind:value={form.password} /></div>
+      {/if}
+
+      {#if isS3}
+        <div class="lrow">
+          <label>Bucket</label><input class="grow" bind:value={form.bucket} />
+          <label class="lbl2">Region</label><input class="port wide" placeholder="us-east-1" bind:value={form.region} />
+        </div>
+      {/if}
+
+      {#if isSftp}
+        <label class="jrow"><input type="checkbox" bind:checked={form.use_jump} /> Connect through a jump host (bastion)</label>
+        {#if form.use_jump}
+          <div class="lrow">
+            <label>Jump host</label><input class="grow" bind:value={form.jump_host} />
+            <label class="lbl2">Port</label><input class="port" bind:value={form.jump_port} />
+          </div>
+          <div class="lrow">
+            <label>Jump user</label><input class="grow" bind:value={form.jump_user} />
+            <select bind:value={form.jump_auth_mode}>
+              <option value="password">Password</option>
+              <option value="key">Key file</option>
+              <option value="agent">Agent</option>
+            </select>
+          </div>
+          {#if form.jump_auth_mode === "key"}
+            <div class="lrow"><label>Jump key</label><input class="grow" placeholder="~/.ssh/id_ed25519" bind:value={form.jump_key_path} /></div>
+          {:else if form.jump_auth_mode !== "agent"}
+            <div class="lrow"><label>Jump password</label><input class="grow" type="password" bind:value={form.jump_password} /></div>
+          {/if}
+        {/if}
+      {/if}
+
+      {#if form.protocol === "ftp"}
+        <p class="warn">⚠ Plain FTP sends credentials and data unencrypted — prefer SFTP or FTPS.</p>
+      {/if}
+
+      {#if hostKey}
+        <div class="hostkey" class:mismatch={hostKey.mismatch}>
+          {#if hostKey.mismatch}
+            ⚠ Host key <code>{hostKey.fingerprint}</code> contradicts the stored one — connection refused.
+          {:else}
+            Unknown server key: <code>{hostKey.fingerprint}</code>
+            <button type="button" class="primary" onclick={() => connect(hostKey.fingerprint)}>Trust &amp; Connect</button>
+          {/if}
+        </div>
+      {/if}
+
+      <div class="lactions">
+        <button type="button" class="ghost" disabled={!form.host && !form.bucket} onclick={() => (saveSiteName = form.host || form.bucket)}>Save site…</button>
+        <button type="button" class="ghost" disabled={!selectedSite} onclick={deleteSite}>Delete site</button>
+        <span class="grow"></span>
+        <button type="button" onclick={() => (showLogin = false)}>Close</button>
+        <button type="submit" class="primary" disabled={busy}>{busy ? "Connecting…" : "Connect"}</button>
+      </div>
+    </form>
+  </Modal>
+{/if}
+
 <style>
-  header {
+  /* Top bar */
+  .topbar {
     display: flex;
-    align-items: baseline;
-    gap: 8px;
-    padding: 8px 10px 4px;
-  }
-  .muted { opacity: 0.5; }
-  .status { margin-left: auto; font-size: 12px; opacity: 0.8; }
-  .login {
-    display: flex;
-    flex-wrap: wrap;
+    align-items: center;
     gap: 6px;
-    padding: 4px 10px 8px;
-    align-items: center;
+    padding: 7px 10px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
   }
-  .login input, .login select, .login button { font: inherit; padding: 4px 6px; }
-  .login .host { flex: 1; min-width: 140px; }
-  .login .port { width: 64px; }
-  .jump-toggle {
+  .brand {
     display: flex;
     align-items: center;
-    gap: 4px;
-    font-size: 12px;
-    white-space: nowrap;
-  }
-  .sites {
-    display: flex;
-    gap: 4px;
-    align-items: center;
-    margin-left: auto;
-  }
-  .jumprow {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    align-items: center;
-    padding: 0 10px 8px;
-  }
-  .jumprow input, .jumprow select { font: inherit; padding: 4px 6px; }
-  .jumprow .host { flex: 1; min-width: 120px; }
-  .jumprow .port { width: 64px; }
-  .jump-label {
-    font-size: 12px;
-    opacity: 0.6;
-    padding-left: 2px;
-  }
-  .hint { font-size: 12px; opacity: 0.6; margin: 0 0 12px; }
-  .hostkey {
-    margin: 0 10px 8px;
-    padding: 8px 10px;
-    border-radius: 6px;
-    background: color-mix(in srgb, orange 18%, var(--panel));
+    gap: 7px;
+    font-weight: 600;
     font-size: 13px;
   }
-  .hostkey.mismatch { background: color-mix(in srgb, red 22%, var(--panel)); }
-  .hostkey code { font-family: ui-monospace, monospace; }
-  .toolbar {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 0 10px 8px;
+  .logodot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--accent);
   }
-  .toolbar button {
-    font: inherit;
-    font-size: 12px;
-    padding: 4px 8px;
+  .hostpill {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--text-2);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 2px 9px;
   }
-  .toolbar .sep {
+  .grow {
     flex: 1;
   }
+  .act {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    color: var(--text);
+  }
+  .act.on {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    background: var(--accent-bg);
+  }
+  .act.primary {
+    color: #fff;
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .act.primary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 88%, #000);
+  }
+  .tvsep {
+    width: 1px;
+    height: 18px;
+    background: var(--border);
+    margin: 0 3px;
+  }
+
+  /* Panes */
   .panes {
     display: flex;
     gap: 8px;
-    padding: 0 10px 8px;
+    padding: 8px 10px;
     flex: 1;
     min-height: 0;
   }
-  .panewrap { display: flex; flex: 1 1 0; min-width: 0; }
   .placeholder {
-    flex: 1;
+    flex: 1 1 0;
+    min-width: 0;
     display: grid;
     place-items: center;
     border: 1px dashed var(--border);
-    border-radius: 6px;
-    opacity: 0.6;
+    border-radius: 8px;
+    color: var(--text-2);
     font-size: 13px;
+    text-align: center;
   }
+  .placeholder p {
+    margin: 0 0 10px;
+  }
+
+  /* Status bar */
+  .statusbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+    font-size: 12px;
+    color: var(--text-2);
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-3);
+    flex: none;
+  }
+  .dot.on {
+    background: var(--ok);
+  }
+  .stxt {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Login modal */
+  .login {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 460px;
+    max-width: 84vw;
+  }
+  .lrow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .lrow > label {
+    width: 86px;
+    flex: none;
+    font-size: 12px;
+    color: var(--text-2);
+  }
+  .lrow .lbl2 {
+    width: auto;
+  }
+  .lrow .grow {
+    min-width: 0;
+  }
+  .lrow .port {
+    width: 64px;
+    flex: none;
+  }
+  .lrow .port.wide {
+    width: 96px;
+  }
+  .sitepick {
+    max-width: 180px;
+  }
+  .jrow {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    margin-top: 2px;
+  }
+  .warn {
+    font-size: 12px;
+    color: var(--warn);
+    margin: 2px 0;
+  }
+  .lactions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+  .lactions button {
+    padding: 5px 12px;
+  }
+  .ghost {
+    color: var(--text-2);
+    font-size: 12px;
+  }
+  button.primary {
+    color: #fff;
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  button.primary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 88%, #000);
+  }
+  .hostkey {
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--warn) 18%, var(--panel));
+    font-size: 12.5px;
+  }
+  .hostkey.mismatch {
+    background: color-mix(in srgb, var(--danger) 20%, var(--panel));
+  }
+  .hostkey code {
+    font-family: var(--mono);
+  }
+
+  /* Shared dialog bits */
   .dlg-input {
     width: 100%;
-    font: inherit;
-    padding: 5px 7px;
+    padding: 6px 8px;
     margin-bottom: 12px;
   }
   .dlg-actions {
@@ -805,8 +1040,8 @@
     padding: 5px 12px;
   }
   button.danger {
-    border-color: tomato;
-    color: tomato;
+    border-color: var(--danger);
+    color: var(--danger);
   }
   .props {
     display: grid;
@@ -816,10 +1051,10 @@
     margin-bottom: 12px;
   }
   .props span:nth-child(odd) {
-    opacity: 0.6;
+    color: var(--text-2);
   }
   .mono {
-    font-family: ui-monospace, monospace;
+    font-family: var(--mono);
   }
   .chmod {
     display: flex;
@@ -827,5 +1062,10 @@
     gap: 8px;
     margin-bottom: 12px;
     font-size: 13px;
+  }
+  .hint {
+    font-size: 12px;
+    color: var(--text-2);
+    margin: 0 0 12px;
   }
 </style>
