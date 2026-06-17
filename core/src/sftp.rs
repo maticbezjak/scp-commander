@@ -537,12 +537,20 @@ fn sha256_fingerprint(session: &Session) -> Option<String> {
     Some(format!("SHA256:{}", base64_nopad(hash)))
 }
 
+/// The user's home directory. Uses `HOME` on Unix and falls back to
+/// `USERPROFILE` on Windows (where `HOME` is usually unset).
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 fn user_known_hosts_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".ssh/known_hosts"))
+    Some(home_dir()?.join(".ssh/known_hosts"))
 }
 
 fn app_known_hosts_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".config/scp-commander/known_hosts"))
+    Some(home_dir()?.join(".config/scp-commander/known_hosts"))
 }
 
 /// One entry in the app's trusted-host store (host + key algorithm).
