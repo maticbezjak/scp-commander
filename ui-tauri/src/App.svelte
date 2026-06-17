@@ -71,10 +71,20 @@
     saveSiteName = null;
     if (!name) return;
     const { password, jump_password, ...rest } = form;
-    await invoke("save_site", { site: { ...rest, name, port: Number(form.port) } });
-    await reloadSites();
-    selectedSite = name;
-    status = `Saved site “${name}”`;
+    const site = {
+      ...rest,
+      name,
+      port: Number(form.port) || 22, // inputs yield strings; the backend wants u16
+      jump_port: Number(form.jump_port) || 22,
+    };
+    try {
+      await invoke("save_site", { site });
+      await reloadSites();
+      selectedSite = name;
+      status = `Saved site “${name}”`;
+    } catch (e) {
+      status = `Save site failed: ${e}`;
+    }
   }
   async function deleteSite() {
     if (!selectedSite) return;
@@ -959,7 +969,7 @@
 {/if}
 
 {#if saveSiteName !== null}
-  <Modal title="Save site" onClose={() => (saveSiteName = null)}>
+  <Modal title="Save site" z={60} onClose={() => (saveSiteName = null)}>
     <form onsubmit={(e) => (e.preventDefault(), saveSite())}>
       <input class="dlg-input" placeholder="site name" bind:value={saveSiteName} autofocus />
       <p class="hint">Stores connection settings (no password).</p>

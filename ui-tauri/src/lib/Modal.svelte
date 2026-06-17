@@ -1,9 +1,9 @@
 <script>
-  let { title, onClose, children } = $props();
+  let { title, onClose, children, z = 50 } = $props();
 </script>
 
 <svelte:window onkeydown={(e) => e.key === "Escape" && onClose()} />
-<div class="backdrop" onclick={onClose} role="presentation">
+<div class="backdrop" style="z-index:{z}" onclick={onClose} role="presentation">
   <div class="modal" onclick={(e) => e.stopPropagation()} role="dialog">
     <div class="mtitle">{title}</div>
     {@render children()}
