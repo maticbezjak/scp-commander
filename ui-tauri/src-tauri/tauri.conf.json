@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SCP Commander",
+  "version": "0.1.0",
+  "identifier": "net.manto.scpcommander",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "SCP Commander",
+        "width": 1040,
+        "height": 660,
+        "minWidth": 760,
+        "minHeight": 480
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
+}
