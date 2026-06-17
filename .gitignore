@@ -17,3 +17,6 @@ ui-macos/ScpCommander.app/
 /dist/
 # Tauri's generated schema/permission files.
 ui-tauri/src-tauri/gen/
+# Tauri/Svelte frontend build output + deps (built in CI via `npm run build`).
+ui-tauri/dist/
+ui-tauri/node_modules/

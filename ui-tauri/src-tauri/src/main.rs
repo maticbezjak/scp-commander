@@ -1,39 +1,53 @@
-// SCP Commander — Tauri frontend. The heavy lifting (SFTP/FTP/FTPS/S3, the
-// transfer engine, jump host, sync, …) all lives in the shared `scp-core`
-// crate; this layer just exposes it to the web UI as Tauri commands + events.
+// SCP Commander — Tauri frontend. All transport logic (SFTP/FTP/FTPS/S3, the
+// transfer engine, jump host, sync, …) lives in the shared `scp-core` crate;
+// this layer exposes it to the Svelte UI as Tauri commands + events.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::sync::Mutex;
+mod transfers;
 
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
-use scp_core::types::{Auth, Credentials, Entry, HostKeyPolicy, Protocol};
+use scp_core::types::{Auth, Credentials, Entry, Error, HostKeyPolicy, Protocol};
 use scp_core::{connect, Transport};
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, State};
+use tauri::State;
 
-/// The one live session for the spike (multi-tab comes later).
+use transfers::TransferManager;
+
+/// The live remote session (single session for now; tabs come later).
 #[derive(Default)]
-struct Session(Mutex<Option<Box<dyn Transport>>>);
+pub struct Session(pub Mutex<Option<Box<dyn Transport>>>);
 
 #[derive(Deserialize)]
-struct ConnectForm {
+pub struct ConnectForm {
     protocol: String,
     host: String,
     port: u16,
     username: String,
     password: String,
+    /// "password" | "key" | "agent"
+    #[serde(default)]
+    auth_mode: String,
+    #[serde(default)]
+    key_path: String,
+    #[serde(default)]
+    bucket: String,
+    #[serde(default)]
+    region: String,
     #[serde(default)]
     path: String,
 }
 
 #[derive(Serialize)]
-struct EntryDto {
+pub struct EntryDto {
     name: String,
     is_dir: bool,
     is_symlink: bool,
     size: u64,
     mtime: Option<i64>,
+    perms: Option<String>,
 }
 
 impl From<&Entry> for EntryDto {
@@ -44,8 +58,19 @@ impl From<&Entry> for EntryDto {
             is_symlink: e.is_symlink,
             size: e.size,
             mtime: e.mtime,
+            perms: e.perms.clone(),
         }
     }
+}
+
+/// Result of a connect attempt — drives the host-key trust prompt in the UI.
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ConnectResult {
+    Connected { entries: Vec<EntryDto>, path: String },
+    UnknownHostKey { fingerprint: String },
+    HostKeyMismatch { fingerprint: String },
+    Error { message: String },
 }
 
 fn proto_from_str(s: &str) -> Result<Protocol, String> {
@@ -58,90 +83,74 @@ fn proto_from_str(s: &str) -> Result<Protocol, String> {
     }
 }
 
-/// Connect with the form's credentials and return the initial directory listing.
-#[tauri::command]
-fn connect_session(form: ConnectForm, session: State<Session>) -> Result<Vec<EntryDto>, String> {
+fn build_creds(form: &ConnectForm, host_key: HostKeyPolicy) -> Result<Credentials, String> {
     let protocol = proto_from_str(&form.protocol)?;
-    let creds = Credentials {
-        protocol,
-        host: form.host,
-        port: form.port,
-        username: form.username,
-        auth: Auth::Password(form.password),
-        bucket: None,
-        region: None,
-        host_key: HostKeyPolicy::AcceptNew, // TOFU for the spike
-        jump: None,
+    let auth = if protocol == Protocol::Sftp {
+        match form.auth_mode.as_str() {
+            "key" => Auth::KeyFile {
+                path: form.key_path.clone(),
+                passphrase: (!form.password.is_empty()).then(|| form.password.clone()),
+            },
+            "agent" => Auth::Agent,
+            _ => Auth::Password(form.password.clone()),
+        }
+    } else {
+        Auth::Password(form.password.clone())
     };
-    let start = if form.path.is_empty() { "/".to_string() } else { form.path };
-    let mut transport = connect(&creds).map_err(|e| e.to_string())?;
-    let entries = transport.list_dir(&start).map_err(|e| e.to_string())?;
-    let dto = entries.iter().map(EntryDto::from).collect();
-    *session.0.lock().unwrap() = Some(transport);
-    Ok(dto)
+    let mut creds = Credentials::basic(
+        protocol, form.host.clone(), form.port, form.username.clone(), auth);
+    creds.host_key = host_key;
+    if protocol == Protocol::S3 {
+        creds.bucket = (!form.bucket.is_empty()).then(|| form.bucket.clone());
+        creds.region = (!form.region.is_empty()).then(|| form.region.clone());
+    }
+    Ok(creds)
+}
+
+/// Connect to the server. With no `trust_fingerprint`, uses Strict host-key
+/// checking and returns `unknown_host_key`/`host_key_mismatch` so the UI can
+/// prompt; the UI then re-calls with the approved fingerprint.
+#[tauri::command]
+fn connect_session(
+    form: ConnectForm,
+    trust_fingerprint: Option<String>,
+    session: State<Session>,
+) -> ConnectResult {
+    let host_key = match trust_fingerprint {
+        Some(fp) => HostKeyPolicy::AcceptFingerprint(fp),
+        None => HostKeyPolicy::Strict,
+    };
+    let creds = match build_creds(&form, host_key) {
+        Ok(c) => c,
+        Err(message) => return ConnectResult::Error { message },
+    };
+    let start = if form.path.is_empty() { "/".to_string() } else { form.path.clone() };
+    match connect(&creds) {
+        Ok(mut transport) => match transport.list_dir(&start) {
+            Ok(entries) => {
+                let dto = entries.iter().map(EntryDto::from).collect();
+                *session.0.lock().unwrap() = Some(transport);
+                ConnectResult::Connected { entries: dto, path: start }
+            }
+            Err(e) => ConnectResult::Error { message: e.to_string() },
+        },
+        Err(Error::UnknownHostKey { fingerprint }) => {
+            ConnectResult::UnknownHostKey { fingerprint }
+        }
+        Err(Error::HostKeyMismatch { fingerprint }) => {
+            ConnectResult::HostKeyMismatch { fingerprint }
+        }
+        Err(e) => ConnectResult::Error { message: e.to_string() },
+    }
 }
 
 /// List a remote directory on the live session.
 #[tauri::command]
-fn list_dir(path: String, session: State<Session>) -> Result<Vec<EntryDto>, String> {
+fn list_remote(path: String, session: State<Session>) -> Result<Vec<EntryDto>, String> {
     let mut guard = session.0.lock().unwrap();
     let transport = guard.as_mut().ok_or("not connected")?;
     let entries = transport.list_dir(&path).map_err(|e| e.to_string())?;
     Ok(entries.iter().map(EntryDto::from).collect())
-}
-
-#[derive(Clone, Serialize)]
-struct Progress {
-    name: String,
-    done: u64,
-    total: u64,
-}
-
-/// Download a remote file to a local path, emitting "xfer-progress" events as
-/// bytes flow. Returns the total bytes written.
-#[tauri::command]
-fn download(
-    remote: String,
-    local: String,
-    app: tauri::AppHandle,
-    session: State<Session>,
-) -> Result<u64, String> {
-    let name = remote.rsplit('/').next().unwrap_or(&remote).to_string();
-    let mut guard = session.0.lock().unwrap();
-    let transport = guard.as_mut().ok_or("not connected")?;
-    let mut progress = |done: u64, total: u64| {
-        let _ = app.emit("xfer-progress", Progress { name: name.clone(), done, total });
-        true
-    };
-    transport
-        .download_progress(&remote, Path::new(&local), &mut progress)
-        .map_err(|e| e.to_string())
-}
-
-/// Upload a local file to a remote path, emitting progress events.
-#[tauri::command]
-fn upload(
-    local: String,
-    remote: String,
-    app: tauri::AppHandle,
-    session: State<Session>,
-) -> Result<u64, String> {
-    let name = remote.rsplit('/').next().unwrap_or(&remote).to_string();
-    let mut guard = session.0.lock().unwrap();
-    let transport = guard.as_mut().ok_or("not connected")?;
-    let mut progress = |done: u64, total: u64| {
-        let _ = app.emit("xfer-progress", Progress { name: name.clone(), done, total });
-        true
-    };
-    transport
-        .upload_progress(Path::new(&local), &remote, &mut progress)
-        .map_err(|e| e.to_string())
-}
-
-/// The OS temp dir — where the spike drops downloads.
-#[tauri::command]
-fn temp_dir() -> String {
-    std::env::temp_dir().to_string_lossy().into_owned()
 }
 
 #[tauri::command]
@@ -149,16 +158,75 @@ fn disconnect(session: State<Session>) {
     *session.0.lock().unwrap() = None;
 }
 
+// --- Local filesystem -------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct LocalEntry {
+    name: String,
+    is_dir: bool,
+    is_symlink: bool,
+    size: u64,
+    mtime: Option<i64>,
+}
+
+/// List a local directory (the left pane).
+#[tauri::command]
+fn list_local(path: String) -> Result<Vec<LocalEntry>, String> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        out.push(LocalEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir: meta.is_dir(),
+            is_symlink: meta.file_type().is_symlink(),
+            size: meta.len(),
+            mtime,
+        });
+    }
+    Ok(out)
+}
+
+/// The user's home directory (initial local pane location).
+#[tauri::command]
+fn home_local() -> String {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| h.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/".to_string())
+}
+
+/// The parent of a local path (for the Up button), or the path itself at root.
+#[tauri::command]
+fn parent_local(path: String) -> String {
+    Path::new(&path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty())
+        .unwrap_or(path)
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(Session::default())
+        .manage(TransferManager::default())
         .invoke_handler(tauri::generate_handler![
             connect_session,
-            list_dir,
-            download,
-            upload,
-            temp_dir,
-            disconnect
+            list_remote,
+            disconnect,
+            list_local,
+            home_local,
+            parent_local,
+            transfers::download,
+            transfers::upload,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SCP Commander");

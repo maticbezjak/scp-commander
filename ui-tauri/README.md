@@ -8,21 +8,32 @@ GTK apps — and the UI is plain web (`dist/index.html`), so one codebase runs o
 ## Layout
 
 - `src-tauri/` — the Rust backend: `#[tauri::command]` handlers wrap `scp-core`
-  (connect, list_dir, …) and stream progress as Tauri events. Depends on the
-  `scp-core` path crate; no FFI/sidecar needed.
-- `dist/` — the static web UI (vanilla JS via `window.__TAURI__`, no npm build).
+  (connect, list, transfers, …) and stream progress as Tauri events. Depends on
+  the `scp-core` path crate; no FFI/sidecar needed.
+- `src/` — the **Svelte 5 + Vite** frontend (`App.svelte`, `lib/Pane.svelte`,
+  `lib/api.js`). Talks to the backend via `window.__TAURI__` (so no
+  `@tauri-apps/api` dependency).
+- `dist/` — Vite build output (gitignored; built by `npm run build`).
 
 ## Run / build
 
 ```sh
-# Plain cargo (builds the binary; opens the window on a desktop session):
-cargo run -p scp-tauri
+cd ui-tauri
+npm install                 # once
 
-# Or with the Tauri CLI (live reload, bundling):
+# Dev with live reload (Tauri spins up Vite via beforeDevCommand):
 cargo install tauri-cli --version '^2'
-cargo tauri dev      # from ui-tauri/src-tauri
-cargo tauri build    # produces installers under target/release/bundle
+cargo tauri dev             # from ui-tauri/src-tauri
+
+# Plain cargo: build the frontend first so `frontendDist` exists, then:
+npm run build
+cargo build -p scp-tauri    # from the repo root
+
+cargo tauri build           # installers under target/release/bundle
 ```
+
+CI builds the frontend (`npm ci && npm run build`) before `cargo build` on all
+three OSes and uploads the Windows binary as an artifact.
 
 ## Windows
 
