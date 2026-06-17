@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Site {
     pub name: String,
     /// Index into the protocol dropdown: 0=SFTP, 1=FTP, 2=FTPS, 3=S3.
@@ -35,6 +35,17 @@ pub struct Site {
     pub remote_dir: String,
     #[serde(default)]
     pub local_dir: String,
+    /// SFTP bastion (empty jump_host = none). jump_auth: 0 pass, 1 key, 2 agent.
+    #[serde(default)]
+    pub jump_host: String,
+    #[serde(default)]
+    pub jump_port: String,
+    #[serde(default)]
+    pub jump_user: String,
+    #[serde(default)]
+    pub jump_auth: u32,
+    #[serde(default)]
+    pub jump_key_path: String,
 }
 
 impl Site {
@@ -127,6 +138,7 @@ impl SiteExport {
             region: self.region,
             remote_dir: self.remote_dir,
             local_dir: self.local_dir,
+            ..Default::default()
         }
     }
 }
@@ -292,6 +304,7 @@ impl SitesStore {
             region: String::new(),
             remote_dir: s.remote_dir,
             local_dir: s.local_dir,
+            ..Default::default()
         });
         true
     }
@@ -375,6 +388,7 @@ impl SitesStore {
                     region: String::new(),
                     remote_dir: String::new(),
                     local_dir: String::new(),
+                    ..Default::default()
                 });
                 count += 1;
             }
@@ -588,6 +602,7 @@ Host db
             region: "us-east-1".into(),
             remote_dir: String::new(),
             local_dir: String::new(),
+            ..Default::default()
         });
         let json = s.export_interchange().unwrap();
         let mut other = store();

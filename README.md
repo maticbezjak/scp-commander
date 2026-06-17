@@ -91,6 +91,16 @@ unit-tested against an in-memory fake transport (`cargo test -p scp-core`).
    If the server's host key is new, a fingerprint prompt appears — review it and
    click **Trust & Connect** to accept.
 
+### Jump host (bastion / ProxyJump)
+
+To reach an SFTP server that's only accessible through a bastion, tick
+**Connect through a jump host** in the Login dialog and fill in the bastion's
+host/port/user and auth (password, key, or agent). The app authenticates to the
+bastion, opens a tunnel to the target, and runs the whole SFTP session
+end-to-end over it — the target's own host key is what gets verified. Jump
+settings are saved with the site (the bastion password is re-entered or, better,
+use a key/agent).
+
 ### Saving sites
 
 Click **Save site…** in the Login dialog to bookmark the current credentials

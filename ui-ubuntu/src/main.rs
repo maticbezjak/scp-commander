@@ -36,7 +36,7 @@ use gtk::{
     MultiSelection,
 };
 
-use scp_core::types::{Auth, Credentials, Entry, HostKeyPolicy, Protocol};
+use scp_core::types::{Auth, Credentials, Entry, HostKeyPolicy, JumpHost, Protocol};
 use sites::{Site, SitesStore};
 use worker::{Cmd, Event, PauseFlag};
 
@@ -209,6 +209,14 @@ struct App {
     key_entry: GtkEntry,
     bucket_entry: GtkEntry,
     region_entry: GtkEntry,
+    // SFTP jump host (bastion / ProxyJump)
+    jump_check: gtk::CheckButton,
+    jump_host_entry: GtkEntry,
+    jump_port_entry: GtkEntry,
+    jump_user_entry: GtkEntry,
+    jump_pass_entry: PasswordEntry,
+    jump_auth_dd: DropDown,
+    jump_key_entry: GtkEntry,
     // Host key trust prompt
     hostkey_bar: GtkBox,
     hostkey_label: Label,
@@ -640,7 +648,35 @@ impl App {
             let region = self.region_entry.text().to_string();
             creds.region = (!region.is_empty()).then_some(region);
         }
+        creds.jump = self.read_jump_host(protocol);
         self.start_connect(creds);
+    }
+
+    /// Build a JumpHost from the form when enabled (SFTP only, host non-empty).
+    fn read_jump_host(&self, protocol: Protocol) -> Option<JumpHost> {
+        if protocol != Protocol::Sftp || !self.jump_check.is_active() {
+            return None;
+        }
+        let host = self.jump_host_entry.text().to_string();
+        if host.is_empty() {
+            return None;
+        }
+        let pass = self.jump_pass_entry.text().to_string();
+        let auth = match self.jump_auth_dd.selected() {
+            1 => Auth::KeyFile {
+                path: self.jump_key_entry.text().to_string(),
+                passphrase: (!pass.is_empty()).then_some(pass),
+            },
+            2 => Auth::Agent,
+            _ => Auth::Password(pass),
+        };
+        Some(JumpHost {
+            host,
+            port: self.jump_port_entry.text().parse::<u16>().unwrap_or(22),
+            username: self.jump_user_entry.text().to_string(),
+            auth,
+            host_key: HostKeyPolicy::AcceptNew,
+        })
     }
 
     fn start_connect(&self, creds: Credentials) {
@@ -2451,6 +2487,15 @@ impl App {
             region: self.region_entry.text().to_string(),
             remote_dir,
             local_dir,
+            jump_host: if is_sftp && self.jump_check.is_active() {
+                self.jump_host_entry.text().to_string()
+            } else {
+                String::new()
+            },
+            jump_port: self.jump_port_entry.text().to_string(),
+            jump_user: self.jump_user_entry.text().to_string(),
+            jump_auth: self.jump_auth_dd.selected(),
+            jump_key_path: self.jump_key_entry.text().to_string(),
         };
         let account = Self::site_account(&site);
         self.sites.borrow_mut().add(site);
@@ -2479,6 +2524,13 @@ impl App {
         self.key_entry.set_text(&site.key_path);
         self.bucket_entry.set_text(&site.bucket);
         self.region_entry.set_text(&site.region);
+        self.jump_check.set_active(!site.jump_host.is_empty());
+        self.jump_host_entry.set_text(&site.jump_host);
+        self.jump_port_entry.set_text(if site.jump_port.is_empty() { "22" } else { &site.jump_port });
+        self.jump_user_entry.set_text(&site.jump_user);
+        self.jump_auth_dd.set_selected(site.jump_auth);
+        self.jump_key_entry.set_text(&site.jump_key_path);
+        self.jump_pass_entry.set_text("");
         if !site.remote_dir.is_empty() {
             *self.session().remote_path.borrow_mut() = site.remote_dir.clone();
         }
@@ -3417,6 +3469,14 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     key_browse.set_tooltip_text(Some("Choose a private key"));
     let bucket_entry = GtkEntry::builder().build();
     let region_entry = GtkEntry::builder().placeholder_text("us-east-1").build();
+    // Jump host (bastion / ProxyJump) — SFTP only.
+    let jump_check = gtk::CheckButton::with_label("Connect through a jump host (bastion)");
+    let jump_host_entry = GtkEntry::builder().hexpand(true).placeholder_text("bastion.example.com").build();
+    let jump_port_entry = GtkEntry::builder().text("22").max_width_chars(6).width_chars(6).build();
+    let jump_user_entry = GtkEntry::builder().build();
+    let jump_pass_entry = PasswordEntry::builder().show_peek_icon(true).hexpand(true).build();
+    let jump_auth_dd = DropDown::from_strings(&AUTH_LABELS);
+    let jump_key_entry = GtkEntry::builder().hexpand(true).placeholder_text("~/.ssh/id_ed25519").build();
 
     let form_label = |text: &str| {
         let l = Label::builder().label(text).xalign(0.0).build();
@@ -3475,6 +3535,35 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
     insecure_label.add_css_class("warning");
     form.attach(&insecure_label, 0, 9, 5, 1);
 
+    // Jump-host rows (10–14). Visibility is driven by the checkbox + SFTP.
+    let jump_host_label = form_label("Jump host:");
+    let jump_port_label = form_label("Jump port:");
+    let jump_user_label = form_label("Jump user:");
+    let jump_auth_label = form_label("Jump auth:");
+    let jump_pass_label = form_label("Jump password:");
+    let jump_key_label = form_label("Jump key:");
+    form.attach(&jump_check, 0, 10, 5, 1);
+    form.attach(&jump_host_label, 0, 11, 1, 1);
+    form.attach(&jump_host_entry, 1, 11, 2, 1);
+    form.attach(&jump_port_label, 3, 11, 1, 1);
+    form.attach(&jump_port_entry, 4, 11, 1, 1);
+    form.attach(&jump_user_label, 0, 12, 1, 1);
+    form.attach(&jump_user_entry, 1, 12, 1, 1);
+    form.attach(&jump_auth_label, 0, 13, 1, 1);
+    form.attach(&jump_auth_dd, 1, 13, 1, 1);
+    form.attach(&jump_pass_label, 0, 14, 1, 1);
+    form.attach(&jump_pass_entry, 1, 14, 2, 1);
+    form.attach(&jump_key_label, 0, 15, 1, 1);
+    form.attach(&jump_key_entry, 1, 15, 2, 1);
+    // Base jump rows shown whenever the checkbox is on (pass/key handled by
+    // the jump auth mode separately).
+    let jump_base_rows: Vec<gtk::Widget> = vec![
+        jump_host_label.clone().upcast(), jump_host_entry.clone().upcast(),
+        jump_port_label.clone().upcast(), jump_port_entry.clone().upcast(),
+        jump_user_label.clone().upcast(), jump_user_entry.clone().upcast(),
+        jump_auth_label.clone().upcast(), jump_auth_dd.clone().upcast(),
+    ];
+
     // The pickers drive the default port, field visibility, and label text.
     let update_form = {
         let proto_dd = proto_dd.clone();
@@ -3494,6 +3583,13 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         let region_entry = region_entry.clone();
         let insecure_label = insecure_label.clone();
         let host_for_warn = host_entry.clone();
+        let jump_check = jump_check.clone();
+        let jump_base_rows = jump_base_rows.clone();
+        let jump_auth_dd_v = jump_auth_dd.clone();
+        let jump_pass_label = jump_pass_label.clone();
+        let jump_pass_entry = jump_pass_entry.clone();
+        let jump_key_label = jump_key_label.clone();
+        let jump_key_entry = jump_key_entry.clone();
         let last_proto = std::cell::Cell::new(u32::MAX);
         Rc::new(move || {
             let selected = proto_dd.selected();
@@ -3539,10 +3635,27 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
                 "\u{26a0} Plain FTP sends your password and data unencrypted \u{2014} prefer SFTP or FTPS."
             });
             insecure_label.set_visible(insecure);
+
+            // Jump host: checkbox SFTP-only; rows follow the checkbox; the
+            // pass/key field follows the jump auth mode.
+            jump_check.set_visible(is_sftp);
+            let jump_on = is_sftp && jump_check.is_active();
+            for w in &jump_base_rows {
+                w.set_visible(jump_on);
+            }
+            let jauth = jump_auth_dd_v.selected();
+            jump_pass_label.set_visible(jump_on && jauth == 0);
+            jump_pass_entry.set_visible(jump_on && jauth == 0);
+            jump_key_label.set_visible(jump_on && jauth == 1);
+            jump_key_entry.set_visible(jump_on && jauth == 1);
         })
     };
     let hook = update_form.clone();
     proto_dd.connect_selected_notify(move |_| hook());
+    let hook = update_form.clone();
+    jump_check.connect_toggled(move |_| hook());
+    let hook = update_form.clone();
+    jump_auth_dd.connect_selected_notify(move |_| hook());
     let hook = update_form.clone();
     auth_dd.connect_selected_notify(move |_| hook());
     let hook = update_form.clone();
@@ -4025,6 +4138,13 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         key_entry,
         bucket_entry,
         region_entry,
+        jump_check,
+        jump_host_entry,
+        jump_port_entry,
+        jump_user_entry,
+        jump_pass_entry,
+        jump_auth_dd,
+        jump_key_entry,
         hostkey_bar,
         hostkey_label,
         pending_connect: RefCell::new(None),
