@@ -115,6 +115,7 @@ fn connect_session(
     form: ConnectForm,
     trust_fingerprint: Option<String>,
     session: State<Session>,
+    transfers: State<TransferManager>,
 ) -> ConnectResult {
     let host_key = match trust_fingerprint {
         Some(fp) => HostKeyPolicy::AcceptFingerprint(fp),
@@ -130,6 +131,8 @@ fn connect_session(
             Ok(entries) => {
                 let dto = entries.iter().map(EntryDto::from).collect();
                 *session.0.lock().unwrap() = Some(transport);
+                // The transfer worker opens its own link from these creds.
+                transfers.set_creds(creds);
                 ConnectResult::Connected { entries: dto, path: start }
             }
             Err(e) => ConnectResult::Error { message: e.to_string() },
@@ -225,8 +228,8 @@ fn main() {
             list_local,
             home_local,
             parent_local,
-            transfers::download,
-            transfers::upload,
+            transfers::enqueue,
+            transfers::cancel_transfer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SCP Commander");

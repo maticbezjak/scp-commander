@@ -1,12 +1,25 @@
 <script>
   import { humanSize } from "./api.js";
 
-  let { title, path = "/", entries = [], busy = false, onOpen, onUp, onNavigate } =
-    $props();
+  let {
+    title,
+    path = "/",
+    entries = [],
+    busy = false,
+    selected = [],
+    transferLabel = "",
+    canTransfer = false,
+    onUp,
+    onNavigate,
+    onOpen, // folder double-click
+    onTransferOne, // file double-click
+    onTransfer, // toolbar button (selection)
+    onRowClick, // (entry, index, event)
+  } = $props();
 
-  let pathInput = $state(path);
+  let pathInput = $state("");
   $effect(() => {
-    pathInput = path; // reflect external navigation
+    pathInput = path; // mirror external navigation into the editable field
   });
 
   // Folders first, then case-insensitive by name.
@@ -19,6 +32,10 @@
   function rowClass(e) {
     return e.is_symlink ? "link" : e.is_dir ? "dir" : "file";
   }
+  function dbl(e) {
+    if (e.is_dir) onOpen(e);
+    else onTransferOne(e);
+  }
 </script>
 
 <div class="pane">
@@ -30,6 +47,11 @@
       bind:value={pathInput}
       onkeydown={(e) => e.key === "Enter" && onNavigate(pathInput)}
     />
+    {#if transferLabel}
+      <button class="xfer" disabled={!canTransfer || selected.length === 0} onclick={onTransfer}>
+        {transferLabel}
+      </button>
+    {/if}
   </div>
 
   <div class="rows" class:busy>
@@ -38,19 +60,15 @@
         <tr><th class="name">Name</th><th class="size">Size</th></tr>
       </thead>
       <tbody>
-        <tr class="dir">
-          <td class="name" onclick={onUp}>..</td>
-          <td></td>
-        </tr>
-        {#each sorted as e (e.name)}
-          <tr class={rowClass(e)}>
-            <td
-              class="name"
-              ondblclick={() => e.is_dir && onOpen(e)}
-              onclick={() => e.is_dir && onOpen(e)}
-            >
-              {e.name}
-            </td>
+        <tr class="dir"><td class="name" ondblclick={onUp}>..</td><td></td></tr>
+        {#each sorted as e, i (e.name)}
+          <tr
+            class={rowClass(e)}
+            class:sel={selected.includes(e.name)}
+            onclick={(ev) => onRowClick(e, i, ev)}
+            ondblclick={() => dbl(e)}
+          >
+            <td class="name">{e.name}</td>
             <td class="size">{e.is_dir ? "" : humanSize(e.size)}</td>
           </tr>
         {/each}
@@ -88,6 +106,10 @@
     font-size: 12px;
     padding: 3px 6px;
   }
+  .xfer {
+    font-size: 12px;
+    white-space: nowrap;
+  }
   .rows {
     overflow: auto;
     flex: 1;
@@ -108,6 +130,7 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    user-select: none;
   }
   th.size,
   td.size {
@@ -119,9 +142,14 @@
     max-width: 0;
     width: 100%;
   }
+  tbody tr {
+    cursor: default;
+  }
+  tbody tr.sel {
+    background: color-mix(in srgb, var(--accent, dodgerblue) 30%, transparent);
+  }
   tr.dir td.name {
     font-weight: 600;
-    cursor: pointer;
   }
   tr.dir td.name::before {
     content: "📁 ";
