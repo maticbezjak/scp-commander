@@ -14,10 +14,10 @@
     "windows": [
       {
         "title": "SCP Commander",
-        "width": 1040,
-        "height": 660,
-        "minWidth": 760,
-        "minHeight": 480
+        "width": 1280,
+        "height": 820,
+        "minWidth": 980,
+        "minHeight": 600
       }
     ]
   },

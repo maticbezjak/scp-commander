@@ -90,6 +90,7 @@
     confirm_overwrite: true,
     atomic_uploads: true,
     max_parallel: 2,
+    show_owner_group: false,
   });
   $effect(() => {
     invoke("load_prefs").then((p) => {
@@ -586,6 +587,7 @@
       entries={remote.entries}
       showHidden={prefs.show_hidden}
       showRights={true}
+      showOwnerGroup={prefs.show_owner_group}
       focused={!focusLocal}
       {busy}
       selected={remoteSel}

@@ -10,6 +10,7 @@
     selected = [],
     showHidden = true,
     showRights = false,
+    showOwnerGroup = false,
     focused = false,
     canTransfer = false,
     transferLabel = "",
@@ -43,7 +44,7 @@
   let ascending = $state(true);
 
   // Resizable column widths, persisted per pane in localStorage.
-  const DEFAULTS = { size: 84, type: 120, changed: 132, owner: 58, group: 58, rights: 96 };
+  const DEFAULTS = { size: 64, type: 92, changed: 118, owner: 48, group: 48, rights: 88 };
   function loadWidths() {
     try {
       return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(`colw.${kind}`) || "{}") };
@@ -80,12 +81,16 @@
     { key: "type", label: "Type", sort: "type", align: "left" },
     { key: "changed", label: "Changed", sort: "mtime", align: "left" },
   ];
-  const RIGHTS = [
+  const OWNER_GROUP = [
     { key: "owner", label: "Owner", align: "right" },
     { key: "group", label: "Group", align: "right" },
-    { key: "rights", label: "Rights", align: "left", mono: true },
   ];
-  let cols = $derived(showRights ? [...BASE, ...RIGHTS] : BASE);
+  const RIGHTS = { key: "rights", label: "Rights", align: "left", mono: true };
+  let cols = $derived(
+    showRights
+      ? [...BASE, ...(showOwnerGroup ? OWNER_GROUP : []), RIGHTS]
+      : BASE,
+  );
 
   const EXT = {
     txt: "Text", md: "Markdown", log: "Log", json: "JSON", yml: "YAML", yaml: "YAML",

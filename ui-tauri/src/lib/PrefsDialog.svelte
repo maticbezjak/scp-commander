@@ -14,6 +14,7 @@
 <Modal title="Preferences" {onClose}>
   <div class="prefs">
     <label><input type="checkbox" bind:checked={p.show_hidden} /> Show hidden files (dotfiles)</label>
+    <label><input type="checkbox" bind:checked={p.show_owner_group} /> Show Owner/Group columns (remote)</label>
     <label><input type="checkbox" bind:checked={p.confirm_delete} /> Confirm before deleting</label>
     <label><input type="checkbox" bind:checked={p.confirm_overwrite} /> Prompt when files already exist</label>
     <label><input type="checkbox" bind:checked={p.atomic_uploads} /> Atomic uploads (temp name + rename)</label>

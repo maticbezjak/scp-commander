@@ -86,6 +86,10 @@ pub struct Prefs {
     pub atomic_uploads: bool,
     #[serde(default = "two")]
     pub max_parallel: u32,
+    /// Show Owner/Group columns on the remote pane (off by default — the values
+    /// are uninformative on many servers and crowd the listing).
+    #[serde(default)]
+    pub show_owner_group: bool,
 }
 
 impl Default for Prefs {
@@ -96,6 +100,7 @@ impl Default for Prefs {
             confirm_overwrite: true,
             atomic_uploads: true,
             max_parallel: 2,
+            show_owner_group: false,
         }
     }
 }
