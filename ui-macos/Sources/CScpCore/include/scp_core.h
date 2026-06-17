@@ -43,7 +43,15 @@ ScpSession *scp_connect(int protocol,
                         int host_key_mode,
                         const char *expected_fingerprint,
                         int auth_mode,
-                        const char *key_path);
+                        const char *key_path,
+                        /* Optional SFTP bastion (NULL/empty jump_host = none).
+                         * jump_auth_mode: 0 password, 1 key file, 2 agent. */
+                        const char *jump_host,
+                        uint16_t jump_port,
+                        const char *jump_username,
+                        const char *jump_password,
+                        int jump_auth_mode,
+                        const char *jump_key_path);
 
 /* Classify the last error on this thread (SCP_ERR_*). */
 int scp_last_error_code(void);

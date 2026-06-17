@@ -926,6 +926,44 @@ private struct SessionForm: View {
                     }
                 }
             }
+            if isSftp {
+                Divider().padding(.vertical, 2)
+                Toggle("Connect through a jump host (bastion)", isOn: $state.useJump)
+                if state.useJump {
+                    Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
+                        GridRow {
+                            Text("Jump host:")
+                            TextField("bastion.example.com", text: $state.jumpHost)
+                        }
+                        GridRow {
+                            Text("Jump port:")
+                            TextField("22", text: $state.jumpPort).frame(width: 80)
+                        }
+                        GridRow {
+                            Text("Jump user:")
+                            TextField("user", text: $state.jumpUser)
+                        }
+                        GridRow {
+                            Text("Jump auth:")
+                            Picker("", selection: $state.jumpAuthMode) {
+                                ForEach(AuthMode.allCases, id: \.self) { Text($0.label).tag($0) }
+                            }
+                            .labelsHidden().frame(width: 160)
+                        }
+                        if state.jumpAuthMode == .keyFile {
+                            GridRow {
+                                Text("Jump key:")
+                                TextField("~/.ssh/id_ed25519", text: $state.jumpKeyPath)
+                            }
+                        } else if state.jumpAuthMode != .agent {
+                            GridRow {
+                                Text("Jump password:")
+                                SecureField("", text: $state.jumpPassword)
+                            }
+                        }
+                    }
+                }
+            }
             if state.proto == .ftp {
                 Label(
                     "Plain FTP sends your password and data unencrypted — prefer SFTP or FTPS.",

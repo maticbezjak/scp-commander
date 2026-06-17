@@ -28,6 +28,12 @@ final class TransferClientPool {
         let authMode: AuthMode
         let keyPath: String
         let trustedFingerprint: String
+        let jumpHost: String
+        let jumpPort: UInt16
+        let jumpUser: String
+        let jumpPassword: String
+        let jumpAuthMode: AuthMode
+        let jumpKeyPath: String
     }
 
     private let slots: [Slot]
@@ -48,11 +54,16 @@ final class TransferClientPool {
                     user: String, password: String,
                     bucket: String, region: String,
                     authMode: AuthMode, keyPath: String,
-                    trustedFingerprint: String) {
+                    trustedFingerprint: String,
+                    jumpHost: String = "", jumpPort: UInt16 = 22,
+                    jumpUser: String = "", jumpPassword: String = "",
+                    jumpAuthMode: AuthMode = .password, jumpKeyPath: String = "") {
         let p = ConnectParams(
             proto: proto, host: host, port: port, user: user, password: password,
             bucket: bucket, region: region, authMode: authMode, keyPath: keyPath,
-            trustedFingerprint: trustedFingerprint)
+            trustedFingerprint: trustedFingerprint,
+            jumpHost: jumpHost, jumpPort: jumpPort, jumpUser: jumpUser,
+            jumpPassword: jumpPassword, jumpAuthMode: jumpAuthMode, jumpKeyPath: jumpKeyPath)
         lock.lock()
         params = p
         lock.unlock()
@@ -68,7 +79,9 @@ final class TransferClientPool {
             bucket: p.bucket, region: p.region,
             hostKeyMode: p.trustedFingerprint.isEmpty ? .strict : .acceptFingerprint,
             trustedFingerprint: p.trustedFingerprint,
-            authMode: p.authMode, keyPath: p.keyPath)
+            authMode: p.authMode, keyPath: p.keyPath,
+            jumpHost: p.jumpHost, jumpPort: p.jumpPort, jumpUser: p.jumpUser,
+            jumpPassword: p.jumpPassword, jumpAuthMode: p.jumpAuthMode, jumpKeyPath: p.jumpKeyPath)
     }
 
     /// Dispatch `work` on the next slot in round-robin order, reviving the

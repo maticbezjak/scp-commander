@@ -17,7 +17,7 @@ use std::ptr;
 use std::cell::Cell;
 
 use crate::transport::{self, Transport};
-use crate::types::{Auth, Credentials, Error, HostKeyPolicy, Protocol};
+use crate::types::{Auth, Credentials, Error, HostKeyPolicy, JumpHost, Protocol};
 
 /// Error codes surfaced via `scp_last_error_code`.
 pub const SCP_ERR_NONE: c_int = 0;
@@ -108,6 +108,12 @@ pub extern "C" fn scp_connect(
     expected_fingerprint: *const c_char,
     auth_mode: c_int,
     key_path: *const c_char,
+    jump_host: *const c_char,
+    jump_port: u16,
+    jump_username: *const c_char,
+    jump_password: *const c_char,
+    jump_auth_mode: c_int,
+    jump_key_path: *const c_char,
 ) -> *mut ScpSession {
     clear_error();
 
@@ -157,10 +163,35 @@ pub extern "C" fn scp_connect(
         }
     };
 
+    // Optional bastion. The bastion key is trusted on first use (a nested
+    // fingerprint prompt is out of scope); auth mirrors the target's modes.
+    let jump = non_empty(jump_host).map(|jh| {
+        let jpass = unsafe { cstr(jump_password) }.unwrap_or("");
+        let jauth = match jump_auth_mode {
+            1 => match non_empty(jump_key_path) {
+                Some(p) => Auth::KeyFile {
+                    path: p.to_string(),
+                    passphrase: (!jpass.is_empty()).then(|| jpass.to_string()),
+                },
+                None => Auth::Password(jpass.to_string()),
+            },
+            2 => Auth::Agent,
+            _ => Auth::Password(jpass.to_string()),
+        };
+        JumpHost {
+            host: jh.to_string(),
+            port: if jump_port == 0 { 22 } else { jump_port },
+            username: unsafe { cstr(jump_username) }.unwrap_or("").to_string(),
+            auth: jauth,
+            host_key: HostKeyPolicy::AcceptNew,
+        }
+    });
+
     let mut creds = Credentials::basic(proto, host.to_string(), port, user.to_string(), auth);
     creds.bucket = non_empty(bucket).map(str::to_string);
     creds.region = non_empty(region).map(str::to_string);
     creds.host_key = host_key;
+    creds.jump = jump;
 
     match transport::connect(&creds) {
         Ok(inner) => Box::into_raw(Box::new(ScpSession { inner })),

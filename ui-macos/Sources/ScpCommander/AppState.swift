@@ -44,6 +44,14 @@ final class AppState: ObservableObject {
     @Published var rememberPassword = false
     @Published var authMode: AuthMode = .password
     @Published var keyPath = ""
+    // SFTP jump host (bastion / ProxyJump)
+    @Published var useJump = false
+    @Published var jumpHost = ""
+    @Published var jumpPort = "22"
+    @Published var jumpUser = ""
+    @Published var jumpPassword = ""
+    @Published var jumpAuthMode: AuthMode = .password
+    @Published var jumpKeyPath = ""
     // S3 only
     @Published var bucket = ""
     @Published var region = ""
@@ -413,12 +421,18 @@ final class AppState: ObservableObject {
     func confirmSaveSite() {
         let name = saveSiteName.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { return }
+        let saveJump = useJump && proto == .sftp && !jumpHost.isEmpty
         let site = Site(
             name: name, proto: proto, host: host, port: port, user: user,
             authMode: proto == .sftp ? authMode : .password,
             keyPath: keyPath, bucket: bucket, region: region,
             remoteDir: active.connected ? active.remotePath : "",
-            localDir: active.connected ? localPath : "")
+            localDir: active.connected ? localPath : "",
+            jumpHost: saveJump ? jumpHost : nil,
+            jumpPort: saveJump ? jumpPort : nil,
+            jumpUser: saveJump ? jumpUser : nil,
+            jumpAuthMode: saveJump ? jumpAuthMode : nil,
+            jumpKeyPath: saveJump ? jumpKeyPath : nil)
         sites.add(site)
         if saveSitePassword && !password.isEmpty && site.authMode == .password {
             Keychain.save(account: site.keychainAccount, password: password)
@@ -439,6 +453,13 @@ final class AppState: ObservableObject {
         keyPath = site.keyPath
         bucket = site.bucket
         region = site.region
+        useJump = site.jumpHost?.isEmpty == false
+        jumpHost = site.jumpHost ?? ""
+        jumpPort = site.jumpPort ?? "22"
+        jumpUser = site.jumpUser ?? ""
+        jumpAuthMode = site.jumpAuthMode ?? .password
+        jumpKeyPath = site.jumpKeyPath ?? ""
+        jumpPassword = ""
         if !site.remoteDir.isEmpty {
             active.remotePath = site.remoteDir
             remotePath = site.remoteDir
@@ -1017,6 +1038,14 @@ final class AppState: ObservableObject {
         let auth = authMode
         let key = keyPath
         let path = session.remotePath
+        // Jump host only applies to SFTP and only when enabled with a host set.
+        let jumping = useJump && p == .sftp && !jumpHost.isEmpty
+        let jHost = jumping ? jumpHost : ""
+        let jPort = UInt16(jumpPort) ?? 22
+        let jUser = jumpUser
+        let jPass = jumpPassword
+        let jAuth = jumpAuthMode
+        let jKey = jumpKeyPath
         runBusy(on: session, "Connecting…") { [client = session.client] in
             try client.connect(
                 proto: p, host: h, port: portNum, user: u, password: pw,
@@ -1024,7 +1053,9 @@ final class AppState: ObservableObject {
                 hostKeyMode: trusted == nil ? .strict : .acceptFingerprint,
                 trustedFingerprint: trusted ?? "",
                 authMode: p == .sftp ? auth : .password,
-                keyPath: key)
+                keyPath: key,
+                jumpHost: jHost, jumpPort: jPort, jumpUser: jUser, jumpPassword: jPass,
+                jumpAuthMode: jAuth, jumpKeyPath: jKey)
             return try client.listDir(path)
         } onSuccess: { [weak self] entries in
             guard let self else { return }
@@ -1049,7 +1080,9 @@ final class AppState: ObservableObject {
                 proto: p, host: h, port: portNum, user: u, password: pw,
                 bucket: bkt, region: rgn,
                 authMode: p == .sftp ? auth : .password, keyPath: key,
-                trustedFingerprint: trusted ?? "")
+                trustedFingerprint: trusted ?? "",
+                jumpHost: jHost, jumpPort: jPort, jumpUser: jUser, jumpPassword: jPass,
+                jumpAuthMode: jAuth, jumpKeyPath: jKey)
         } onFailure: { [weak self] error in
             guard let self else { return }
             if let core = error as? CoreError, core.isUnknownHostKey,

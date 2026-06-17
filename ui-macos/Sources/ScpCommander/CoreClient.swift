@@ -181,13 +181,20 @@ final class CoreClient: @unchecked Sendable {
         hostKeyMode: HostKeyMode = .strict,
         trustedFingerprint: String = "",
         authMode: AuthMode = .password,
-        keyPath: String = ""
+        keyPath: String = "",
+        jumpHost: String = "",
+        jumpPort: UInt16 = 22,
+        jumpUser: String = "",
+        jumpPassword: String = "",
+        jumpAuthMode: AuthMode = .password,
+        jumpKeyPath: String = ""
     ) throws {
         disconnect()
         let handle = scp_connect(
             proto.rawValue, host, port, user, password,
             bucket, region, hostKeyMode.rawValue, trustedFingerprint,
-            authMode.rawValue, keyPath)
+            authMode.rawValue, keyPath,
+            jumpHost, jumpPort, jumpUser, jumpPassword, jumpAuthMode.rawValue, jumpKeyPath)
         guard let handle else { throw Self.lastError() }
         session = handle
     }

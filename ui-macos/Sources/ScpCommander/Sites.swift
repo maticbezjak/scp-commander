@@ -21,12 +21,20 @@ struct Site: Codable, Identifiable, Hashable {
     /// "Remote directory" advanced setting). Empty = defaults.
     var remoteDir: String
     var localDir: String
+    /// Optional SFTP bastion (Optional so older saved sites still decode).
+    var jumpHost: String?
+    var jumpPort: String?
+    var jumpUser: String?
+    var jumpAuthMode: AuthMode?
+    var jumpKeyPath: String?
 
     init(
         name: String, proto: Proto, host: String, port: String, user: String,
         authMode: AuthMode = .password, keyPath: String = "",
         bucket: String = "", region: String = "",
-        remoteDir: String = "", localDir: String = ""
+        remoteDir: String = "", localDir: String = "",
+        jumpHost: String? = nil, jumpPort: String? = nil, jumpUser: String? = nil,
+        jumpAuthMode: AuthMode? = nil, jumpKeyPath: String? = nil
     ) {
         self.name = name
         self.proto = proto
@@ -39,6 +47,11 @@ struct Site: Codable, Identifiable, Hashable {
         self.region = region
         self.remoteDir = remoteDir
         self.localDir = localDir
+        self.jumpHost = jumpHost
+        self.jumpPort = jumpPort
+        self.jumpUser = jumpUser
+        self.jumpAuthMode = jumpAuthMode
+        self.jumpKeyPath = jumpKeyPath
     }
 
     /// Decode tolerantly so sites.json files from older versions still load.
