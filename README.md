@@ -131,7 +131,8 @@ On macOS it's the standard ⌘, window; on Ubuntu it's under the Login dialog's
 - Double-click a **folder** to enter it; double-click the **`..`** row at the
   top (or press **Backspace**) to go up one level.
 - The **path bar** below the toolbar is editable — type a path and press Enter
-  to jump directly.
+  to jump directly (focus it with **⌘/Ctrl L**). The clock dropdown beside it
+  lists **recent locations** for that pane.
 - Toggle **show hidden files** with the eye-icon button (macOS toolbar) or the
   reveal button (Ubuntu toolbar).
 - A **status line** under each pane shows the item count, or the number and
@@ -197,6 +198,8 @@ differs in size/kind — press **F5** to transfer exactly those.
 | `F6` | Move selected items to the other pane |
 | `F2` | Rename selected item |
 | `F3` | View selected file in the built-in read-only viewer |
+| `⌘/Ctrl C` · `⌘/Ctrl V` | Copy in one pane, paste in the other to queue a transfer |
+| `⌘/Ctrl L` | Focus the path bar of the active pane |
 | `Del` | Delete selected item(s) |
 | `Backspace` | Navigate to parent directory |
 | `Tab` | Switch focus between left and right pane |

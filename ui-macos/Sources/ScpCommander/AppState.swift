@@ -58,12 +58,32 @@ final class AppState: ObservableObject {
 
     // Active tab's view of the panes
     @Published var localPath = FileManager.default.homeDirectoryForCurrentUser.path {
-        didSet { if localPath != oldValue { startLocalWatch() } }
+        didSet {
+            if localPath != oldValue {
+                startLocalWatch()
+                Self.pushRecent(&localRecents, localPath)
+            }
+        }
     }
     @Published var localEntries: [FileEntry] = []
-    @Published var remotePath = "/"
+    @Published var remotePath = "/" {
+        didSet { if remotePath != oldValue { Self.pushRecent(&remoteRecents, remotePath) } }
+    }
     @Published var remoteEntries: [FileEntry] = []
     @Published var activeConnected = false
+
+    /// Most-recently-visited directories per pane (newest first) for the path
+    /// bar's recent-locations dropdown.
+    @Published var localRecents: [String] = []
+    @Published var remoteRecents: [String] = []
+    /// Bumped to request that a pane's path bar take keyboard focus (⌘L).
+    @Published var focusPathBar: PaneKind?
+
+    private static func pushRecent(_ list: inout [String], _ path: String) {
+        list.removeAll { $0 == path }
+        list.insert(path, at: 0)
+        if list.count > 12 { list.removeLast(list.count - 12) }
+    }
 
     @Published var status = "Not connected" {
         didSet { log(status) }

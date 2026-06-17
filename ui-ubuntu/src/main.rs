@@ -78,6 +78,8 @@ struct Pane {
     selection: MultiSelection,
     entries: Rc<RefCell<Vec<Entry>>>,
     path_entry: GtkEntry,
+    /// Recent-locations dropdown; its menu is rebuilt as directories change.
+    recents_btn: gtk::MenuButton,
     /// WinSCP-style status line: item count, or size of the selection.
     info_label: Label,
 }
@@ -247,6 +249,10 @@ struct App {
     log_buf: RefCell<Vec<String>>,
     /// Pane clipboard for copy-in-one-pane / paste-in-the-other transfers.
     clipboard: RefCell<Option<Clipboard>>,
+    /// Recently-visited directories per pane (newest first) for the path-bar
+    /// recent-locations dropdown.
+    local_recents: RefCell<Vec<String>>,
+    remote_recents: RefCell<Vec<String>>,
     /// Set once the user confirms "Quit Anyway" so the close handler stops
     /// re-prompting and lets the window actually close.
     quit_confirmed: Cell<bool>,
@@ -406,6 +412,7 @@ impl App {
             .unwrap_or_default();
         worker::sort_entries(&mut entries);
         self.local.show(&entries, &path.to_string_lossy(), self.show_hidden.get());
+        self.record_recent(true, &path.to_string_lossy());
         self.arm_local_monitor(&path);
     }
 
@@ -845,6 +852,39 @@ impl App {
             });
             return Some(id);
         }
+    }
+
+    // -- Recent locations -----------------------------------------------------
+
+    /// Record a visited directory in a pane's MRU and refresh its dropdown.
+    fn record_recent(&self, local: bool, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        {
+            let mut list = if local { self.local_recents.borrow_mut() } else { self.remote_recents.borrow_mut() };
+            list.retain(|p| p != path);
+            list.insert(0, path.to_string());
+            if list.len() > 12 {
+                list.truncate(12);
+            }
+        }
+        self.rebuild_recents_menu(local);
+    }
+
+    /// Rebuild a pane's recent-locations dropdown menu from its MRU list.
+    fn rebuild_recents_menu(&self, local: bool) {
+        let list = if local { self.local_recents.borrow() } else { self.remote_recents.borrow() };
+        let action = if local { "win.recent-go-local" } else { "win.recent-go-remote" };
+        let menu = gio::Menu::new();
+        for p in list.iter() {
+            let item = gio::MenuItem::new(Some(p), None);
+            item.set_action_and_target_value(Some(action), Some(&p.to_variant()));
+            menu.append_item(&item);
+        }
+        let btn = if local { &self.local.recents_btn } else { &self.remote.recents_btn };
+        btn.set_menu_model(Some(&menu));
+        btn.set_sensitive(!list.is_empty());
     }
 
     // -- Pane clipboard (copy here, paste in the other pane) ------------------
@@ -3057,6 +3097,7 @@ impl App {
                 }
                 if is_active {
                     self.remote.show(&entries, &path, self.show_hidden.get());
+                    self.record_recent(false, &path);
                     self.set_status(&format!("{path} ({count} items)"));
                     if first_connect || self.login_window.is_visible() {
                         self.login_window.set_visible(false);
@@ -4009,6 +4050,8 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
         sites_list,
         log_buf: RefCell::new(Vec::new()),
         clipboard: RefCell::new(None),
+        local_recents: RefCell::new(Vec::new()),
+        remote_recents: RefCell::new(Vec::new()),
         quit_confirmed: Cell::new(false),
         local_monitor: RefCell::new(None),
         local_reload_pending: Cell::new(false),
@@ -4181,6 +4224,28 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
 
         action!("sync-up", st, st.sync(false));
         action!("sync-down", st, st.sync(true));
+
+        // Recent-locations dropdowns: navigate to the path carried as target.
+        {
+            let st = state.clone();
+            let a = gio::SimpleAction::new("recent-go-local", Some(glib::VariantTy::STRING));
+            a.connect_activate(move |_, p| {
+                if let Some(path) = p.and_then(|v| v.str()) {
+                    st.navigate_local(path);
+                }
+            });
+            window.add_action(&a);
+        }
+        {
+            let st = state.clone();
+            let a = gio::SimpleAction::new("recent-go-remote", Some(glib::VariantTy::STRING));
+            a.connect_activate(move |_, p| {
+                if let Some(path) = p.and_then(|v| v.str()) {
+                    st.navigate_remote(path);
+                }
+            });
+            window.add_action(&a);
+        }
 
         // Left / Right pane navigation
         action!("left-up", st, st.local_up());
@@ -4487,6 +4552,11 @@ fn build_ui(app: &Application, open_uri: Option<&str>) {
                     }
                     gdk::Key::v | gdk::Key::V => {
                         state.clipboard_paste(local);
+                        return glib::Propagation::Stop;
+                    }
+                    gdk::Key::l | gdk::Key::L => {
+                        let pane = if local { &state.local } else { &state.remote };
+                        pane.path_entry.grab_focus();
                         return glib::Propagation::Stop;
                     }
                     _ => {}
@@ -5320,8 +5390,15 @@ fn make_pane(
         .margin_start(4)
         .margin_end(4)
         .build();
+    let recents_btn = gtk::MenuButton::builder()
+        .icon_name("document-open-recent-symbolic")
+        .tooltip_text("Recent locations")
+        .has_frame(false)
+        .sensitive(false)
+        .build();
     addr_bar.append(&folder_icon);
     addr_bar.append(&path_entry);
+    addr_bar.append(&recents_btn);
     addr_bar.add_css_class("card");
 
     let scroller = ScrolledWindow::builder().vexpand(true).child(&view).build();
@@ -5360,6 +5437,7 @@ fn make_pane(
         selection,
         entries: Rc::new(RefCell::new(Vec::new())),
         path_entry,
+        recents_btn,
         info_label,
     };
     (pane_box, pane, view, header)

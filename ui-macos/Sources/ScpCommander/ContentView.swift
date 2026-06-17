@@ -94,6 +94,88 @@ struct ContentView: View {
     @State private var typeAhead = ""
     @State private var typeAheadAt = Date.distantPast
 
+    @ViewBuilder private var localPane: some View {
+        FilePane(
+            kind: "local",
+            title: "Local",
+            path: state.localPath,
+            entries: state.localEntries,
+            showRights: false,
+            showHidden: state.showHidden,
+            isFocused: state.localFocused,
+            selection: $state.localSelection,
+            onFocus: { if state.focusedPane != .local { state.focusedPane = .local } },
+            onUp: { state.localUp() },
+            onRefresh: { state.loadLocal() },
+            onNavigate: { state.navigateLocal($0) },
+            onOpen: { state.openLocal($0) },
+            transferLabel: "Upload",
+            onTransfer: { state.requestTransfers([$0], from: .local) },
+            onDrop: { if $0.pane == "remote" { state.downloadByName($0.name) } },
+            onRename: { beginRename(.local, $0) },
+            onDelete: { deleteTarget = (.local, $0) },
+            onNewFolder: { beginNewFolder(.local) },
+            onEdit: nil,
+            onCopyURL: nil,
+            onProperties: { propertiesTarget = (.local, $0) },
+            onExternalDrop: nil,
+            onView: { state.viewFile($0, pane: .local) },
+            onClipboardCopy: { state.copySelection(from: .local) },
+            onClipboardPaste: { state.paste(into: .local) },
+            canPaste: state.paneClipboard?.sourcePane == .remote,
+            onBack: { state.goBack(.local) },
+            onForward: { state.goForward(.local) },
+            onHome: { state.goHome(.local) },
+            canBack: state.canGoBack(.local),
+            canForward: state.canGoForward(.local),
+            recents: state.localRecents,
+            focusRequested: state.focusPathBar == .local,
+            onFocusHandled: { state.focusPathBar = nil }
+        )
+    }
+
+    @ViewBuilder private var remotePane: some View {
+        FilePane(
+            kind: "remote",
+            title: "Remote",
+            path: state.remotePath,
+            entries: state.remoteEntries,
+            showRights: true,
+            showHidden: state.showHidden,
+            isFocused: !state.localFocused,
+            selection: $state.remoteSelection,
+            onFocus: { if state.focusedPane != .remote { state.focusedPane = .remote } },
+            onUp: { state.remoteUp() },
+            onRefresh: { state.refreshRemote() },
+            onNavigate: { state.navigateRemote($0) },
+            onOpen: { state.openRemote($0) },
+            transferLabel: "Download",
+            onTransfer: { state.requestTransfers([$0], from: .remote) },
+            onDrop: { if $0.pane == "local" { state.uploadByName($0.name) } },
+            onRename: { beginRename(.remote, $0) },
+            onDelete: { deleteTarget = (.remote, $0) },
+            onNewFolder: { beginNewFolder(.remote) },
+            onEdit: { state.editRemote($0) },
+            onCopyURL: { state.copyRemoteURL($0) },
+            onProperties: { propertiesTarget = (.remote, $0) },
+            onExternalDrop: { state.uploadExternal($0) },
+            onCopyFile: { e in copyNameText = e.name; copyTarget = e },
+            onExec: state.proto == .sftp ? { _ in state.beginExecCommand() } : nil,
+            onView: { state.viewFile($0, pane: .remote) },
+            onClipboardCopy: { state.copySelection(from: .remote) },
+            onClipboardPaste: { state.paste(into: .remote) },
+            canPaste: state.paneClipboard?.sourcePane == .local,
+            onBack: { state.goBack(.remote) },
+            onForward: { state.goForward(.remote) },
+            onHome: { state.goHome(.remote) },
+            canBack: state.canGoBack(.remote),
+            canForward: state.canGoForward(.remote),
+            recents: state.remoteRecents,
+            focusRequested: state.focusPathBar == .remote,
+            onFocusHandled: { state.focusPathBar = nil }
+        )
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             TopBar()
@@ -101,76 +183,8 @@ struct ContentView: View {
             TabStrip()
             Divider()
             HSplitView {
-                FilePane(
-                    kind: "local",
-                    title: "Local",
-                    path: state.localPath,
-                    entries: state.localEntries,
-                    showRights: false,
-                    showHidden: state.showHidden,
-                    isFocused: state.localFocused,
-                    selection: $state.localSelection,
-                    onFocus: { if state.focusedPane != .local { state.focusedPane = .local } },
-                    onUp: { state.localUp() },
-                    onRefresh: { state.loadLocal() },
-                    onNavigate: { state.navigateLocal($0) },
-                    onOpen: { state.openLocal($0) },
-                    transferLabel: "Upload",
-                    onTransfer: { state.requestTransfers([$0], from: .local) },
-                    onDrop: { if $0.pane == "remote" { state.downloadByName($0.name) } },
-                    onRename: { beginRename(.local, $0) },
-                    onDelete: { deleteTarget = (.local, $0) },
-                    onNewFolder: { beginNewFolder(.local) },
-                    onEdit: nil,
-                    onCopyURL: nil,
-                    onProperties: { propertiesTarget = (.local, $0) },
-                    onExternalDrop: nil,
-                    onView: { state.viewFile($0, pane: .local) },
-                    onClipboardCopy: { state.copySelection(from: .local) },
-                    onClipboardPaste: { state.paste(into: .local) },
-                    canPaste: state.paneClipboard?.sourcePane == .remote,
-                    onBack: { state.goBack(.local) },
-                    onForward: { state.goForward(.local) },
-                    onHome: { state.goHome(.local) },
-                    canBack: state.canGoBack(.local),
-                    canForward: state.canGoForward(.local)
-                )
-                FilePane(
-                    kind: "remote",
-                    title: "Remote",
-                    path: state.remotePath,
-                    entries: state.remoteEntries,
-                    showRights: true,
-                    showHidden: state.showHidden,
-                    isFocused: !state.localFocused,
-                    selection: $state.remoteSelection,
-                    onFocus: { if state.focusedPane != .remote { state.focusedPane = .remote } },
-                    onUp: { state.remoteUp() },
-                    onRefresh: { state.refreshRemote() },
-                    onNavigate: { state.navigateRemote($0) },
-                    onOpen: { state.openRemote($0) },
-                    transferLabel: "Download",
-                    onTransfer: { state.requestTransfers([$0], from: .remote) },
-                    onDrop: { if $0.pane == "local" { state.uploadByName($0.name) } },
-                    onRename: { beginRename(.remote, $0) },
-                    onDelete: { deleteTarget = (.remote, $0) },
-                    onNewFolder: { beginNewFolder(.remote) },
-                    onEdit: { state.editRemote($0) },
-                    onCopyURL: { state.copyRemoteURL($0) },
-                    onProperties: { propertiesTarget = (.remote, $0) },
-                    onExternalDrop: { state.uploadExternal($0) },
-                    onCopyFile: { e in copyNameText = e.name; copyTarget = e },
-                    onExec: state.proto == .sftp ? { _ in state.beginExecCommand() } : nil,
-                    onView: { state.viewFile($0, pane: .remote) },
-                    onClipboardCopy: { state.copySelection(from: .remote) },
-                    onClipboardPaste: { state.paste(into: .remote) },
-                    canPaste: state.paneClipboard?.sourcePane == .local,
-                    onBack: { state.goBack(.remote) },
-                    onForward: { state.goForward(.remote) },
-                    onHome: { state.goHome(.remote) },
-                    canBack: state.canGoBack(.remote),
-                    canForward: state.canGoForward(.remote)
-                )
+                localPane
+                remotePane
             }
             Divider()
             CommandBar()
@@ -437,6 +451,7 @@ struct ContentView: View {
             switch event.charactersIgnoringModifiers {
             case "c": state.copySelection(from: pane); return true
             case "v": state.paste(into: pane); return true
+            case "l": state.focusPathBar = pane; return true
             default: break
             }
         }
@@ -1071,10 +1086,16 @@ private struct FilePane: View {
     var onHome: (() -> Void)? = nil
     var canBack: Bool = false
     var canForward: Bool = false
+    /// Recent directories for this pane's dropdown (newest first).
+    var recents: [String] = []
+    /// Flips true to request keyboard focus on the path bar (⌘L).
+    var focusRequested: Bool = false
+    var onFocusHandled: (() -> Void)? = nil
 
     @State private var sortKey: SortKey = .name
     @State private var ascending = true
     @State private var pathText = ""
+    @FocusState private var pathFocused: Bool
     @State private var filterText = ""
     // Resizable column widths (live values; persisted to UserDefaults on release).
     @State private var colWidths: [String: CGFloat] = [:]
@@ -1276,9 +1297,26 @@ private struct FilePane: View {
                 TextField("path", text: $pathText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12, design: .monospaced))
+                    .focused($pathFocused)
                     .onAppear { pathText = path }
                     .onChange(of: path) { pathText = $0 }
                     .onSubmit { onNavigate(pathText) }
+                    .onChange(of: focusRequested) {
+                        if $0 { pathFocused = true; onFocusHandled?() }
+                    }
+                if !recents.isEmpty {
+                    Menu {
+                        ForEach(recents, id: \.self) { dir in
+                            Button(dir) { onNavigate(dir) }
+                        }
+                    } label: {
+                        Image(systemName: "clock.arrow.circlepath").font(.caption)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Recent locations")
+                }
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
