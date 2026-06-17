@@ -5,10 +5,12 @@
 
 use std::sync::Mutex;
 
+use std::path::Path;
+
 use scp_core::types::{Auth, Credentials, Entry, HostKeyPolicy, Protocol};
 use scp_core::{connect, Transport};
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Emitter, State};
 
 /// The one live session for the spike (multi-tab comes later).
 #[derive(Default)]
@@ -88,6 +90,60 @@ fn list_dir(path: String, session: State<Session>) -> Result<Vec<EntryDto>, Stri
     Ok(entries.iter().map(EntryDto::from).collect())
 }
 
+#[derive(Clone, Serialize)]
+struct Progress {
+    name: String,
+    done: u64,
+    total: u64,
+}
+
+/// Download a remote file to a local path, emitting "xfer-progress" events as
+/// bytes flow. Returns the total bytes written.
+#[tauri::command]
+fn download(
+    remote: String,
+    local: String,
+    app: tauri::AppHandle,
+    session: State<Session>,
+) -> Result<u64, String> {
+    let name = remote.rsplit('/').next().unwrap_or(&remote).to_string();
+    let mut guard = session.0.lock().unwrap();
+    let transport = guard.as_mut().ok_or("not connected")?;
+    let mut progress = |done: u64, total: u64| {
+        let _ = app.emit("xfer-progress", Progress { name: name.clone(), done, total });
+        true
+    };
+    transport
+        .download_progress(&remote, Path::new(&local), &mut progress)
+        .map_err(|e| e.to_string())
+}
+
+/// Upload a local file to a remote path, emitting progress events.
+#[tauri::command]
+fn upload(
+    local: String,
+    remote: String,
+    app: tauri::AppHandle,
+    session: State<Session>,
+) -> Result<u64, String> {
+    let name = remote.rsplit('/').next().unwrap_or(&remote).to_string();
+    let mut guard = session.0.lock().unwrap();
+    let transport = guard.as_mut().ok_or("not connected")?;
+    let mut progress = |done: u64, total: u64| {
+        let _ = app.emit("xfer-progress", Progress { name: name.clone(), done, total });
+        true
+    };
+    transport
+        .upload_progress(Path::new(&local), &remote, &mut progress)
+        .map_err(|e| e.to_string())
+}
+
+/// The OS temp dir — where the spike drops downloads.
+#[tauri::command]
+fn temp_dir() -> String {
+    std::env::temp_dir().to_string_lossy().into_owned()
+}
+
 #[tauri::command]
 fn disconnect(session: State<Session>) {
     *session.0.lock().unwrap() = None;
@@ -96,7 +152,14 @@ fn disconnect(session: State<Session>) {
 fn main() {
     tauri::Builder::default()
         .manage(Session::default())
-        .invoke_handler(tauri::generate_handler![connect_session, list_dir, disconnect])
+        .invoke_handler(tauri::generate_handler![
+            connect_session,
+            list_dir,
+            download,
+            upload,
+            temp_dir,
+            disconnect
+        ])
         .run(tauri::generate_context!())
         .expect("error while running SCP Commander");
 }
