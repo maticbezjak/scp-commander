@@ -3,13 +3,14 @@
 // this layer exposes it to the Svelte UI as Tauri commands + events.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod sites;
 mod transfers;
 
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
-use scp_core::types::{Auth, Credentials, Entry, Error, HostKeyPolicy, Protocol};
+use scp_core::types::{Auth, Credentials, Entry, Error, HostKeyPolicy, JumpHost, Protocol};
 use scp_core::{connect, Transport};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -38,6 +39,21 @@ pub struct ConnectForm {
     region: String,
     #[serde(default)]
     path: String,
+    // SFTP jump host (bastion / ProxyJump)
+    #[serde(default)]
+    use_jump: bool,
+    #[serde(default)]
+    jump_host: String,
+    #[serde(default)]
+    jump_port: u16,
+    #[serde(default)]
+    jump_user: String,
+    #[serde(default)]
+    jump_password: String,
+    #[serde(default)]
+    jump_auth_mode: String,
+    #[serde(default)]
+    jump_key_path: String,
 }
 
 #[derive(Serialize)]
@@ -103,6 +119,24 @@ fn build_creds(form: &ConnectForm, host_key: HostKeyPolicy) -> Result<Credential
     if protocol == Protocol::S3 {
         creds.bucket = (!form.bucket.is_empty()).then(|| form.bucket.clone());
         creds.region = (!form.region.is_empty()).then(|| form.region.clone());
+    }
+    if protocol == Protocol::Sftp && form.use_jump && !form.jump_host.is_empty() {
+        let jpass = form.jump_password.clone();
+        let jauth = match form.jump_auth_mode.as_str() {
+            "key" => Auth::KeyFile {
+                path: form.jump_key_path.clone(),
+                passphrase: (!jpass.is_empty()).then(|| jpass.clone()),
+            },
+            "agent" => Auth::Agent,
+            _ => Auth::Password(jpass),
+        };
+        creds.jump = Some(JumpHost {
+            host: form.jump_host.clone(),
+            port: if form.jump_port == 0 { 22 } else { form.jump_port },
+            username: form.jump_user.clone(),
+            auth: jauth,
+            host_key: HostKeyPolicy::AcceptNew,
+        });
     }
     Ok(creds)
 }
@@ -289,6 +323,9 @@ fn main() {
             local_mkdir,
             local_delete,
             local_rename,
+            sites::list_sites,
+            sites::save_site,
+            sites::delete_site,
             transfers::enqueue,
             transfers::cancel_transfer,
         ])

@@ -18,7 +18,66 @@
     bucket: "",
     region: "",
     path: "/",
+    use_jump: false,
+    jump_host: "",
+    jump_port: 22,
+    jump_user: "",
+    jump_password: "",
+    jump_auth_mode: "password",
+    jump_key_path: "",
   });
+
+  // Saved sites
+  let sites = $state([]);
+  let selectedSite = $state("");
+  let saveSiteName = $state(null); // non-null = the Save-site dialog value
+  async function reloadSites() {
+    sites = await invoke("list_sites");
+  }
+  $effect(() => {
+    reloadSites();
+  });
+  function applySite() {
+    const s = sites.find((x) => x.name === selectedSite);
+    if (!s) return;
+    form = {
+      ...form,
+      protocol: s.protocol,
+      host: s.host,
+      port: s.port,
+      username: s.username,
+      password: "",
+      auth_mode: s.auth_mode || "password",
+      key_path: s.key_path || "",
+      bucket: s.bucket || "",
+      region: s.region || "",
+      path: s.path || "/",
+      use_jump: s.use_jump || false,
+      jump_host: s.jump_host || "",
+      jump_port: s.jump_port || 22,
+      jump_user: s.jump_user || "",
+      jump_password: "",
+      jump_auth_mode: s.jump_auth_mode || "password",
+      jump_key_path: s.jump_key_path || "",
+    };
+    status = `Loaded site “${s.name}” — enter password and Connect`;
+  }
+  async function saveSite() {
+    const name = saveSiteName.trim();
+    saveSiteName = null;
+    if (!name) return;
+    const { password, jump_password, ...rest } = form;
+    await invoke("save_site", { site: { ...rest, name, port: Number(form.port) } });
+    await reloadSites();
+    selectedSite = name;
+    status = `Saved site “${name}”`;
+  }
+  async function deleteSite() {
+    if (!selectedSite) return;
+    await invoke("delete_site", { name: selectedSite });
+    selectedSite = "";
+    await reloadSites();
+  }
 
   let connected = $state(false);
   let status = $state("Not connected");
@@ -369,12 +428,48 @@
     <input type="password" placeholder={isS3 ? "secret key" : "password"} bind:value={form.password} />
   {/if}
   {#if isS3}<input placeholder="bucket" bind:value={form.bucket} />{/if}
+  {#if isSftp}
+    <label class="jump-toggle" title="Connect via a bastion / jump host">
+      <input type="checkbox" bind:checked={form.use_jump} /> Jump
+    </label>
+  {/if}
+  <span class="sites">
+    <select bind:value={selectedSite} onchange={applySite} title="Saved sites">
+      <option value="">— Sites —</option>
+      {#each sites as s}<option value={s.name}>{s.name}</option>{/each}
+    </select>
+    <button type="button" title="Save current as a site" onclick={() => (saveSiteName = form.host)}>
+      Save
+    </button>
+    <button type="button" title="Delete selected site" disabled={!selectedSite} onclick={deleteSite}>
+      🗑
+    </button>
+  </span>
   {#if !connected}
     <button type="submit" disabled={busy}>Connect</button>
   {:else}
     <button type="button" onclick={disconnect}>Disconnect</button>
   {/if}
 </form>
+
+{#if isSftp && form.use_jump}
+  <div class="jumprow">
+    <span class="jump-label">via</span>
+    <input class="host" placeholder="jump host" bind:value={form.jump_host} />
+    <input class="port" placeholder="22" bind:value={form.jump_port} />
+    <input placeholder="jump user" bind:value={form.jump_user} />
+    <select bind:value={form.jump_auth_mode}>
+      <option value="password">Password</option>
+      <option value="key">Key file</option>
+      <option value="agent">Agent</option>
+    </select>
+    {#if form.jump_auth_mode === "key"}
+      <input placeholder="~/.ssh/id_ed25519" bind:value={form.jump_key_path} />
+    {:else if form.jump_auth_mode !== "agent"}
+      <input type="password" placeholder="jump password" bind:value={form.jump_password} />
+    {/if}
+  </div>
+{/if}
 
 {#if hostKey}
   <div class="hostkey" class:mismatch={hostKey.mismatch}>
@@ -501,6 +596,19 @@
   </Modal>
 {/if}
 
+{#if saveSiteName !== null}
+  <Modal title="Save site" onClose={() => (saveSiteName = null)}>
+    <form onsubmit={(e) => (e.preventDefault(), saveSite())}>
+      <input class="dlg-input" placeholder="site name" bind:value={saveSiteName} autofocus />
+      <p class="hint">Stores connection settings (no password).</p>
+      <div class="dlg-actions">
+        <button type="button" onclick={() => (saveSiteName = null)}>Cancel</button>
+        <button type="submit">Save</button>
+      </div>
+    </form>
+  </Modal>
+{/if}
+
 {#if overwrite}
   <Modal title="Files already exist" onClose={() => (overwrite = null)}>
     <p>{overwrite.count} item(s) already exist at the destination. What should happen?</p>
@@ -532,6 +640,35 @@
   .login input, .login select, .login button { font: inherit; padding: 4px 6px; }
   .login .host { flex: 1; min-width: 140px; }
   .login .port { width: 64px; }
+  .jump-toggle {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .sites {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    margin-left: auto;
+  }
+  .jumprow {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    padding: 0 10px 8px;
+  }
+  .jumprow input, .jumprow select { font: inherit; padding: 4px 6px; }
+  .jumprow .host { flex: 1; min-width: 120px; }
+  .jumprow .port { width: 64px; }
+  .jump-label {
+    font-size: 12px;
+    opacity: 0.6;
+    padding-left: 2px;
+  }
+  .hint { font-size: 12px; opacity: 0.6; margin: 0 0 12px; }
   .hostkey {
     margin: 0 10px 8px;
     padding: 8px 10px;
