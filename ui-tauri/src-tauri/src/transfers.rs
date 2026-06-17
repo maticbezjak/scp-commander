@@ -1,7 +1,11 @@
-// Transfer queue. Runs on its own connection (a dedicated worker thread) so the
-// browsing session stays responsive, processes jobs sequentially, and reports
-// per-transfer progress / completion as Tauri events. Cancellation is a flag
-// the progress callback observes.
+// Transfer queue. Runs as a pool of up to N concurrent worker threads (N is
+// configurable at runtime via `set_max_parallel`, default 2). Each worker owns
+// its OWN connection, so transfers truly run in parallel on separate links and
+// the browsing session stays responsive. Jobs are pulled from a single shared
+// queue (an `mpsc` receiver behind a mutex): a worker locks the receiver only
+// long enough to grab the next job, releases it immediately, then processes the
+// job on its own connection. Per-transfer progress / completion is reported as
+// Tauri events. Cancellation is a flag the progress callback observes.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,6 +18,9 @@ use scp_core::types::{Credentials, Error};
 use scp_core::{connect, Transport};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
+
+/// Default worker count when no explicit target has been set.
+const DEFAULT_PARALLEL: u64 = 2;
 
 struct Job {
     id: u64,
@@ -28,6 +35,9 @@ struct Job {
     cancel: Arc<AtomicBool>,
 }
 
+/// Shared, lockable receiver so multiple workers can pull from one queue.
+type SharedRx = Arc<Mutex<Receiver<Job>>>;
+
 #[derive(Default)]
 pub struct TransferManager {
     inner: Arc<Inner>,
@@ -37,18 +47,45 @@ pub struct TransferManager {
 struct Inner {
     creds: Mutex<Option<Credentials>>,
     sender: Mutex<Option<Sender<Job>>>,
+    /// The shared receiver, created lazily alongside the sender.
+    receiver: Mutex<Option<SharedRx>>,
     cancels: Mutex<HashMap<u64, Arc<AtomicBool>>>,
     next_id: AtomicU64,
-    /// Set when the browsing session (re)connects, so the worker rebuilds its
-    /// own connection from the latest credentials before the next job.
-    reconnect: AtomicBool,
+    /// Bumped whenever the browsing session (re)connects. Each worker remembers
+    /// the generation it last connected with and rebuilds its own connection
+    /// from the latest credentials when the counter moves ahead of it.
+    creds_gen: AtomicU64,
+    /// Desired number of live workers (0 means "use the default").
+    target: AtomicU64,
+    /// Current number of live workers.
+    workers: AtomicU64,
+}
+
+impl Inner {
+    /// Effective worker target, treating 0 as the default.
+    fn effective_target(&self) -> u64 {
+        let t = self.target.load(Ordering::Relaxed);
+        if t == 0 {
+            DEFAULT_PARALLEL
+        } else {
+            t
+        }
+    }
 }
 
 impl TransferManager {
-    /// Remember the credentials of a freshly-connected session for the worker.
+    /// Remember the credentials of a freshly-connected session for the workers.
+    /// Bumping the generation makes every worker reconnect before its next job.
     pub fn set_creds(&self, creds: Credentials) {
         *self.inner.creds.lock().unwrap() = Some(creds);
-        self.inner.reconnect.store(true, Ordering::Relaxed);
+        self.inner.creds_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the desired number of concurrent transfer workers (at least 1).
+    pub fn set_max(&self, n: u32) {
+        self.inner
+            .target
+            .store(n.max(1) as u64, Ordering::Relaxed);
     }
 }
 
@@ -87,15 +124,14 @@ pub fn enqueue(
     let cancel = Arc::new(AtomicBool::new(false));
     inner.cancels.lock().unwrap().insert(id, cancel.clone());
 
-    // Lazily spawn the worker on first use.
+    // Lazily create the shared queue on first use.
     let mut sender = inner.sender.lock().unwrap();
     if sender.is_none() {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         *sender = Some(tx);
-        let worker_inner = inner.clone();
-        let worker_app = app.clone();
-        std::thread::spawn(move || worker(worker_inner, rx, worker_app));
+        *inner.receiver.lock().unwrap() = Some(Arc::new(Mutex::new(rx)));
     }
+
     let job = Job {
         id, upload, is_dir, name, local, remote,
         overwrite: overwrite.unwrap_or(0),
@@ -106,6 +142,26 @@ pub fn enqueue(
         .unwrap()
         .send(job)
         .map_err(|_| "transfer worker stopped".to_string())?;
+    drop(sender);
+
+    // Spawn workers up to the current target. We bump `workers` here (before the
+    // spawn) so the count this loop reads stays accurate across concurrent
+    // enqueue calls.
+    let shared_rx = inner
+        .receiver
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("receiver created above")
+        .clone();
+    while inner.workers.load(Ordering::Relaxed) < inner.effective_target() {
+        inner.workers.fetch_add(1, Ordering::Relaxed);
+        let worker_inner = inner.clone();
+        let worker_app = app.clone();
+        let worker_rx = shared_rx.clone();
+        std::thread::spawn(move || worker(worker_inner, worker_rx, worker_app));
+    }
+
     Ok(id)
 }
 
@@ -117,19 +173,57 @@ pub fn cancel_transfer(id: u64, mgr: State<TransferManager>) {
     }
 }
 
-fn worker(inner: Arc<Inner>, rx: Receiver<Job>, app: AppHandle) {
+/// Set the maximum number of concurrent transfers.
+#[tauri::command]
+pub fn set_max_parallel(n: u32, mgr: State<TransferManager>) {
+    mgr.set_max(n);
+}
+
+fn worker(inner: Arc<Inner>, rx: SharedRx, app: AppHandle) {
+    // The generation this worker's `transport` was built for. Starts at 0 so the
+    // first job always (re)connects from the latest credentials.
+    let mut my_gen = 0u64;
     let mut transport: Option<Box<dyn Transport>> = None;
-    while let Ok(job) = rx.recv() {
+
+    loop {
+        // Shrink the pool if we're over target. Check BEFORE locking/recv so no
+        // job is ever pulled and then dropped. Never let the pool fall below 1.
+        {
+            let workers = inner.workers.load(Ordering::Relaxed);
+            if workers > inner.effective_target() && workers > 1 {
+                inner.workers.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        // Grab the next job, holding the receiver lock only for the recv.
+        let job = {
+            let guard = rx.lock().unwrap();
+            match guard.recv() {
+                Ok(job) => job,
+                Err(_) => {
+                    // Channel closed: no more jobs will ever arrive.
+                    inner.workers.fetch_sub(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        };
+
         if job.cancel.load(Ordering::Relaxed) {
             emit(&app, Evt::Cancelled { id: job.id });
             inner.cancels.lock().unwrap().remove(&job.id);
             continue;
         }
-        // (Re)connect the transfer link if needed.
-        if transport.is_none() || inner.reconnect.swap(false, Ordering::Relaxed) {
+
+        // (Re)connect this worker's own link if needed: no transport yet, or the
+        // credentials generation has moved past the one we built for.
+        let latest_gen = inner.creds_gen.load(Ordering::Relaxed);
+        if transport.is_none() || latest_gen != my_gen {
             let creds = inner.creds.lock().unwrap().clone();
             transport = creds.and_then(|c| connect(&c).ok());
+            my_gen = latest_gen;
         }
+
         let Some(t) = transport.as_mut() else {
             emit(&app, Evt::Failed { id: job.id, message: "not connected".into() });
             inner.cancels.lock().unwrap().remove(&job.id);

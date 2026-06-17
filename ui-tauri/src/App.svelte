@@ -4,6 +4,10 @@
   import TransferQueue from "./lib/TransferQueue.svelte";
   import Modal from "./lib/Modal.svelte";
   import ContextMenu from "./lib/ContextMenu.svelte";
+  import SyncDialog from "./lib/SyncDialog.svelte";
+  import ConsoleDialog from "./lib/ConsoleDialog.svelte";
+  import KnownHostsDialog from "./lib/KnownHostsDialog.svelte";
+  import PrefsDialog from "./lib/PrefsDialog.svelte";
 
   const PROTOS = ["sftp", "ftp", "ftps", "s3"];
 
@@ -78,6 +82,33 @@
     selectedSite = "";
     await reloadSites();
   }
+
+  // Preferences (loaded from backend on startup).
+  let prefs = $state({
+    show_hidden: false,
+    confirm_delete: true,
+    confirm_overwrite: true,
+    atomic_uploads: true,
+    max_parallel: 2,
+  });
+  $effect(() => {
+    invoke("load_prefs").then((p) => {
+      prefs = p;
+      invoke("set_max_parallel", { n: prefs.max_parallel });
+    });
+  });
+  async function savePrefs(next) {
+    prefs = next;
+    showPrefs = false;
+    await invoke("save_prefs", { prefs: next });
+    await invoke("set_max_parallel", { n: next.max_parallel });
+  }
+
+  // Phase 5 dialogs
+  let showSync = $state(false);
+  let showConsole = $state(false);
+  let showKnownHosts = $state(false);
+  let showPrefs = $state(false);
 
   let connected = $state(false);
   let status = $state("Not connected");
@@ -170,8 +201,10 @@
   const remoteUp = () => loadRemote(joinPath(remote.path, ".."));
 
   // --- selection (click / cmd-click toggle / shift-range) ---
+  // Mirror Pane's visible ordering so shift-range matches what's on screen.
   function sortedNames(entries) {
     return [...entries]
+      .filter((e) => prefs.show_hidden || !e.name.startsWith("."))
       .sort((a, b) => Number(b.is_dir) - Number(a.is_dir) || a.name.localeCompare(b.name))
       .map((e) => e.name);
   }
@@ -208,11 +241,23 @@
     const dest = upload ? remote : local;
     const destNames = new Set(dest.entries.map((e) => e.name));
     const collisions = entries.filter((e) => destNames.has(e.name));
-    if (collisions.length) {
+    if (collisions.length && prefs.confirm_overwrite) {
       overwrite = { entries, upload, count: collisions.length };
     } else {
       for (const e of entries) enqueueEntry(e, upload, 0);
     }
+  }
+
+  // Compare the two panes: select entries that are missing on the other side
+  // or differ in size. Folders are compared by presence only.
+  function compareDirs() {
+    if (!connected) return;
+    const rByName = new Map(remote.entries.map((e) => [e.name, e]));
+    const lByName = new Map(local.entries.map((e) => [e.name, e]));
+    const differs = (a, b) => !b || (!a.is_dir && !b.is_dir && a.size !== b.size);
+    localSel = local.entries.filter((e) => differs(e, rByName.get(e.name))).map((e) => e.name);
+    remoteSel = remote.entries.filter((e) => differs(e, lByName.get(e.name))).map((e) => e.name);
+    status = `Compare — ${localSel.length} local, ${remoteSel.length} remote differing`;
   }
   function resolveOverwrite(decision) {
     const { entries, upload } = overwrite;
@@ -266,7 +311,10 @@
       {
         label: `Delete${targets.length > 1 ? ` (${targets.length})` : ""}…`,
         danger: true,
-        action: () => (deleteTarget = { isLocal, entries: targets }),
+        action: () =>
+          prefs.confirm_delete
+            ? (deleteTarget = { isLocal, entries: targets })
+            : doDeleteEntries(isLocal, targets),
       },
       { label: "New folder…", action: () => (newFolder = { isLocal, value: "" }) },
       {
@@ -303,9 +351,7 @@
       status = `New folder failed: ${e}`;
     }
   }
-  async function doDelete() {
-    const { isLocal, entries } = deleteTarget;
-    deleteTarget = null;
+  async function doDeleteEntries(isLocal, entries) {
     for (const e of entries) {
       try {
         await invoke(isLocal ? "local_delete" : "remote_delete", {
@@ -317,6 +363,11 @@
       }
     }
     refresh(isLocal);
+  }
+  async function doDelete() {
+    const { isLocal, entries } = deleteTarget;
+    deleteTarget = null;
+    await doDeleteEntries(isLocal, entries);
   }
   async function doChmod() {
     const { entry, mode } = propsTarget;
@@ -485,12 +536,22 @@
   </div>
 {/if}
 
+<div class="toolbar">
+  <button disabled={!connected} onclick={() => (showSync = true)} title="Synchronize directories">⇄ Sync</button>
+  <button disabled={!connected} onclick={compareDirs} title="Select differing files">⇌ Compare</button>
+  <button disabled={!connected} onclick={() => (showConsole = true)} title="Run remote commands">⌘ Console</button>
+  <span class="sep"></span>
+  <button onclick={() => (showKnownHosts = true)} title="Manage trusted host keys">🔑 Hosts</button>
+  <button onclick={() => (showPrefs = true)} title="Preferences">⚙ Preferences</button>
+</div>
+
 <div class="panes">
   <div class="panewrap" onfocusin={() => (focusLocal = true)} onpointerdown={() => (focusLocal = true)}>
     <Pane
       title="Local"
       path={local.path}
       entries={local.entries}
+      showHidden={prefs.show_hidden}
       selected={localSel}
       transferLabel="Upload →"
       canTransfer={connected}
@@ -511,6 +572,7 @@
         title="Remote"
         path={remote.path}
         entries={remote.entries}
+        showHidden={prefs.show_hidden}
         {busy}
         selected={remoteSel}
         transferLabel="← Download"
@@ -621,6 +683,22 @@
   </Modal>
 {/if}
 
+{#if showSync}
+  <SyncDialog localPath={local.path} remotePath={remote.path} onClose={() => (showSync = false)} />
+{/if}
+
+{#if showConsole}
+  <ConsoleDialog remotePath={remote.path} selection={remoteSel} onClose={() => (showConsole = false)} />
+{/if}
+
+{#if showKnownHosts}
+  <KnownHostsDialog onClose={() => (showKnownHosts = false)} />
+{/if}
+
+{#if showPrefs}
+  <PrefsDialog {prefs} onSave={savePrefs} onClose={() => (showPrefs = false)} />
+{/if}
+
 <style>
   header {
     display: flex;
@@ -678,6 +756,20 @@
   }
   .hostkey.mismatch { background: color-mix(in srgb, red 22%, var(--panel)); }
   .hostkey code { font-family: ui-monospace, monospace; }
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px 8px;
+  }
+  .toolbar button {
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 8px;
+  }
+  .toolbar .sep {
+    flex: 1;
+  }
   .panes {
     display: flex;
     gap: 8px;

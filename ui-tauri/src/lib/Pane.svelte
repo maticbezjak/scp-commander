@@ -18,6 +18,7 @@
     onContext, // (entry, event) right-click
     onNewFolder,
     onRefresh,
+    showHidden = true,
   } = $props();
 
   let pathInput = $state("");
@@ -25,11 +26,12 @@
     pathInput = path; // mirror external navigation into the editable field
   });
 
-  // Folders first, then case-insensitive by name.
+  // Folders first, then case-insensitive by name. Hidden dotfiles are dropped
+  // unless the show-hidden preference is on.
   let sorted = $derived(
-    [...entries].sort(
-      (a, b) => Number(b.is_dir) - Number(a.is_dir) || a.name.localeCompare(b.name),
-    ),
+    [...entries]
+      .filter((e) => showHidden || !e.name.startsWith("."))
+      .sort((a, b) => Number(b.is_dir) - Number(a.is_dir) || a.name.localeCompare(b.name)),
   );
 
   function rowClass(e) {

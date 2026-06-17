@@ -3,7 +3,9 @@
 // this layer exposes it to the Svelte UI as Tauri commands + events.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod extras;
 mod sites;
+mod sync;
 mod transfers;
 
 use std::path::Path;
@@ -150,6 +152,7 @@ fn connect_session(
     trust_fingerprint: Option<String>,
     session: State<Session>,
     transfers: State<TransferManager>,
+    sync: State<sync::SyncManager>,
 ) -> ConnectResult {
     let host_key = match trust_fingerprint {
         Some(fp) => HostKeyPolicy::AcceptFingerprint(fp),
@@ -165,8 +168,10 @@ fn connect_session(
             Ok(entries) => {
                 let dto = entries.iter().map(EntryDto::from).collect();
                 *session.0.lock().unwrap() = Some(transport);
-                // The transfer worker opens its own link from these creds.
-                transfers.set_creds(creds);
+                // The transfer worker and sync engine each open their own link
+                // from these creds.
+                transfers.set_creds(creds.clone());
+                sync.set_creds(creds);
                 ConnectResult::Connected { entries: dto, path: start }
             }
             Err(e) => ConnectResult::Error { message: e.to_string() },
@@ -309,6 +314,7 @@ fn main() {
     tauri::Builder::default()
         .manage(Session::default())
         .manage(TransferManager::default())
+        .manage(sync::SyncManager::default())
         .invoke_handler(tauri::generate_handler![
             connect_session,
             list_remote,
@@ -326,8 +332,16 @@ fn main() {
             sites::list_sites,
             sites::save_site,
             sites::delete_site,
+            sync::sync_plan,
+            sync::sync_run,
+            extras::remote_exec,
+            extras::known_hosts_list,
+            extras::known_hosts_remove,
+            extras::load_prefs,
+            extras::save_prefs,
             transfers::enqueue,
             transfers::cancel_transfer,
+            transfers::set_max_parallel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SCP Commander");
