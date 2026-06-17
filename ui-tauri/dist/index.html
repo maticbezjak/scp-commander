@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SCP Commander</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; padding: 12px; }
+      h1 { font-size: 15px; margin: 0 0 10px; }
+      form { display: grid; grid-template-columns: auto 1fr auto 90px; gap: 6px 8px; align-items: center; }
+      label { font-size: 12px; opacity: 0.7; text-align: right; }
+      input, select, button { font: inherit; padding: 4px 6px; }
+      .row-actions { grid-column: 1 / -1; display: flex; gap: 8px; align-items: center; }
+      #status { font-size: 12px; opacity: 0.8; margin-left: auto; }
+      .pathbar { display: flex; gap: 6px; margin: 10px 0 6px; }
+      .pathbar input { flex: 1; font-family: ui-monospace, monospace; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { text-align: left; padding: 3px 8px; border-bottom: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
+      td.size { text-align: right; font-variant-numeric: tabular-nums; }
+      tr.dir td.name { font-weight: 600; cursor: pointer; }
+      tr.dir td.name::before { content: "📁 "; }
+      tr.file td.name::before { content: "📄 "; }
+      .hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <h1>SCP Commander <span style="opacity:.5">— Tauri spike</span></h1>
+
+    <form id="login">
+      <label>Protocol</label>
+      <select id="protocol">
+        <option value="sftp">SFTP</option>
+        <option value="ftp">FTP</option>
+        <option value="ftps">FTPS</option>
+      </select>
+      <label>Port</label>
+      <input id="port" value="22" />
+
+      <label>Host</label>
+      <input id="host" placeholder="example.com" />
+      <label>User</label>
+      <input id="username" placeholder="user" />
+
+      <label>Password</label>
+      <input id="password" type="password" />
+      <label>Path</label>
+      <input id="path" value="/" />
+
+      <div class="row-actions">
+        <button type="submit">Connect</button>
+        <button type="button" id="disconnect" class="hidden">Disconnect</button>
+        <span id="status">Not connected</span>
+      </div>
+    </form>
+
+    <div id="browser" class="hidden">
+      <div class="pathbar">
+        <button id="up">⬆ Up</button>
+        <input id="cwd" />
+        <button id="go">Go</button>
+      </div>
+      <table>
+        <thead><tr><th>Name</th><th class="size">Size</th><th></th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div id="progress" class="hidden">
+        <progress id="bar" max="100" value="0" style="width:100%"></progress>
+        <span id="progresstext" style="font-size:12px;opacity:.8"></span>
+      </div>
+    </div>
+
+    <script>
+      const invoke = window.__TAURI__.core.invoke;
+      const listen = window.__TAURI__.event.listen;
+      const $ = (id) => document.getElementById(id);
+      const status = (t) => ($("status").textContent = t);
+      let tempDir = "/tmp";
+
+      // Live transfer progress from the Rust side.
+      listen("xfer-progress", (e) => {
+        const { name, done, total } = e.payload;
+        $("progress").classList.remove("hidden");
+        $("bar").value = total > 0 ? Math.round((done / total) * 100) : 0;
+        $("progresstext").textContent =
+          `${name}: ${humanSize(done)}${total ? " / " + humanSize(total) : ""}`;
+      });
+
+      async function download(remote) {
+        const name = remote.split("/").pop();
+        const local = `${tempDir}/${name}`;
+        status(`Downloading ${name}…`);
+        $("progress").classList.remove("hidden");
+        try {
+          const n = await invoke("download", { remote, local });
+          status(`Downloaded ${name} (${humanSize(n)}) → ${local}`);
+        } catch (e) { status("Error: " + e); }
+      }
+
+      function humanSize(n) {
+        const u = ["B", "KB", "MB", "GB", "TB"];
+        let i = 0, v = n;
+        while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+        return i === 0 ? `${n} B` : `${v.toFixed(1)} ${u[i]}`;
+      }
+
+      function render(entries) {
+        const rows = $("rows");
+        rows.innerHTML = "";
+        entries.sort((a, b) => (b.is_dir - a.is_dir) || a.name.localeCompare(b.name));
+        for (const e of entries) {
+          const tr = document.createElement("tr");
+          tr.className = e.is_dir ? "dir" : "file";
+          const name = document.createElement("td");
+          name.className = "name";
+          name.textContent = e.name;
+          if (e.is_dir) name.onclick = () => navigate(joinPath($("cwd").value, e.name));
+          const size = document.createElement("td");
+          size.className = "size";
+          size.textContent = e.is_dir ? "" : humanSize(e.size);
+          const act = document.createElement("td");
+          if (!e.is_dir) {
+            const btn = document.createElement("button");
+            btn.textContent = "⬇";
+            btn.title = "Download to temp";
+            btn.onclick = () => download(joinPath($("cwd").value, e.name));
+            act.append(btn);
+          }
+          tr.append(name, size, act);
+          rows.append(tr);
+        }
+      }
+
+      function joinPath(base, name) {
+        if (name === "..") {
+          const p = base.replace(/\/+$/, "");
+          const i = p.lastIndexOf("/");
+          return i <= 0 ? "/" : p.slice(0, i);
+        }
+        return base.endsWith("/") ? base + name : base + "/" + name;
+      }
+
+      async function navigate(path) {
+        try {
+          const entries = await invoke("list_dir", { path });
+          $("cwd").value = path;
+          render([{ name: "..", is_dir: true, size: 0 }, ...entries]);
+          status(`${path} — ${entries.length} item(s)`);
+        } catch (e) { status("Error: " + e); }
+      }
+
+      $("login").addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        status("Connecting…");
+        const form = {
+          protocol: $("protocol").value,
+          host: $("host").value,
+          port: parseInt($("port").value || "22", 10),
+          username: $("username").value,
+          password: $("password").value,
+          path: $("path").value || "/",
+        };
+        try {
+          const entries = await invoke("connect_session", { form });
+          try { tempDir = await invoke("temp_dir"); } catch (_) {}
+          $("cwd").value = form.path;
+          render([{ name: "..", is_dir: true, size: 0 }, ...entries]);
+          status(`Connected — ${entries.length} item(s)`);
+          $("browser").classList.remove("hidden");
+          $("disconnect").classList.remove("hidden");
+        } catch (e) { status("Error: " + e); }
+      });
+
+      $("up").onclick = () => navigate(joinPath($("cwd").value, ".."));
+      $("go").onclick = () => navigate($("cwd").value);
+      $("disconnect").onclick = async () => {
+        await invoke("disconnect");
+        $("browser").classList.add("hidden");
+        $("disconnect").classList.add("hidden");
+        status("Disconnected");
+      };
+
+      // Default port follows the protocol.
+      $("protocol").onchange = () => {
+        $("port").value = $("protocol").value === "sftp" ? "22" : "21";
+      };
+    </script>
+  </body>
+</html>

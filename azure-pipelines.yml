@@ -1,0 +1,100 @@
+# Azure DevOps signing/release pipeline for the Tauri app.
+#
+# Source: this GitHub repo (add a GitHub service connection in your ADO project,
+# then point a pipeline at azure-pipelines.yml). The code stays public on
+# GitHub; only signing runs here, reading secrets from a Key-Vault-backed
+# variable group.
+#
+# STATUS: skeleton — fill in the variable-group name and the secret variable
+# names (marked TODO) to match your vault, then run it. Nothing here is
+# verified yet; we'll iterate once it runs.
+
+# Build signed artifacts on tags like v1.2.3 (and allow manual runs).
+trigger:
+  tags:
+    include:
+      - "v*"
+
+variables:
+  # The variable group linked to your Azure Key Vault. Exposes the secrets
+  # referenced below as $(SECRET_NAME). TODO: set the real group name.
+  - group: scp-commander-signing
+
+stages:
+  - stage: build_signed
+    displayName: Build & sign
+    jobs:
+      # --- Windows: build, then sign with AzureSignTool against Key Vault ----
+      # AzureSignTool signs using the cert *inside* Key Vault (the private key
+      # never leaves the HSM), which satisfies the post-2023 hardware rule.
+      - job: windows
+        displayName: Windows (signed)
+        pool:
+          vmImage: windows-latest
+        steps:
+          - script: rustup default stable
+            displayName: Rust toolchain
+          - script: choco install nasm -y
+            displayName: NASM (for libssh2 vendored OpenSSL)
+          - script: cargo build -p scp-tauri --release
+            displayName: Build Tauri app (release)
+          - script: dotnet tool install --global AzureSignTool
+            displayName: Install AzureSignTool
+          # TODO: replace the $(...) names with your variable-group secrets.
+          #   AZURE_KEYVAULT_URL   – e.g. https://myvault.vault.azure.net
+          #   AZURE_CERT_NAME      – the code-signing cert name in the vault
+          #   AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_CLIENT_SECRET – the
+          #     service principal allowed to sign with that cert
+          - script: >
+              AzureSignTool sign
+              -kvu "$(AZURE_KEYVAULT_URL)"
+              -kvc "$(AZURE_CERT_NAME)"
+              -kvi "$(AZURE_CLIENT_ID)"
+              -kvt "$(AZURE_TENANT_ID)"
+              -kvs "$(AZURE_CLIENT_SECRET)"
+              -tr http://timestamp.digicert.com
+              -td sha256
+              -fd sha256
+              "target\release\scp-tauri.exe"
+            displayName: Code-sign the Windows binary
+          - publish: target/release/scp-tauri.exe
+            artifact: scp-commander-windows-signed
+
+      # --- macOS: build + codesign + notarize + staple (Tauri does it all) ---
+      - job: macos
+        displayName: macOS (notarized)
+        pool:
+          vmImage: macOS-14
+        steps:
+          - script: rustup default stable
+            displayName: Rust toolchain
+          - script: brew install tauri-cli || cargo install tauri-cli --version '^2'
+            displayName: Tauri CLI
+          # Import the Developer ID Application cert from the vault into a
+          # temporary keychain so codesign can use it.
+          # TODO secrets: APPLE_CERT_P12_BASE64, APPLE_CERT_PASSWORD.
+          - script: |
+              KEYCHAIN=build.keychain
+              security create-keychain -p actions $KEYCHAIN
+              security default-keychain -s $KEYCHAIN
+              security unlock-keychain -p actions $KEYCHAIN
+              echo "$(APPLE_CERT_P12_BASE64)" | base64 --decode > cert.p12
+              security import cert.p12 -k $KEYCHAIN -P "$(APPLE_CERT_PASSWORD)" \
+                -T /usr/bin/codesign
+              security set-key-partition-list -S apple-tool:,apple: -s -k actions $KEYCHAIN
+              rm cert.p12
+            displayName: Import signing certificate
+          # Tauri runs codesign -> notarytool -> stapler when these are set.
+          # TODO secrets: APPLE_SIGNING_IDENTITY ("Developer ID Application: …"),
+          #   APPLE_ID, APPLE_PASSWORD (app-specific), APPLE_TEAM_ID.
+          #   (Or use APPLE_API_KEY / APPLE_API_ISSUER for an ASC API key.)
+          - script: cargo tauri build
+            displayName: Build, sign & notarize
+            workingDirectory: ui-tauri/src-tauri
+            env:
+              APPLE_SIGNING_IDENTITY: $(APPLE_SIGNING_IDENTITY)
+              APPLE_ID: $(APPLE_ID)
+              APPLE_PASSWORD: $(APPLE_PASSWORD)
+              APPLE_TEAM_ID: $(APPLE_TEAM_ID)
+          - publish: target/release/bundle
+            artifact: scp-commander-macos-notarized

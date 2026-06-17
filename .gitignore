@@ -12,4 +12,8 @@ ui-macos/ScpCommander.app/
 
 # macOS
 .DS_Store
-dist/
+# Only the repo-root packaging output (scripts/package-macos.sh), NOT
+# ui-tauri/dist which is the Tauri frontend and must be committed.
+/dist/
+# Tauri's generated schema/permission files.
+ui-tauri/src-tauri/gen/

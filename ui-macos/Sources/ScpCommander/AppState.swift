@@ -342,8 +342,8 @@ final class AppState: ObservableObject {
         let interval = stored == 0 ? 30 : min(300, max(10, stored))
         keepaliveTimer = Timer.scheduledTimer(
             withTimeInterval: TimeInterval(interval), repeats: true
-        ) { [weak self] _ in
-            Task { @MainActor in
+        ) { _ in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 for session in self.sessions where session.connected {
                     session.queue.async { [client = session.client] in client.keepalive() }
@@ -760,8 +760,8 @@ final class AppState: ObservableObject {
         updateDockBadge()
         guard dockBadgeTimer == nil else { return }
         dockBadgeTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) {
-            [weak self] timer in
-            Task { @MainActor in
+            timer in
+            Task { @MainActor [weak self] in
                 guard let self else { timer.invalidate(); return }
                 self.updateDockBadge()
                 if self.transfers.activeCount == 0 {
@@ -1746,8 +1746,8 @@ final class AppState: ObservableObject {
 
     private func startEditTimerIfNeeded() {
         guard editTimer == nil else { return }
-        editTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.pollEdits() }
+        editTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+            Task { @MainActor [weak self] in self?.pollEdits() }
         }
     }
 
