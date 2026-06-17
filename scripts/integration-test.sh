@@ -47,18 +47,19 @@ $COMPOSE up -d sftp ftp minio ssh
 $COMPOSE up mc # one-shot: creates the S3 test bucket
 
 # Wait until each server actually answers (cold container starts take a
-# few seconds; a blind sleep flakes).
+# few seconds; a blind sleep flakes). 90s tolerates slow/cold CI runners —
+# the FTP image in particular can take >30s to come up.
 wait_ready() { # wait_ready <label> <probe...>
     local label=$1
     shift
-    for _ in $(seq 1 30); do
+    for _ in $(seq 1 90); do
         if "$@" >/dev/null 2>&1; then
             echo "  $label ready"
             return 0
         fi
         sleep 1
     done
-    echo "  $label NOT ready after 30s" >&2
+    echo "  $label NOT ready after 90s" >&2
     return 1
 }
 wait_ready sftp cli --accept-new ls "sftp://demo@127.0.0.1:2222/upload" demopass
