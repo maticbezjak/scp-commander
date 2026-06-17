@@ -41,6 +41,72 @@ pub fn remote_exec(
     })
 }
 
+/// Reveal a path in the OS file manager (Finder / Explorer / file manager).
+#[tauri::command]
+pub fn reveal_path(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").args(["-R", &path]).spawn();
+    #[cfg(target_os = "windows")]
+    let spawned = std::process::Command::new("explorer")
+        .arg(format!("/select,{path}"))
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let spawned = {
+        let dir = std::path::Path::new(&path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        std::process::Command::new("xdg-open").arg(dir).spawn()
+    };
+    spawned.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Server-side duplicate of a remote file.
+#[tauri::command]
+pub fn remote_copy(
+    session_id: u32,
+    src: String,
+    dst: String,
+    sessions: State<crate::Sessions>,
+) -> Result<(), String> {
+    let s = sessions.get(session_id).ok_or("not connected")?;
+    let mut g = s.transport.lock().unwrap();
+    let t = g.as_mut().ok_or("not connected")?;
+    t.copy_file(&src, &dst).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Max bytes the built-in viewer will read.
+const MAX_VIEW_BYTES: u64 = 1_048_576;
+
+/// Read a local file as text for the F3 viewer (capped).
+#[tauri::command]
+pub fn local_read_text(path: String) -> Result<String, String> {
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_VIEW_BYTES {
+        return Err("file too large to view (>1 MiB)".into());
+    }
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
+/// Download a remote file to a temp path and return its text (capped).
+#[tauri::command]
+pub fn remote_read_text(
+    session_id: u32,
+    path: String,
+    sessions: State<crate::Sessions>,
+) -> Result<String, String> {
+    let s = sessions.get(session_id).ok_or("not connected")?;
+    let tmp = std::env::temp_dir().join(format!("scpview-{}.tmp", std::process::id()));
+    {
+        let mut g = s.transport.lock().unwrap();
+        let t = g.as_mut().ok_or("not connected")?;
+        t.download(&path, &tmp).map_err(|e| e.to_string())?;
+    }
+    let res = std::fs::read_to_string(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+    res.map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Group B — known-hosts manager
 // ---------------------------------------------------------------------------

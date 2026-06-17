@@ -32,6 +32,8 @@
     onNewFolder,
     onDelete,
     onProperties,
+    onDragStartRow = () => {},
+    onDropPane = () => {},
   } = $props();
 
   let pathInput = $state("");
@@ -229,7 +231,12 @@
   </div>
 
   <!-- Listing -->
-  <div class="rows" class:busy>
+  <div
+    class="rows"
+    class:busy
+    ondragover={(ev) => ev.preventDefault()}
+    ondrop={(ev) => (ev.preventDefault(), onDropPane())}
+  >
     <table>
       <colgroup>
         <col />
@@ -260,6 +267,12 @@
         {#each display as e, i (e.name)}
           <tr
             class:sel={selected.includes(e.name)}
+            draggable="true"
+            ondragstart={(ev) => {
+              ev.dataTransfer.setData("text/plain", e.name);
+              ev.dataTransfer.effectAllowed = "copy";
+              onDragStartRow(e);
+            }}
             onclick={(ev) => onRowClick(e, i, ev)}
             ondblclick={() => dbl(e)}
             oncontextmenu={(ev) => (ev.preventDefault(), onContext(e, i, ev))}

@@ -242,13 +242,28 @@
       case "progress":
         if (t) { t.done = p.done; t.total = p.total; }
         break;
-      case "done":
+      case "done": {
         if (t) { t.state = "done"; t.done = t.total || t.done; }
         // Refresh the affected pane: remote only for the active session; local
         // is shared so always refresh on a download.
         if (p.upload) { if (p.session === activeId) loadRemote(remote.path, false); }
         else loadLocal(local.path, false);
+        // Move: delete the source now that the copy landed.
+        const mk = `${p.session}:${p.id}`;
+        if (pendingMove.has(mk)) {
+          const mv = pendingMove.get(mk);
+          pendingMove.delete(mk);
+          invoke(mv.isLocal ? "local_delete" : "remote_delete", {
+            sessionId: p.session, path: mv.path, isDir: mv.is_dir,
+          })
+            .then(() => {
+              if (mv.isLocal) loadLocal(local.path, false);
+              else if (p.session === activeId) loadRemote(remote.path, false);
+            })
+            .catch((e) => (status = `Move cleanup failed: ${e}`));
+        }
         break;
+      }
       case "failed":
         if (t) { t.state = "failed"; t.error = p.message; }
         break;
@@ -332,26 +347,41 @@
   }
 
   // --- transfers (with overwrite prompt) ---
-  function enqueueEntry(e, upload, policy) {
-    return invoke("enqueue", {
+  // Transfers whose source should be deleted on success (F6 move).
+  const pendingMove = new Map(); // `${session}:${id}` -> { isLocal, path, is_dir }
+  function enqueueEntry(e, upload, policy, move = false) {
+    const localPath = joinPath(local.path, e.name, "/");
+    const remotePath = joinPath(remote.path, e.name);
+    const p = invoke("enqueue", {
       sessionId: activeId,
       upload,
       isDir: e.is_dir,
       name: e.name,
-      local: joinPath(local.path, e.name, "/"),
-      remote: joinPath(remote.path, e.name),
+      local: localPath,
+      remote: remotePath,
       overwrite: policy,
     });
+    if (move) {
+      const sess = activeId;
+      p.then((id) =>
+        pendingMove.set(`${sess}:${id}`, {
+          isLocal: upload, // source side: upload=local→remote, so source is local
+          path: upload ? localPath : remotePath,
+          is_dir: e.is_dir,
+        }),
+      );
+    }
+    return p;
   }
-  function transfer(entries, upload) {
+  function transfer(entries, upload, move = false) {
     if (!connected || !entries.length) return;
     const dest = upload ? remote : local;
     const destNames = new Set(dest.entries.map((e) => e.name));
     const collisions = entries.filter((e) => destNames.has(e.name));
     if (collisions.length && prefs.confirm_overwrite) {
-      overwrite = { entries, upload, count: collisions.length };
+      overwrite = { entries, upload, move, count: collisions.length };
     } else {
-      for (const e of entries) enqueueEntry(e, upload, 0);
+      for (const e of entries) enqueueEntry(e, upload, 0, move);
     }
   }
 
@@ -367,7 +397,7 @@
     status = `Compare — ${localSel.length} local, ${remoteSel.length} remote differing`;
   }
   function resolveOverwrite(decision) {
-    const { entries, upload } = overwrite;
+    const { entries, upload, move } = overwrite;
     overwrite = null;
     if (decision === "cancel") return;
     const dest = upload ? remote : local;
@@ -376,15 +406,15 @@
     for (const e of entries) {
       const d = byName.get(e.name);
       if (e.is_dir) {
-        enqueueEntry(e, upload, policy); // backend applies the policy per-file
+        enqueueEntry(e, upload, policy, move); // backend applies the policy per-file
       } else if (!d) {
-        enqueueEntry(e, upload, 0);
+        enqueueEntry(e, upload, 0, move);
       } else if (decision === "skip") {
         continue;
       } else if (decision === "newer") {
-        if (e.mtime && d.mtime && e.mtime > d.mtime) enqueueEntry(e, upload, 0);
+        if (e.mtime && d.mtime && e.mtime > d.mtime) enqueueEntry(e, upload, 0, move);
       } else {
-        enqueueEntry(e, upload, 0);
+        enqueueEntry(e, upload, 0, move);
       }
     }
   }
@@ -414,7 +444,12 @@
         label: isLocal ? "Upload →" : "← Download",
         action: () => transfer(targets, isLocal),
       },
-      { label: "Rename…", action: () => (renameTarget = { isLocal, entry, value: entry.name }) },
+      !entry.is_dir && { label: "View (F3)", action: () => viewFile(isLocal, entry) },
+      { label: "Rename… (F2)", action: () => (renameTarget = { isLocal, entry, value: entry.name }) },
+      !isLocal && !entry.is_dir && {
+        label: "Duplicate…",
+        action: () => (dupTarget = { entry, value: entry.name }),
+      },
       {
         label: `Delete${targets.length > 1 ? ` (${targets.length})` : ""}…`,
         danger: true,
@@ -424,12 +459,18 @@
             : doDeleteEntries(isLocal, targets),
       },
       { label: "New folder…", action: () => (newFolder = { isLocal, value: "" }) },
+      { label: "Copy path", action: () => copyToClipboard(fullPath(isLocal, entry.name)) },
+      !isLocal && { label: "Copy URL", action: () => copyToClipboard(remoteUrl(entry.name)) },
+      isLocal && {
+        label: "Reveal in Finder",
+        action: () => invoke("reveal_path", { path: fullPath(true, entry.name) }),
+      },
       {
         label: "Properties…",
         action: () =>
           (propsTarget = { isLocal, entry, mode: octalPerms(entry.perms) }),
       },
-    ];
+    ].filter(Boolean);
     ctx = { x: ev.clientX, y: ev.clientY, items };
   }
   async function doRename() {
@@ -521,16 +562,157 @@
     queue = queue.filter((t) => t.state === "active");
   }
 
-  // F5 transfers the focused pane's selection.
+  let focusLocal = $state(true);
+
+  function selectedEntriesIn(isLocal) {
+    const sel = isLocal ? localSel : remoteSel;
+    return (isLocal ? local.entries : remote.entries).filter((e) => sel.includes(e.name));
+  }
+
+  // Keyboard commander: F5 copy · F6 move · F2 rename · F3 view · Del delete ·
+  // Tab switch panes · Backspace up · Enter open · type-ahead row jump.
+  let typeAhead = "";
+  let typeAheadAt = 0;
+  function anyModalOpen() {
+    return (
+      renameTarget || newFolder || deleteTarget || propsTarget || overwrite ||
+      dupTarget || viewer || showLogin || showSync || showConsole ||
+      showKnownHosts || showPrefs
+    );
+  }
   function onKey(ev) {
-    if (ev.key === "F5" && connected) {
-      const inField = ["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement?.tagName);
-      if (inField) return;
+    if (anyModalOpen()) return;
+    if (["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement?.tagName)) return;
+    const isLocal = focusLocal;
+    const remoteOk = isLocal || connected;
+    switch (ev.key) {
+      case "Tab":
+        ev.preventDefault();
+        focusLocal = !focusLocal;
+        return;
+      case "F5":
+        if (connected) { ev.preventDefault(); transferSelected(isLocal); }
+        return;
+      case "F6":
+        if (connected) { ev.preventDefault(); moveSelected(isLocal); }
+        return;
+      case "F2": {
+        ev.preventDefault();
+        const e = selectedEntriesIn(isLocal)[0];
+        if (e) renameTarget = { isLocal, entry: e, value: e.name };
+        return;
+      }
+      case "F3": {
+        ev.preventDefault();
+        const e = selectedEntriesIn(isLocal)[0];
+        if (e && !e.is_dir) viewFile(isLocal, e);
+        return;
+      }
+      case "Delete": {
+        ev.preventDefault();
+        const es = selectedEntriesIn(isLocal);
+        if (es.length) requestDelete(isLocal, es);
+        return;
+      }
+      case "Backspace":
+        ev.preventDefault();
+        if (isLocal) localUp();
+        else if (connected) remoteUp();
+        return;
+      case "Enter": {
+        ev.preventDefault();
+        const e = selectedEntriesIn(isLocal)[0];
+        if (e && e.is_dir && remoteOk) {
+          if (isLocal) loadLocal(joinPath(local.path, e.name, "/"));
+          else loadRemote(joinPath(remote.path, e.name));
+        }
+        return;
+      }
+    }
+    // Type-ahead: a printable key jumps to the first matching row.
+    if (ev.key.length === 1 && !ev.metaKey && !ev.ctrlKey && !ev.altKey && /[\w.\- ]/.test(ev.key)) {
       ev.preventDefault();
-      transferSelected(focusLocal);
+      const now = Date.now();
+      typeAhead = now - typeAheadAt < 1000 ? typeAhead + ev.key.toLowerCase() : ev.key.toLowerCase();
+      typeAheadAt = now;
+      const names = sortedNames(isLocal ? local.entries : remote.entries);
+      const hit = names.find((n) => n.toLowerCase().startsWith(typeAhead));
+      if (hit) {
+        if (isLocal) localSel = [hit];
+        else remoteSel = [hit];
+      }
     }
   }
-  let focusLocal = $state(true);
+
+  // F6 move = copy to the other side, then delete the source on success.
+  function moveSelected(fromLocal) {
+    const src = fromLocal ? local : remote;
+    const sel = fromLocal ? localSel : remoteSel;
+    transfer(src.entries.filter((e) => sel.includes(e.name)), fromLocal, true);
+  }
+
+  // Built-in file viewer (F3).
+  let viewer = $state(null); // { name, text }
+  async function viewFile(isLocal, e) {
+    if (e.is_dir) return;
+    if (e.size > 1048576) { status = "File too large to view (>1 MiB)"; return; }
+    try {
+      const text = await invoke(isLocal ? "local_read_text" : "remote_read_text", {
+        sessionId: activeId,
+        path: fullPath(isLocal, e.name),
+      });
+      viewer = { name: e.name, text };
+    } catch (err) {
+      status = `View failed: ${err}`;
+    }
+  }
+
+  // Duplicate a remote file (server-side copy).
+  let dupTarget = $state(null); // { entry, value }
+  async function doDuplicate() {
+    const { entry, value } = dupTarget;
+    const v = value.trim();
+    dupTarget = null;
+    if (!v || v === entry.name) return;
+    try {
+      await invoke("remote_copy", {
+        sessionId: activeId,
+        src: fullPath(false, entry.name),
+        dst: fullPath(false, v),
+      });
+      loadRemote(remote.path, false);
+    } catch (e) {
+      status = `Duplicate failed: ${e}`;
+    }
+  }
+
+  async function copyToClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      status = `Copied: ${text}`;
+    } catch {
+      status = "Copy failed";
+    }
+  }
+  function remoteUrl(name) {
+    const c = tabs.find((t) => t.id === activeId);
+    if (!c) return "";
+    const auth = c.user ? `${c.user}@` : "";
+    return `${c.proto}://${auth}${c.host}:${c.port}${joinPath(remote.path, name)}`;
+  }
+
+  // --- drag and drop between panes ---
+  let dragData = null; // { fromLocal, entries }
+  function onDragStartRow(isLocal, entry) {
+    const sel = isLocal ? localSel : remoteSel;
+    const entries = (isLocal ? local.entries : remote.entries).filter((e) => sel.includes(e.name));
+    dragData = { fromLocal: isLocal, entries: entries.length && sel.includes(entry.name) ? entries : [entry] };
+  }
+  function onDropPane(toLocal) {
+    if (!dragData || dragData.fromLocal === toLocal) { dragData = null; return; }
+    transfer(dragData.entries, !toLocal); // dropping onto remote (toLocal=false) = upload
+    dragData = null;
+  }
 
   // --- connect ---
   const defaultPort = (p) => (p === "sftp" ? 22 : p === "s3" ? 443 : 21);
@@ -550,7 +732,17 @@
           snapshotActive();
           const label =
             (form.username ? form.username + "@" : "") + (form.host || form.bucket || "session");
-          tabs = [...tabs, { id: res.session_id, label }];
+          tabs = [
+            ...tabs,
+            {
+              id: res.session_id,
+              label,
+              proto: form.protocol,
+              host: form.host,
+              port: Number(form.port),
+              user: form.username,
+            },
+          ];
           remote = { path: res.path, entries: res.entries };
           remoteSel = [];
           remoteHome = res.path;
@@ -648,6 +840,8 @@
     onNewFolder={() => (newFolder = { isLocal: true, value: "" })}
     onDelete={(entries) => requestDelete(true, entries)}
     onProperties={(e) => openProps(true, e)}
+    onDragStartRow={(e) => onDragStartRow(true, e)}
+    onDropPane={() => onDropPane(true)}
   />
   {#if connected}
     <Pane
@@ -681,6 +875,8 @@
       onNewFolder={() => (newFolder = { isLocal: false, value: "" })}
       onDelete={(entries) => requestDelete(false, entries)}
       onProperties={(e) => openProps(false, e)}
+      onDragStartRow={(e) => onDragStartRow(false, e)}
+      onDropPane={() => onDropPane(false)}
     />
   {:else}
     <div class="placeholder">
@@ -801,6 +997,25 @@
 
 {#if showPrefs}
   <PrefsDialog {prefs} onSave={savePrefs} onClose={() => (showPrefs = false)} />
+{/if}
+
+{#if dupTarget}
+  <Modal title="Duplicate" onClose={() => (dupTarget = null)}>
+    <form onsubmit={(e) => (e.preventDefault(), doDuplicate())}>
+      <input class="dlg-input" bind:value={dupTarget.value} autofocus />
+      <div class="dlg-actions">
+        <button type="button" onclick={() => (dupTarget = null)}>Cancel</button>
+        <button type="submit">Duplicate</button>
+      </div>
+    </form>
+  </Modal>
+{/if}
+
+{#if viewer}
+  <Modal title={viewer.name} onClose={() => (viewer = null)}>
+    <pre class="viewer">{viewer.text}</pre>
+    <div class="dlg-actions"><button onclick={() => (viewer = null)}>Close</button></div>
+  </Modal>
 {/if}
 
 {#if showLogin}
@@ -1200,5 +1415,19 @@
     font-size: 12px;
     color: var(--text-2);
     margin: 0 0 12px;
+  }
+  .viewer {
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre;
+    overflow: auto;
+    max-height: 60vh;
+    max-width: 78vw;
+    min-width: 380px;
+    margin: 0 0 12px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel-2);
   }
 </style>
