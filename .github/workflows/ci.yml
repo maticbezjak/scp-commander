@@ -15,10 +15,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev build-essential pkg-config \
-            libssl-dev libssh2-1-dev
+            libssl-dev libssh2-1-dev \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build workspace (core + GTK app, with S3)
+      - name: Build workspace (core + GTK app + Tauri app, with S3)
         run: cargo build --workspace --features scp-core/s3
       - name: Unit tests
         run: cargo test --workspace --features scp-core/s3
@@ -40,3 +41,24 @@ jobs:
           cargo test -p scp-core --features s3
       - name: SwiftUI app
         run: cd ui-macos && swift build
+      - name: Tauri app
+        run: cargo build -p scp-tauri
+
+  windows:
+    name: Windows (Tauri app)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # libssh2 builds against vendored OpenSSL on Windows, which needs NASM
+      # (Perl ships with the runner).
+      - uses: ilammy/setup-nasm@v1
+      - name: Build Tauri app (release)
+        run: cargo build -p scp-tauri --release
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: scp-commander-windows
+          path: target/release/scp-tauri.exe
+          if-no-files-found: error
