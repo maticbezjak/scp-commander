@@ -142,6 +142,7 @@
   let showPrefs = $state(false);
   let syncBrowse = $state(false); // mirror cd between panes when on
   let showHelp = $state(false); // keyboard-shortcuts help modal
+  let findState = $state(null); // { mask, results, busy } — Find dialog
 
   let status = $state("Not connected");
   let busy = $state(false);
@@ -805,7 +806,7 @@
   function anyModalOpen() {
     return (
       renameTarget || newFolder || deleteTarget || propsTarget || overwrite ||
-      dupTarget || viewer || maskSelect || showLogin || showSync || showConsole ||
+      dupTarget || viewer || maskSelect || findState || showLogin || showSync || showConsole ||
       showKnownHosts || showPrefs || showHelp
     );
   }
@@ -948,6 +949,32 @@
     } catch (e) {
       status = `Edit failed: ${e}`;
     }
+  }
+
+  // --- Find files (remote mask search) ---
+  function openFind() {
+    findState = { mask: "*", results: null, busy: false };
+  }
+  async function runFind() {
+    if (!connected || !findState) return;
+    findState.busy = true;
+    try {
+      findState.results = await invoke("find_remote", {
+        sessionId: activeId,
+        base: remote.path,
+        mask: findState.mask || "*",
+      });
+    } catch (e) {
+      status = `Find failed: ${e}`;
+      findState.results = [];
+    } finally {
+      findState.busy = false;
+    }
+  }
+  function openFindHit(hit) {
+    const dir = hit.path.replace(/\/[^/]*$/, "") || "/";
+    findState = null;
+    loadRemote(dir);
   }
 
   // Duplicate a remote file (server-side copy).
@@ -1122,6 +1149,7 @@
     <button class="act" onclick={() => (showSync = true)}>Synchronize</button>
     <button class="act" onclick={compareDirs}>Compare</button>
     <button class="act" onclick={() => (showConsole = true)}>Console</button>
+    <button class="act" onclick={openFind} title="Find remote files by mask">Find</button>
     <button class="act" class:on={syncBrowse} onclick={() => (syncBrowse = !syncBrowse)} title="Synchronized browsing: mirror folder changes between panes">Sync browse</button>
     <button class="act" onclick={() => invoke("open_transfers_window")} title="Open transfers in a separate window">Transfers ⤢</button>
     <span class="tvsep"></span>
@@ -1413,6 +1441,35 @@
     </div>
     <p class="hint">Drag rows between panes to transfer; drop onto a folder to go into it.</p>
     <div class="dlg-actions"><button onclick={() => (showHelp = false)}>Close</button></div>
+  </Modal>
+{/if}
+
+{#if findState}
+  <Modal title="Find remote files" onClose={() => (findState = null)}>
+    <form class="findbar" onsubmit={(e) => (e.preventDefault(), runFind())}>
+      <span class="muted">under {remote.path}</span>
+      <input class="dlg-input findmask" placeholder="mask, e.g. *.log" bind:value={findState.mask} autofocus />
+      <button type="submit" class="primary" disabled={findState.busy}>{findState.busy ? "Searching…" : "Search"}</button>
+    </form>
+    {#if findState.results}
+      <div class="findres">
+        {#if findState.results.length}
+          <div class="findcount">{findState.results.length} match(es){findState.results.length === 1000 ? " (capped)" : ""}</div>
+          <ul>
+            {#each findState.results as h (h.path)}
+              <li>
+                <span class="ftype">{h.is_dir ? "dir" : "file"}</span>
+                <span class="fpath" title={h.path}>{h.path}</span>
+                <button class="ghost" onclick={() => openFindHit(h)}>Open dir</button>
+              </li>
+            {/each}
+          </ul>
+        {:else}
+          <div class="findcount">No matches.</div>
+        {/if}
+      </div>
+    {/if}
+    <div class="dlg-actions"><button onclick={() => (findState = null)}>Close</button></div>
   </Modal>
 {/if}
 
@@ -1949,6 +2006,45 @@
     color: var(--text-2);
     margin: 0 0 12px;
   }
+  .findbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 520px;
+    max-width: 80vw;
+    margin-bottom: 8px;
+  }
+  .findbar .muted { font-size: 12px; color: var(--text-2); white-space: nowrap; }
+  .findmask { flex: 1; margin: 0; }
+  .findbar button { padding: 6px 12px; }
+  .findres { max-height: 320px; overflow: auto; margin-bottom: 10px; }
+  .findcount { font-size: 12px; color: var(--text-2); margin: 4px 0; }
+  .findres ul { list-style: none; margin: 0; padding: 0; }
+  .findres li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+    font-size: 12px;
+  }
+  .ftype {
+    font-size: 10px;
+    text-transform: uppercase;
+    color: var(--text-3);
+    width: 30px;
+    flex: none;
+  }
+  .fpath {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    direction: rtl;
+    text-align: left;
+  }
+  .findres .ghost { font-size: 11px; padding: 2px 8px; }
   .keys {
     display: grid;
     grid-template-columns: auto 1fr;

@@ -378,6 +378,33 @@ fn edit_remote(session_id: u32, path: String, app: AppHandle, sessions: State<Se
     Ok(())
 }
 
+#[derive(Serialize)]
+pub struct FindHit {
+    path: String,
+    name: String,
+    is_dir: bool,
+}
+
+/// Recursively search the remote tree under `base` for names matching `mask`
+/// (glob), capped at 1000 hits.
+#[tauri::command]
+fn find_remote(
+    session_id: u32,
+    base: String,
+    mask: String,
+    sessions: State<Sessions>,
+) -> Result<Vec<FindHit>, String> {
+    let s = session_of(&sessions, session_id)?;
+    let mut g = s.transport.lock().unwrap();
+    let t = g.as_mut().ok_or("not connected")?;
+    let mut keep = || true;
+    let hits = scp_core::ops::find(t.as_mut(), &base, &mask, 1000, &mut keep).map_err(|e| e.to_string())?;
+    Ok(hits
+        .into_iter()
+        .map(|(path, e)| FindHit { path, name: e.name, is_dir: e.is_dir })
+        .collect())
+}
+
 // --- Transfers (per session) ------------------------------------------------
 
 #[tauri::command]
@@ -558,6 +585,7 @@ fn main() {
             remote_rename,
             remote_chmod,
             edit_remote,
+            find_remote,
             local_mkdir,
             local_delete,
             local_rename,
