@@ -390,11 +390,13 @@ fn enqueue(
     local: String,
     remote: String,
     overwrite: Option<i32>,
+    resume: Option<bool>,
     app: AppHandle,
     sessions: State<Sessions>,
 ) -> Result<u64, String> {
     let s = session_of(&sessions, session_id)?;
-    s.transfers.enqueue_job(upload, is_dir, name, local, remote, overwrite, app)
+    s.transfers
+        .enqueue_job(upload, is_dir, name, local, remote, overwrite, resume.unwrap_or(false), app)
 }
 
 #[tauri::command]
@@ -528,6 +530,22 @@ fn parent_local(path: String) -> String {
 fn main() {
     tauri::Builder::default()
         .manage(Sessions::default())
+        .setup(|app| {
+            // Keep idle sessions warm so the first op after a lull doesn't stall
+            // (dropped links still auto-recover via core's AutoReconnect).
+            let handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(30));
+                let sessions = handle.state::<Sessions>();
+                let live: Vec<_> = sessions.map.lock().unwrap().values().cloned().collect();
+                for s in live {
+                    if let Some(t) = s.transport.lock().unwrap().as_mut() {
+                        let _ = t.keepalive();
+                    }
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             connect_session,
             list_remote,

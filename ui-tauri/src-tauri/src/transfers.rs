@@ -30,6 +30,8 @@ struct Job {
     remote: String,
     /// Folder overwrite policy (0 overwrite, 1 skip, 2 only-newer).
     overwrite: i32,
+    /// Resume a partial transfer instead of starting fresh (set on Retry).
+    resume: bool,
     cancel: Arc<AtomicBool>,
 }
 
@@ -97,6 +99,7 @@ impl TransferManager {
     }
 
     /// Queue a transfer; returns its id. `upload` = local→remote.
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_job(
         &self,
         upload: bool,
@@ -105,6 +108,7 @@ impl TransferManager {
         local: String,
         remote: String,
         overwrite: Option<i32>,
+        resume: bool,
         app: AppHandle,
     ) -> Result<u64, String> {
         let inner = self.inner.clone();
@@ -122,6 +126,7 @@ impl TransferManager {
         let job = Job {
             id, upload, is_dir, name, local, remote,
             overwrite: overwrite.unwrap_or(0),
+            resume,
             cancel,
         };
         sender
@@ -282,7 +287,16 @@ fn run_job(t: &mut dyn Transport, job: &Job, app: &AppHandle, sid: u32) -> scp_c
             emit(&app, Evt::Progress { session: sid, id, done, total });
             true
         };
-        if job.upload {
+        if job.resume {
+            // Continue a partial (Retry): resume the upload, or download from
+            // the size already on disk.
+            if job.upload {
+                t.upload_resume(Path::new(&job.local), &job.remote, &mut progress)
+            } else {
+                let offset = std::fs::metadata(&job.local).map(|m| m.len()).unwrap_or(0);
+                t.download_resume(&job.remote, Path::new(&job.local), offset, &mut progress)
+            }
+        } else if job.upload {
             t.upload_progress(Path::new(&job.local), &job.remote, &mut progress)
         } else {
             t.download_progress(&job.remote, Path::new(&job.local), &mut progress)

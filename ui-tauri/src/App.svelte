@@ -339,6 +339,13 @@
     const un = listen("tauri://drag-drop", (e) => {
       const paths = e.payload?.paths ?? [];
       if (!connected || !paths.length) return;
+      // Only upload when dropped on the remote pane (position is physical px).
+      const pos = e.payload?.position;
+      if (pos) {
+        const dpr = window.devicePixelRatio || 1;
+        const el = document.elementFromPoint(pos.x / dpr, pos.y / dpr);
+        if (el?.closest("[data-kind]")?.dataset.kind !== "remote") return;
+      }
       uploadExternal(paths);
     });
     return () => un.then((f) => f());
@@ -779,6 +786,7 @@
       local: item.local,
       remote: item.remote,
       overwrite: item.overwrite ?? 0,
+      resume: true, // continue the partial we already started
     }).catch((e) => (status = `Retry failed: ${e}`));
     removeTransfer(item);
   }

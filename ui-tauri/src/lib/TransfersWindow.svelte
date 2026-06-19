@@ -79,6 +79,7 @@
     invoke("enqueue", {
       sessionId: t.session, upload: t.upload, isDir: t.is_dir,
       name: t.name, local: t.local, remote: t.remote, overwrite: t.overwrite ?? 0,
+      resume: true,
     });
     remove(t);
   }
