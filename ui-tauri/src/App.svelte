@@ -1147,6 +1147,17 @@
   async function disconnect() {
     if (activeId != null) await closeTab(activeId);
   }
+  // Resolve a host-key mismatch: forget the stored key, then trust the new one.
+  async function forgetHostKey() {
+    try {
+      await invoke("known_hosts_remove", { host: form.host });
+      const fp = hostKey?.fingerprint;
+      hostKey = null;
+      connect(fp);
+    } catch (e) {
+      status = `Could not update host key: ${e}`;
+    }
+  }
 </script>
 
 <svelte:window onkeydown={onKey} />
@@ -1600,7 +1611,9 @@
       {#if hostKey}
         <div class="hostkey" class:mismatch={hostKey.mismatch}>
           {#if hostKey.mismatch}
-            ⚠ Host key <code>{hostKey.fingerprint}</code> contradicts the stored one — connection refused.
+            ⚠ Host key <code>{hostKey.fingerprint}</code> contradicts the one stored for this host.
+            Only continue if you know it legitimately changed (e.g. the server was reinstalled) — otherwise this could be a man-in-the-middle.
+            <button type="button" class="danger" onclick={forgetHostKey}>Forget old key &amp; connect</button>
           {:else}
             Unknown server key: <code>{hostKey.fingerprint}</code>
             <button type="button" class="primary" onclick={() => connect(hostKey.fingerprint)}>Trust &amp; Connect</button>
