@@ -10,6 +10,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod extras;
+mod secret;
 mod sites;
 mod sync;
 mod transfers;
@@ -476,6 +477,9 @@ fn main() {
             sites::list_sites,
             sites::save_site,
             sites::delete_site,
+            secret::secret_set,
+            secret::secret_get,
+            secret::secret_delete,
             sync_plan,
             sync_run,
             extras::remote_exec,

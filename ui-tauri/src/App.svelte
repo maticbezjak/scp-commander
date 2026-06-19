@@ -35,22 +35,27 @@
   let sites = $state([]);
   let selectedSite = $state("");
   let saveSiteName = $state(null); // non-null = the Save-site dialog value
+  let saveSitePw = $state(false); // "save password in keychain" checkbox
   async function reloadSites() {
     sites = await invoke("list_sites");
   }
   $effect(() => {
     reloadSites();
   });
-  function applySite() {
-    const s = sites.find((x) => x.name === selectedSite);
-    if (!s) return;
+  // Load a site into the form; fetches the keychain password if it has one.
+  async function loadSiteForm(s) {
+    selectedSite = s.name;
+    let pw = "";
+    if (s.save_password) {
+      try { pw = (await invoke("secret_get", { account: s.name })) ?? ""; } catch {}
+    }
     form = {
       ...form,
       protocol: s.protocol,
       host: s.host,
       port: s.port,
       username: s.username,
-      password: "",
+      password: pw,
       auth_mode: s.auth_mode || "password",
       key_path: s.key_path || "",
       bucket: s.bucket || "",
@@ -64,10 +69,19 @@
       jump_auth_mode: s.jump_auth_mode || "password",
       jump_key_path: s.jump_key_path || "",
     };
-    status = `Loaded site “${s.name}” — enter password and Connect`;
+    status = `Loaded site “${s.name}”`;
+  }
+  function applySiteByName(name) {
+    const s = sites.find((x) => x.name === name);
+    if (s) loadSiteForm(s);
+  }
+  async function connectSite(s) {
+    await loadSiteForm(s);
+    connect();
   }
   async function saveSite() {
     const name = saveSiteName.trim();
+    const savePw = saveSitePw;
     saveSiteName = null;
     if (!name) return;
     const { password, jump_password, ...rest } = form;
@@ -76,9 +90,12 @@
       name,
       port: Number(form.port) || 22, // inputs yield strings; the backend wants u16
       jump_port: Number(form.jump_port) || 22,
+      save_password: savePw && !!password,
     };
     try {
       await invoke("save_site", { site });
+      if (savePw && password) await invoke("secret_set", { account: name, password });
+      else await invoke("secret_delete", { account: name }).catch(() => {});
       await reloadSites();
       selectedSite = name;
       status = `Saved site “${name}”`;
@@ -86,11 +103,14 @@
       status = `Save site failed: ${e}`;
     }
   }
-  async function deleteSite() {
-    if (!selectedSite) return;
-    await invoke("delete_site", { name: selectedSite });
-    selectedSite = "";
+  async function deleteSiteByName(name) {
+    await invoke("delete_site", { name });
+    invoke("secret_delete", { account: name }).catch(() => {});
+    if (selectedSite === name) selectedSite = "";
     await reloadSites();
+  }
+  function deleteSite() {
+    if (selectedSite) deleteSiteByName(selectedSite);
   }
 
   // Preferences (loaded from backend on startup).
@@ -1165,7 +1185,10 @@
   <Modal title="Save site" z={60} onClose={() => (saveSiteName = null)}>
     <form onsubmit={(e) => (e.preventDefault(), saveSite())}>
       <input class="dlg-input" placeholder="site name" bind:value={saveSiteName} autofocus />
-      <p class="hint">Stores connection settings (no password).</p>
+      {#if form.password}
+        <label class="pwsave"><input type="checkbox" bind:checked={saveSitePw} /> Save password in the keychain</label>
+      {/if}
+      <p class="hint">Connection settings are stored as JSON; the password (if saved) goes to the OS keychain.</p>
       <div class="dlg-actions">
         <button type="button" onclick={() => (saveSiteName = null)}>Cancel</button>
         <button type="submit">Save</button>
@@ -1236,18 +1259,33 @@
 
 {#if showLogin}
   <Modal title="Connect to server" onClose={() => (showLogin = false)}>
-    <form class="login" onsubmit={(e) => (e.preventDefault(), connect())}>
-      <div class="lrow">
-        <label>Protocol</label>
-        <select bind:value={form.protocol} onchange={() => (form.port = defaultPort(form.protocol))}>
-          {#each PROTOS as p}<option value={p}>{p.toUpperCase()}</option>{/each}
-        </select>
-        <span class="grow"></span>
-        <select class="sitepick" bind:value={selectedSite} onchange={applySite} title="Load a saved site">
-          <option value="">— Saved sites —</option>
-          {#each sites as s}<option value={s.name}>{s.name}</option>{/each}
-        </select>
-      </div>
+    <div class="login-layout">
+      <aside class="sites-side">
+        <div class="sites-head">Saved sites</div>
+        <ul class="sites-list">
+          {#each sites as s (s.name)}
+            <li
+              class:active={selectedSite === s.name}
+              onclick={() => applySiteByName(s.name)}
+              ondblclick={() => connectSite(s)}
+              role="button"
+              tabindex="0"
+            >
+              <span class="snm">{s.name}</span>
+              <span class="spr">{s.protocol}</span>
+              <button class="srm" title="Delete site" onclick={(e) => (e.stopPropagation(), deleteSiteByName(s.name))}>✕</button>
+            </li>
+          {/each}
+          {#if !sites.length}<li class="sites-empty">No saved sites yet</li>{/if}
+        </ul>
+      </aside>
+      <form class="login" onsubmit={(e) => (e.preventDefault(), connect())}>
+        <div class="lrow">
+          <label>Protocol</label>
+          <select bind:value={form.protocol} onchange={() => (form.port = defaultPort(form.protocol))}>
+            {#each PROTOS as p}<option value={p}>{p.toUpperCase()}</option>{/each}
+          </select>
+        </div>
 
       <div class="lrow">
         <label>{isS3 ? "Endpoint" : "Host"}</label>
@@ -1321,13 +1359,14 @@
       {/if}
 
       <div class="lactions">
-        <button type="button" class="ghost" disabled={!form.host && !form.bucket} onclick={() => (saveSiteName = form.host || form.bucket)}>Save site…</button>
+        <button type="button" class="ghost" disabled={!form.host && !form.bucket} onclick={() => { saveSitePw = !!form.password; saveSiteName = form.host || form.bucket || ""; }}>Save site…</button>
         <button type="button" class="ghost" disabled={!selectedSite} onclick={deleteSite}>Delete site</button>
         <span class="grow"></span>
         <button type="button" onclick={() => (showLogin = false)}>Close</button>
         <button type="submit" class="primary" disabled={busy}>{busy ? "Connecting…" : "Connect"}</button>
       </div>
-    </form>
+      </form>
+    </div>
   </Modal>
 {/if}
 
@@ -1526,12 +1565,96 @@
   }
 
   /* Login modal */
+  .login-layout {
+    display: flex;
+    gap: 14px;
+    width: 660px;
+    max-width: 88vw;
+  }
+  .sites-side {
+    width: 190px;
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--panel-2);
+  }
+  .sites-head {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-2);
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .sites-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    overflow: auto;
+    max-height: 360px;
+  }
+  .sites-list li {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    cursor: pointer;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  }
+  .sites-list li:hover {
+    background: var(--hover);
+  }
+  .sites-list li.active {
+    background: var(--sel);
+  }
+  .sites-list .snm {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+  }
+  .sites-list .spr {
+    font-size: 10px;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .sites-list .srm {
+    border: none;
+    background: transparent;
+    color: var(--text-3);
+    padding: 0 3px;
+    font-size: 12px;
+    border-radius: 4px;
+    opacity: 0;
+  }
+  .sites-list li:hover .srm {
+    opacity: 1;
+  }
+  .sites-list .srm:hover {
+    color: var(--danger);
+  }
+  .sites-empty {
+    color: var(--text-3);
+    font-size: 12px;
+    padding: 12px 10px;
+    cursor: default;
+  }
+  .pwsave {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    margin-bottom: 10px;
+  }
   .login {
     display: flex;
     flex-direction: column;
     gap: 8px;
-    width: 460px;
-    max-width: 84vw;
+    flex: 1;
+    min-width: 0;
   }
   .lrow {
     display: flex;

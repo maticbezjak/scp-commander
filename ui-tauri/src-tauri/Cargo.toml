@@ -19,3 +19,13 @@ scp-core = { path = "../../core" }
 # vendored OpenSSL avoids a system OpenSSL install. No-op elsewhere.
 [target.'cfg(windows)'.dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"] }
+keyring = { version = "3", features = ["windows-native"] }
+
+# Secure password storage. Pure-Rust backends per platform so no system libs
+# are needed to build (keeps CI green): Keychain on macOS, Credential Manager
+# on Windows, kernel keyutils on Linux.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["linux-native"] }

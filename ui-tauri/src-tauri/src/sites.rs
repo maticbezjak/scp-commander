@@ -34,6 +34,9 @@ pub struct Site {
     pub jump_auth_mode: String,
     #[serde(default)]
     pub jump_key_path: String,
+    /// Whether a password is stored in the OS keychain for this site.
+    #[serde(default)]
+    pub save_password: bool,
 }
 
 fn sites_path() -> Option<PathBuf> {
