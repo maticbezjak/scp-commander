@@ -420,44 +420,57 @@ fn verify_host_key(session: &Session, creds: &Credentials) -> Result<()> {
     let fingerprint = sha256_fingerprint(session)
         .ok_or_else(|| Error::Connect("could not hash server host key".into()))?;
 
-    let mut matched = false;
-    for path in [user_known_hosts_path(), app_known_hosts_path()]
+    // Decide using the app's own store first (it's authoritative — the app can
+    // both read and write it), then the user's ~/.ssh/known_hosts as a
+    // read-only fallback. The first store with a verdict for this host wins, so
+    // once the user re-trusts a changed key in-app it sticks (a stale entry in
+    // ~/.ssh/known_hosts no longer permanently blocks the connection).
+    let mut decision = CheckResult::NotFound;
+    for path in [app_known_hosts_path(), user_known_hosts_path()]
         .into_iter()
         .flatten()
         .filter(|p| p.exists())
     {
-        let mut store = session
-            .known_hosts()
-            .map_err(|e| Error::Connect(e.to_string()))?;
+        let mut store = match session.known_hosts() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
         if store.read_file(&path, KnownHostFileKind::OpenSSH).is_err() {
             continue; // unreadable/corrupt file — treat as no information
         }
         match store.check_port(&creds.host, creds.port, key) {
-            CheckResult::Match => matched = true,
-            // Fail-closed: a recorded mismatch in ANY store (most importantly
-            // the user's authoritative ~/.ssh/known_hosts) is terminal — a
-            // Match elsewhere must not override it.
+            CheckResult::Match => {
+                decision = CheckResult::Match;
+                break;
+            }
             CheckResult::Mismatch => {
-                return Err(Error::HostKeyMismatch { fingerprint });
+                decision = CheckResult::Mismatch;
+                break;
             }
             CheckResult::NotFound | CheckResult::Failure => {}
         }
     }
-    if matched {
-        return Ok(());
-    }
 
-    match &creds.host_key {
-        HostKeyPolicy::Strict => Err(Error::UnknownHostKey { fingerprint }),
-        HostKeyPolicy::AcceptNew => remember_host_key(session, creds, key, key_type),
-        HostKeyPolicy::AcceptFingerprint(approved) => {
-            if *approved == fingerprint {
+    match decision {
+        CheckResult::Match => Ok(()),
+        // A recorded key differs. Refuse unless the user has explicitly approved
+        // exactly this fingerprint (the "key changed — trust new" override),
+        // which re-records it in the app store for next time.
+        CheckResult::Mismatch => match &creds.host_key {
+            HostKeyPolicy::AcceptFingerprint(approved) if *approved == fingerprint => {
                 remember_host_key(session, creds, key, key_type)
-            } else {
-                // The key changed between the prompt and the retry.
-                Err(Error::HostKeyMismatch { fingerprint })
             }
-        }
+            _ => Err(Error::HostKeyMismatch { fingerprint }),
+        },
+        // Unknown host: defer to the policy.
+        _ => match &creds.host_key {
+            HostKeyPolicy::Strict => Err(Error::UnknownHostKey { fingerprint }),
+            HostKeyPolicy::AcceptNew => remember_host_key(session, creds, key, key_type),
+            HostKeyPolicy::AcceptFingerprint(approved) if *approved == fingerprint => {
+                remember_host_key(session, creds, key, key_type)
+            }
+            HostKeyPolicy::AcceptFingerprint(_) => Err(Error::HostKeyMismatch { fingerprint }),
+        },
     }
 }
 
