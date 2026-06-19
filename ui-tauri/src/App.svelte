@@ -141,6 +141,7 @@
   let showKnownHosts = $state(false);
   let showPrefs = $state(false);
   let syncBrowse = $state(false); // mirror cd between panes when on
+  let showHelp = $state(false); // keyboard-shortcuts help modal
 
   let status = $state("Not connected");
   let busy = $state(false);
@@ -310,6 +311,56 @@
     });
     return () => un.then((f) => f());
   });
+
+  // Reflect the active connection in the OS window title.
+  $effect(() => {
+    const t = activeLabel ? `${activeLabel} — SCP Commander` : "SCP Commander";
+    try {
+      window.__TAURI__?.window?.getCurrentWindow?.().setTitle(t);
+    } catch {}
+  });
+
+  // Notify when the queue drains (status line + best-effort desktop notification).
+  let prevActive = 0;
+  $effect(() => {
+    const n = activeXfers.length;
+    if (prevActive > 0 && n === 0) {
+      status = "✓ All transfers complete";
+      try {
+        if (typeof Notification !== "undefined" && Notification.permission === "granted")
+          new Notification("SCP Commander", { body: "All transfers complete" });
+      } catch {}
+    }
+    prevActive = n;
+  });
+
+  // OS file drop (from Finder) → upload to the active remote directory.
+  $effect(() => {
+    const un = listen("tauri://drag-drop", (e) => {
+      const paths = e.payload?.paths ?? [];
+      if (!connected || !paths.length) return;
+      uploadExternal(paths);
+    });
+    return () => un.then((f) => f());
+  });
+  async function uploadExternal(paths) {
+    for (const p of paths) {
+      const name = p.replace(/[/\\]+$/, "").split(/[/\\]/).pop();
+      if (!name) continue;
+      let isDir = false;
+      try { isDir = await invoke("local_is_dir", { path: p }); } catch {}
+      invoke("enqueue", {
+        sessionId: activeId,
+        upload: true,
+        isDir,
+        name,
+        local: p,
+        remote: joinPath(remote.path, name),
+        overwrite: 0,
+      });
+    }
+    status = `Uploading ${paths.length} dropped item(s)…`;
+  }
   function onXfer(p) {
     // Transfer ids are per-session, so match on both.
     const t = queue.find((x) => x.id === p.id && x.session === p.session);
@@ -363,6 +414,10 @@
     if (started) return;
     started = true;
     invoke("home_local").then(loadLocal);
+    try {
+      if (typeof Notification !== "undefined" && Notification.permission === "default")
+        Notification.requestPermission();
+    } catch {}
   });
   async function loadLocal(path, record = true) {
     try {
@@ -743,7 +798,7 @@
     return (
       renameTarget || newFolder || deleteTarget || propsTarget || overwrite ||
       dupTarget || viewer || maskSelect || showLogin || showSync || showConsole ||
-      showKnownHosts || showPrefs
+      showKnownHosts || showPrefs || showHelp
     );
   }
   function onKey(ev) {
@@ -1066,6 +1121,7 @@
   <button class="act" class:on={prefs.show_hidden} onclick={toggleHidden} title="Show hidden files">Hidden</button>
   <button class="act" onclick={() => (showKnownHosts = true)} title="Trusted host keys">Hosts</button>
   <button class="act" onclick={() => (showPrefs = true)} title="Preferences">Preferences</button>
+  <button class="act" onclick={() => (showHelp = true)} title="Keyboard shortcuts">?</button>
   <span class="tvsep"></span>
   {#if connected}
     <button class="act" onclick={disconnect}>Disconnect</button>
@@ -1324,6 +1380,31 @@
   <Modal title={viewer.name} onClose={() => (viewer = null)}>
     <pre class="viewer">{viewer.text}</pre>
     <div class="dlg-actions"><button onclick={() => (viewer = null)}>Close</button></div>
+  </Modal>
+{/if}
+
+{#if showHelp}
+  <Modal title="Keyboard shortcuts" onClose={() => (showHelp = false)}>
+    <div class="keys">
+      <span class="k">F5</span><span>Copy (upload/download) selection</span>
+      <span class="k">F6</span><span>Move selection (copy then delete)</span>
+      <span class="k">F2</span><span>Rename</span>
+      <span class="k">F3</span><span>View file</span>
+      <span class="k">F4</span><span>Edit remote file (auto-upload on save)</span>
+      <span class="k">Del</span><span>Delete selection</span>
+      <span class="k">Enter</span><span>Open folder</span>
+      <span class="k">Backspace</span><span>Parent directory</span>
+      <span class="k">Tab</span><span>Switch panes</span>
+      <span class="k">↑ ↓</span><span>Move selection (Shift extends)</span>
+      <span class="k">Home / End</span><span>First / last item</span>
+      <span class="k">⌘A / ⌘I</span><span>Select all / invert</span>
+      <span class="k">Space</span><span>Toggle current row</span>
+      <span class="k">+ / −</span><span>Select / deselect by mask</span>
+      <span class="k">⌘L</span><span>Focus the path bar</span>
+      <span class="k">type…</span><span>Jump to a row by name</span>
+    </div>
+    <p class="hint">Drag rows between panes to transfer; drop onto a folder to go into it.</p>
+    <div class="dlg-actions"><button onclick={() => (showHelp = false)}>Close</button></div>
   </Modal>
 {/if}
 
@@ -1859,6 +1940,19 @@
     font-size: 12px;
     color: var(--text-2);
     margin: 0 0 12px;
+  }
+  .keys {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 6px 16px;
+    font-size: 13px;
+    margin-bottom: 10px;
+  }
+  .keys .k {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-2);
+    white-space: nowrap;
   }
   .ow {
     width: 100%;

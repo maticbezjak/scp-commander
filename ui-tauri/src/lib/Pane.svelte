@@ -306,6 +306,9 @@
             {/each}
           </tr>
         {/each}
+        {#if !display.length}
+          <tr class="empty-row"><td class="empty-cell" colspan={cols.length + 1}>{filterText ? "No matching items" : "Empty folder"}</td></tr>
+        {/if}
       </tbody>
     </table>
   </div>
@@ -561,6 +564,15 @@
     font-weight: 700;
     color: var(--text-2);
     padding-left: 22px;
+  }
+  .empty-row td {
+    color: var(--text-3);
+    text-align: center;
+    padding: 18px;
+    font-style: italic;
+  }
+  .empty-row:hover {
+    background: transparent;
   }
 
   .foot {

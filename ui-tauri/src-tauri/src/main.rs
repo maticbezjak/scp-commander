@@ -465,6 +465,12 @@ fn local_rename(from: String, to: String) -> Result<(), String> {
     std::fs::rename(&from, &to).map_err(|e| e.to_string())
 }
 
+/// Whether a local path is a directory (used for OS file-drop uploads).
+#[tauri::command]
+fn local_is_dir(path: String) -> bool {
+    std::path::Path::new(&path).is_dir()
+}
+
 #[derive(Serialize)]
 pub struct LocalEntry {
     name: String,
@@ -537,6 +543,7 @@ fn main() {
             local_mkdir,
             local_delete,
             local_rename,
+            local_is_dir,
             sites::list_sites,
             sites::save_site,
             sites::delete_site,
