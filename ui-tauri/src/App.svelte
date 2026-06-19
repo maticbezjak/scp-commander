@@ -1,5 +1,5 @@
 <script>
-  import { invoke, listen, emit, joinPath, humanSize } from "./lib/api.js";
+  import { invoke, listen, emit, joinPath, humanSize, updateProgress } from "./lib/api.js";
   import Pane from "./lib/Pane.svelte";
   import TransferQueue from "./lib/TransferQueue.svelte";
   import Modal from "./lib/Modal.svelte";
@@ -267,10 +267,15 @@
     switch (p.event) {
       case "started":
         if (!t)
-          queue.push({ id: p.id, session: p.session, name: p.name, upload: p.upload, done: 0, total: p.total, state: "active" });
+          queue.push({
+            id: p.id, session: p.session, name: p.name, upload: p.upload,
+            done: 0, total: p.total, state: "active",
+            local: p.local, remote: p.remote, is_dir: p.is_dir, overwrite: p.overwrite,
+            speed: 0, eta: null, lastAt: null, lastDone: 0,
+          });
         break;
       case "progress":
-        if (t) { t.done = p.done; t.total = p.total; }
+        if (t) updateProgress(t, p.done, p.total);
         break;
       case "done": {
         if (t) { t.state = "done"; t.done = t.total || t.done; }
@@ -641,6 +646,21 @@
   }
   function clearFinished() {
     queue = queue.filter((t) => t.state === "active");
+  }
+  function removeTransfer(item) {
+    queue = queue.filter((x) => !(x.session === item.session && x.id === item.id));
+  }
+  function retryTransfer(item) {
+    invoke("enqueue", {
+      sessionId: item.session,
+      upload: item.upload,
+      isDir: item.is_dir,
+      name: item.name,
+      local: item.local,
+      remote: item.remote,
+      overwrite: item.overwrite ?? 0,
+    }).catch((e) => (status = `Retry failed: ${e}`));
+    removeTransfer(item);
   }
 
   let focusLocal = $state(true);
@@ -1076,7 +1096,7 @@
   {/if}
 </div>
 
-<TransferQueue {queue} onCancel={cancelTransfer} onClear={clearFinished} />
+<TransferQueue {queue} onCancel={cancelTransfer} onClear={clearFinished} onRetry={retryTransfer} onRemove={removeTransfer} />
 
 {#if ctx}
   <ContextMenu x={ctx.x} y={ctx.y} items={ctx.items} onClose={() => (ctx = null)} />

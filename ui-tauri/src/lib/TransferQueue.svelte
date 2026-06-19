@@ -1,14 +1,15 @@
 <script>
-  import { humanSize } from "./api.js";
+  import { humanSize, humanRate, fmtEta } from "./api.js";
 
-  let { queue = [], onCancel, onClear } = $props();
+  let { queue = [], onCancel, onClear, onRetry, onRemove } = $props();
 
   let active = $derived(queue.filter((t) => t.state === "active"));
   let agg = $derived.by(() => {
     const done = active.reduce((s, t) => s + t.done, 0);
     const total = active.reduce((s, t) => s + t.total, 0);
+    const rate = active.reduce((s, t) => s + (t.speed || 0), 0);
     const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-    return { count: active.length, done, total, pct };
+    return { count: active.length, done, total, pct, rate };
   });
 
   function pctOf(t) {
@@ -19,7 +20,10 @@
     if (t.state === "done") return "done";
     if (t.state === "failed") return `failed: ${t.error ?? ""}`;
     if (t.state === "cancelled") return "cancelled";
-    return `${arrow} ${humanSize(t.done)}${t.total ? " / " + humanSize(t.total) : ""}`;
+    const size = `${humanSize(t.done)}${t.total ? " / " + humanSize(t.total) : ""}`;
+    const rate = t.speed ? ` · ${humanRate(t.speed)}` : "";
+    const eta = t.eta ? ` · ${fmtEta(t.eta)} left` : "";
+    return `${arrow} ${size}${rate}${eta}`;
   }
 </script>
 
@@ -29,7 +33,7 @@
       <strong>Transfers</strong>
       {#if agg.count}
         <span class="agg">
-          {agg.count} active · {humanSize(agg.done)} / {humanSize(agg.total)} · {agg.pct}%
+          {agg.count} active · {humanSize(agg.done)} / {humanSize(agg.total)} · {agg.pct}%{#if agg.rate} · {humanRate(agg.rate)}{/if}
         </span>
         <progress class="aggbar" max="100" value={agg.pct}></progress>
       {/if}
@@ -43,9 +47,16 @@
           <span class="qname" title={t.name}>{t.name}</span>
           <progress max="100" value={pctOf(t)}></progress>
           <span class="qstat">{label(t)}</span>
-          {#if t.state === "active"}
-            <button class="qcancel" onclick={() => onCancel(t)} title="Cancel">✕</button>
-          {/if}
+          <span class="qacts">
+            {#if t.state === "active"}
+              <button class="qcancel" onclick={() => onCancel(t)} title="Cancel">✕</button>
+            {:else if t.state === "failed"}
+              <button class="qcancel" onclick={() => onRetry(t)} title="Retry">↻</button>
+              <button class="qcancel" onclick={() => onRemove(t)} title="Remove">✕</button>
+            {:else}
+              <button class="qcancel" onclick={() => onRemove(t)} title="Remove">✕</button>
+            {/if}
+          </span>
         </div>
       {/each}
     </div>
@@ -88,6 +99,10 @@
     align-items: center;
     font-size: 12px;
     padding: 2px 0;
+  }
+  .qacts {
+    display: inline-flex;
+    gap: 2px;
   }
   .qname {
     overflow: hidden;

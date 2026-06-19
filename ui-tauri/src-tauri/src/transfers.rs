@@ -154,7 +154,18 @@ impl TransferManager {
 #[derive(Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum Evt {
-    Started { session: u32, id: u64, name: String, upload: bool, total: u64 },
+    Started {
+        session: u32,
+        id: u64,
+        name: String,
+        upload: bool,
+        total: u64,
+        // Echoed back so the UI can re-enqueue this transfer on Retry.
+        local: String,
+        remote: String,
+        is_dir: bool,
+        overwrite: i32,
+    },
     Progress { session: u32, id: u64, done: u64, total: u64 },
     Done { session: u32, id: u64, name: String, upload: bool },
     Failed { session: u32, id: u64, message: String },
@@ -216,7 +227,17 @@ fn worker(inner: Arc<Inner>, rx: SharedRx, app: AppHandle) {
             continue;
         };
 
-        emit(&app, Evt::Started { session: sid, id: job.id, name: job.name.clone(), upload: job.upload, total: 0 });
+        emit(&app, Evt::Started {
+            session: sid,
+            id: job.id,
+            name: job.name.clone(),
+            upload: job.upload,
+            total: 0,
+            local: job.local.clone(),
+            remote: job.remote.clone(),
+            is_dir: job.is_dir,
+            overwrite: job.overwrite,
+        });
         let result = run_job(t.as_mut(), &job, &app, sid);
         match result {
             Ok(_) => emit(&app, Evt::Done { session: sid, id: job.id, name: job.name.clone(), upload: job.upload }),

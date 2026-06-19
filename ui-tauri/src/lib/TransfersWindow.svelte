@@ -1,5 +1,5 @@
 <script>
-  import { invoke, listen, emit, humanSize } from "./api.js";
+  import { invoke, listen, emit, humanSize, humanRate, fmtEta, updateProgress } from "./api.js";
 
   // This window builds its own copy of the queue from the global "xfer" events
   // (the same ones the main window listens to), seeded once on open with a
@@ -12,10 +12,15 @@
     switch (p.event) {
       case "started":
         if (!t)
-          queue.push({ id: p.id, session: p.session, name: p.name, upload: p.upload, done: 0, total: p.total, state: "active" });
+          queue.push({
+            id: p.id, session: p.session, name: p.name, upload: p.upload,
+            done: 0, total: p.total, state: "active",
+            local: p.local, remote: p.remote, is_dir: p.is_dir, overwrite: p.overwrite,
+            speed: 0, eta: null, lastAt: null, lastDone: 0,
+          });
         break;
       case "progress":
-        if (t) { t.done = p.done; t.total = p.total; }
+        if (t) updateProgress(t, p.done, p.total);
         break;
       case "done":
         if (t) { t.state = "done"; t.done = t.total || t.done; }
@@ -48,7 +53,8 @@
   let agg = $derived.by(() => {
     const done = active.reduce((s, t) => s + t.done, 0);
     const total = active.reduce((s, t) => s + t.total, 0);
-    return { count: active.length, pct: total > 0 ? Math.round((done / total) * 100) : 0 };
+    const rate = active.reduce((s, t) => s + (t.speed || 0), 0);
+    return { count: active.length, pct: total > 0 ? Math.round((done / total) * 100) : 0, rate };
   });
 
   function pctOf(t) {
@@ -58,10 +64,23 @@
     if (t.state === "done") return "done";
     if (t.state === "failed") return `failed: ${t.error ?? ""}`;
     if (t.state === "cancelled") return "cancelled";
-    return `${humanSize(t.done)}${t.total ? " / " + humanSize(t.total) : ""}`;
+    const size = `${humanSize(t.done)}${t.total ? " / " + humanSize(t.total) : ""}`;
+    const rate = t.speed ? ` · ${humanRate(t.speed)}` : "";
+    const eta = t.eta ? ` · ${fmtEta(t.eta)} left` : "";
+    return `${size}${rate}${eta}`;
   }
   function cancel(t) {
     invoke("cancel_transfer", { sessionId: t.session, id: t.id });
+  }
+  function remove(t) {
+    queue = queue.filter((x) => !(x.session === t.session && x.id === t.id));
+  }
+  function retry(t) {
+    invoke("enqueue", {
+      sessionId: t.session, upload: t.upload, isDir: t.is_dir,
+      name: t.name, local: t.local, remote: t.remote, overwrite: t.overwrite ?? 0,
+    });
+    remove(t);
   }
   function clearFinished() {
     queue = queue.filter((t) => t.state === "active");
@@ -72,7 +91,7 @@
   <header>
     <strong>Transfers</strong>
     {#if agg.count}
-      <span class="agg">{agg.count} active · {agg.pct}%</span>
+      <span class="agg">{agg.count} active · {agg.pct}%{#if agg.rate} · {humanRate(agg.rate)}{/if}</span>
       <progress max="100" value={agg.pct}></progress>
     {:else}
       <span class="agg muted">idle</span>
@@ -94,8 +113,10 @@
         <span class="stat">{statusText(t)}</span>
         {#if t.state === "active"}
           <button class="x" onclick={() => cancel(t)} title="Cancel">✕</button>
+        {:else if t.state === "failed"}
+          <button class="x" onclick={() => retry(t)} title="Retry">↻</button>
         {:else}
-          <span class="x"></span>
+          <button class="x" onclick={() => remove(t)} title="Remove">✕</button>
         {/if}
       </div>
     {/each}
