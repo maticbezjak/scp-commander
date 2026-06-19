@@ -140,6 +140,7 @@
   let showConsole = $state(false);
   let showKnownHosts = $state(false);
   let showPrefs = $state(false);
+  let syncBrowse = $state(false); // mirror cd between panes when on
 
   let status = $state("Not connected");
   let busy = $state(false);
@@ -214,6 +215,26 @@
     loadRemote(remoteHome);
   }
 
+  // --- navigation with optional synchronized browsing (mirror cd) ---
+  function navOpenLocal(e) {
+    loadLocal(joinPath(local.path, e.name, "/"));
+    if (syncBrowse && connected && remote.entries.some((r) => r.name === e.name && r.is_dir))
+      loadRemote(joinPath(remote.path, e.name));
+  }
+  function navOpenRemote(e) {
+    loadRemote(joinPath(remote.path, e.name));
+    if (syncBrowse && local.entries.some((r) => r.name === e.name && r.is_dir))
+      loadLocal(joinPath(local.path, e.name, "/"));
+  }
+  function navUpLocal() {
+    localUp();
+    if (syncBrowse && connected) remoteUp();
+  }
+  function navUpRemote() {
+    remoteUp();
+    if (syncBrowse) localUp();
+  }
+
   // --- tabs (sessions) ---
   function snapshotActive() {
     if (activeId == null) return;
@@ -279,6 +300,14 @@
     const un = listen("request-xfer-snapshot", () =>
       emit("xfer-snapshot", queue.map((t) => ({ ...t }))),
     );
+    return () => un.then((f) => f());
+  });
+  // Auto-upload results from the remote-file editor.
+  $effect(() => {
+    const un = listen("edit", (e) => {
+      const p = e.payload;
+      status = p.ok ? `Uploaded changes to ${p.name}` : `Edit upload failed (${p.name}): ${p.message}`;
+    });
     return () => un.then((f) => f());
   });
   function onXfer(p) {
@@ -484,7 +513,14 @@
       const destNames = new Set(dest.entries.map((e) => e.name));
       const collisions = entries.filter((e) => destNames.has(e.name));
       if (collisions.length && prefs.confirm_overwrite) {
-        overwrite = { entries, upload, move, count: collisions.length };
+        const byName = new Map(dest.entries.map((e) => [e.name, e]));
+        const details = collisions
+          .filter((e) => !e.is_dir)
+          .map((e) => {
+            const d = byName.get(e.name);
+            return { name: e.name, srcSize: e.size, srcMtime: e.mtime, dstSize: d.size, dstMtime: d.mtime };
+          });
+        overwrite = { entries, upload, move, count: collisions.length, details };
         return;
       }
     }
@@ -551,6 +587,7 @@
         action: () => transfer(targets, isLocal),
       },
       !entry.is_dir && { label: "View (F3)", action: () => viewFile(isLocal, entry) },
+      !isLocal && !entry.is_dir && { label: "Edit (F4)", action: () => editFile(entry) },
       { label: "Rename… (F2)", action: () => (renameTarget = { isLocal, entry, value: entry.name }) },
       !isLocal && !entry.is_dir && {
         label: "Duplicate…",
@@ -577,6 +614,14 @@
           (propsTarget = { isLocal, entry, mode: octalPerms(entry.perms) }),
       },
     ].filter(Boolean);
+    ctx = { x: ev.clientX, y: ev.clientY, items };
+  }
+  function openContextEmpty(isLocal, ev) {
+    const items = [
+      { label: "Refresh", action: () => refresh(isLocal) },
+      { label: "New folder…", action: () => (newFolder = { isLocal, value: "" }) },
+      { label: "Select all", action: () => setSel(isLocal, [...paneView(isLocal)]) },
+    ];
     ctx = { x: ev.clientX, y: ev.clientY, items };
   }
   async function doRename() {
@@ -755,6 +800,14 @@
       case "F6":
         if (connected) { ev.preventDefault(); moveSelected(isLocal); }
         return;
+      case "F4": {
+        ev.preventDefault();
+        if (!isLocal && connected) {
+          const e = selectedEntriesIn(false)[0];
+          if (e && !e.is_dir) editFile(e);
+        }
+        return;
+      }
       case "F2": {
         ev.preventDefault();
         const e = selectedEntriesIn(isLocal)[0];
@@ -820,6 +873,17 @@
       viewer = { name: e.name, text };
     } catch (err) {
       status = `View failed: ${err}`;
+    }
+  }
+
+  // Edit a remote file: opens in the OS editor; saves auto-upload (F4).
+  async function editFile(entry) {
+    if (entry.is_dir) return;
+    try {
+      await invoke("edit_remote", { sessionId: activeId, path: fullPath(false, entry.name) });
+      status = `Editing ${entry.name} — saves upload automatically`;
+    } catch (e) {
+      status = `Edit failed: ${e}`;
     }
   }
 
@@ -995,6 +1059,7 @@
     <button class="act" onclick={() => (showSync = true)}>Synchronize</button>
     <button class="act" onclick={compareDirs}>Compare</button>
     <button class="act" onclick={() => (showConsole = true)}>Console</button>
+    <button class="act" class:on={syncBrowse} onclick={() => (syncBrowse = !syncBrowse)} title="Synchronized browsing: mirror folder changes between panes">Sync browse</button>
     <button class="act" onclick={() => invoke("open_transfers_window")} title="Open transfers in a separate window">Transfers ⤢</button>
     <span class="tvsep"></span>
   {/if}
@@ -1037,13 +1102,13 @@
     canBack={localNav.back.length > 0}
     canForward={localNav.fwd.length > 0}
     onFocus={() => (focusLocal = true)}
-    onUp={localUp}
+    onUp={navUpLocal}
     onHome={goHomeLocal}
     onBack={() => goBack(true)}
     onForward={() => goForward(true)}
     onRefresh={() => loadLocal(local.path, false)}
     onNavigate={(p) => loadLocal(p)}
-    onOpen={(e) => loadLocal(joinPath(local.path, e.name, "/"))}
+    onOpen={navOpenLocal}
     onTransferOne={(e) => transfer([e], true)}
     onTransfer={() => transferSelected(true)}
     onRowClick={(e, i, ev) => rowClick(true, e, i, ev)}
@@ -1056,6 +1121,7 @@
     dropName={dropTarget?.kind === "local" ? dropTarget.name : null}
     onView={(names) => (localView = names)}
     focusPathReq={focusLocal ? pathFocusReq : 0}
+    onContextEmpty={(ev) => openContextEmpty(true, ev)}
   />
   {#if connected}
     <Pane
@@ -1075,13 +1141,13 @@
       canBack={remoteNav.back.length > 0}
       canForward={remoteNav.fwd.length > 0}
       onFocus={() => (focusLocal = false)}
-      onUp={remoteUp}
+      onUp={navUpRemote}
       onHome={goHomeRemote}
       onBack={() => goBack(false)}
       onForward={() => goForward(false)}
       onRefresh={() => loadRemote(remote.path, false)}
       onNavigate={(p) => loadRemote(p)}
-      onOpen={(e) => loadRemote(joinPath(remote.path, e.name))}
+      onOpen={navOpenRemote}
       onTransferOne={(e) => transfer([e], false)}
       onTransfer={() => transferSelected(false)}
       onRowClick={(e, i, ev) => rowClick(false, e, i, ev)}
@@ -1094,6 +1160,7 @@
       dropName={dropTarget?.kind === "remote" ? dropTarget.name : null}
       onView={(names) => (remoteView = names)}
       focusPathReq={!focusLocal ? pathFocusReq : 0}
+      onContextEmpty={(ev) => openContextEmpty(false, ev)}
     />
   {:else}
     <div class="placeholder">
@@ -1200,6 +1267,22 @@
 {#if overwrite}
   <Modal title="Files already exist" onClose={() => (overwrite = null)}>
     <p>{overwrite.count} item(s) already exist at the destination. What should happen?</p>
+    {#if overwrite.details?.length}
+      <table class="ow">
+        <thead><tr><th>Name</th><th>Source</th><th>Target</th></tr></thead>
+        <tbody>
+          {#each overwrite.details.slice(0, 8) as d}
+            {@const newer = d.srcMtime && d.dstMtime ? (d.srcMtime > d.dstMtime ? "newer" : d.srcMtime < d.dstMtime ? "older" : "same") : ""}
+            <tr>
+              <td class="ow-nm" title={d.name}>{d.name}</td>
+              <td class="ow-m" class:hit={newer === "newer"}>{humanSize(d.srcSize)} · {fmtTime(d.srcMtime)}{#if newer} · {newer}{/if}</td>
+              <td class="ow-m">{humanSize(d.dstSize)} · {fmtTime(d.dstMtime)}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+      {#if overwrite.details.length > 8}<p class="hint">…and {overwrite.details.length - 8} more.</p>{/if}
+    {/if}
     <div class="dlg-actions wrap">
       <button class="danger" onclick={() => resolveOverwrite("overwrite")}>Overwrite</button>
       <button onclick={() => resolveOverwrite("newer")}>Only newer</button>
@@ -1776,6 +1859,38 @@
     font-size: 12px;
     color: var(--text-2);
     margin: 0 0 12px;
+  }
+  .ow {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    margin: 6px 0 12px;
+  }
+  .ow th {
+    text-align: left;
+    color: var(--text-2);
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+    padding: 3px 6px;
+  }
+  .ow td {
+    padding: 3px 6px;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  }
+  .ow-nm {
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ow-m {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+  .ow-m.hit {
+    color: var(--ok);
   }
   .drag-ghost {
     position: fixed;

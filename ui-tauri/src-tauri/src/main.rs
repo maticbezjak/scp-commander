@@ -22,9 +22,11 @@ use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
 use scp_core::types::{Auth, Credentials, Entry, Error, HostKeyPolicy, JumpHost, Protocol};
+use std::time::Duration;
+
 use scp_core::{connect, Transport};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use transfers::TransferManager;
 
@@ -316,6 +318,66 @@ fn remote_chmod(session_id: u32, path: String, mode: u32, sessions: State<Sessio
     t.set_permissions(&path, mode).map_err(|e| e.to_string())
 }
 
+#[derive(Clone, Serialize)]
+struct EditEvt {
+    name: String,
+    ok: bool,
+    message: String,
+}
+
+fn open_path_in_os(path: &Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", &path.to_string_lossy()])
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+/// Edit a remote file: download to a temp file, open it in the OS default app,
+/// then watch it and re-upload on every save (emits "edit" events). The watcher
+/// stops when the temp file disappears or the session goes away.
+#[tauri::command]
+fn edit_remote(session_id: u32, path: String, app: AppHandle, sessions: State<Sessions>) -> Result<(), String> {
+    let s = session_of(&sessions, session_id)?;
+    let name = path.rsplit('/').find(|p| !p.is_empty()).unwrap_or("file").to_string();
+    let tmp = std::env::temp_dir().join(format!("scpedit-{}-{}", std::process::id(), name));
+    {
+        let mut g = s.transport.lock().unwrap();
+        let t = g.as_mut().ok_or("not connected")?;
+        t.download(&path, &tmp).map_err(|e| e.to_string())?;
+    }
+    open_path_in_os(&tmp);
+
+    let watch = s.clone();
+    let remote = path.clone();
+    let tmp2 = tmp.clone();
+    std::thread::spawn(move || {
+        let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let mut last = mtime(&tmp2);
+        loop {
+            std::thread::sleep(Duration::from_millis(1500));
+            if std::fs::metadata(&tmp2).is_err() {
+                break; // temp file gone — done editing
+            }
+            let now = mtime(&tmp2);
+            if now != last {
+                last = now;
+                let mut g = watch.transport.lock().unwrap();
+                let Some(t) = g.as_mut() else { break };
+                let evt = match t.upload(&tmp2, &remote) {
+                    Ok(_) => EditEvt { name: name.clone(), ok: true, message: String::new() },
+                    Err(e) => EditEvt { name: name.clone(), ok: false, message: e.to_string() },
+                };
+                let _ = app.emit("edit", evt);
+            }
+        }
+    });
+    Ok(())
+}
+
 // --- Transfers (per session) ------------------------------------------------
 
 #[tauri::command]
@@ -471,6 +533,7 @@ fn main() {
             remote_delete,
             remote_rename,
             remote_chmod,
+            edit_remote,
             local_mkdir,
             local_delete,
             local_rename,

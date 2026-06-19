@@ -37,6 +37,7 @@
     dropName = null,
     onView = () => {}, // report the current visible row order (for keyboard nav)
     focusPathReq = 0, // bump to request focus on the path bar (⌘L)
+    onContextEmpty = () => {}, // right-click on empty pane area
   } = $props();
 
   let pathInput = $state("");
@@ -256,7 +257,12 @@
   </div>
 
   <!-- Listing -->
-  <div class="rows" class:busy bind:this={rowsEl}>
+  <div
+    class="rows"
+    class:busy
+    bind:this={rowsEl}
+    oncontextmenu={(ev) => { if (!ev.target.closest("tr")) { ev.preventDefault(); onContextEmpty(ev); } }}
+  >
     <table>
       <colgroup>
         <col />
@@ -292,7 +298,7 @@
             onpointerdown={(ev) => onRowPointerDown(e, ev)}
             onclick={(ev) => onRowClick(e, i, ev)}
             ondblclick={() => dbl(e)}
-            oncontextmenu={(ev) => (ev.preventDefault(), onContext(e, i, ev))}
+            oncontextmenu={(ev) => (ev.preventDefault(), ev.stopPropagation(), onContext(e, i, ev))}
           >
             <td class="name">{@render typeIcon(e)}<span class="nm">{e.name}</span></td>
             {#each cols as c}
