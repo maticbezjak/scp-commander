@@ -1,5 +1,5 @@
 <script>
-  import { invoke, listen, joinPath, humanSize } from "./lib/api.js";
+  import { invoke, listen, emit, joinPath, humanSize } from "./lib/api.js";
   import Pane from "./lib/Pane.svelte";
   import TransferQueue from "./lib/TransferQueue.svelte";
   import Modal from "./lib/Modal.svelte";
@@ -149,6 +149,12 @@
   let showLogin = $state(true);
 
   let queue = $state([]);
+  const activeXfers = $derived(queue.filter((t) => t.state === "active"));
+  const xferPct = $derived.by(() => {
+    const done = activeXfers.reduce((s, t) => s + t.done, 0);
+    const total = activeXfers.reduce((s, t) => s + t.total, 0);
+    return total > 0 ? Math.round((done / total) * 100) : 0;
+  });
 
   function pushRecent(isLocal, p) {
     const arr = isLocal ? localRecents : remoteRecents;
@@ -239,6 +245,13 @@
   // --- transfer events from the backend worker ---
   $effect(() => {
     const un = listen("xfer", (e) => onXfer(e.payload));
+    return () => un.then((f) => f());
+  });
+  // The separate Transfers window asks for the current queue when it opens.
+  $effect(() => {
+    const un = listen("request-xfer-snapshot", () =>
+      emit("xfer-snapshot", queue.map((t) => ({ ...t }))),
+    );
     return () => un.then((f) => f());
   });
   function onXfer(p) {
@@ -359,9 +372,12 @@
   // --- transfers (with overwrite prompt) ---
   // Transfers whose source should be deleted on success (F6 move).
   const pendingMove = new Map(); // `${session}:${id}` -> { isLocal, path, is_dir }
-  function enqueueEntry(e, upload, policy, move = false) {
-    const localPath = joinPath(local.path, e.name, "/");
-    const remotePath = joinPath(remote.path, e.name);
+  // `destDir` overrides the destination directory (e.g. dropping onto a folder).
+  function enqueueEntry(e, upload, policy, move = false, destDir = null) {
+    const localBase = upload ? local.path : destDir ?? local.path;
+    const remoteBase = upload ? destDir ?? remote.path : remote.path;
+    const localPath = joinPath(localBase, e.name, "/");
+    const remotePath = joinPath(remoteBase, e.name);
     const p = invoke("enqueue", {
       sessionId: activeId,
       upload,
@@ -383,16 +399,19 @@
     }
     return p;
   }
-  function transfer(entries, upload, move = false) {
+  function transfer(entries, upload, move = false, destDir = null) {
     if (!connected || !entries.length) return;
-    const dest = upload ? remote : local;
-    const destNames = new Set(dest.entries.map((e) => e.name));
-    const collisions = entries.filter((e) => destNames.has(e.name));
-    if (collisions.length && prefs.confirm_overwrite) {
-      overwrite = { entries, upload, move, count: collisions.length };
-    } else {
-      for (const e of entries) enqueueEntry(e, upload, 0, move);
+    // Skip the collision prompt when dropping into a subfolder we haven't listed.
+    if (destDir == null) {
+      const dest = upload ? remote : local;
+      const destNames = new Set(dest.entries.map((e) => e.name));
+      const collisions = entries.filter((e) => destNames.has(e.name));
+      if (collisions.length && prefs.confirm_overwrite) {
+        overwrite = { entries, upload, move, count: collisions.length };
+        return;
+      }
     }
+    for (const e of entries) enqueueEntry(e, upload, 0, move, destDir);
   }
 
   // Compare the two panes: select entries that are missing on the other side
@@ -711,17 +730,65 @@
     return `${c.proto}://${auth}${c.host}:${c.port}${joinPath(remote.path, name)}`;
   }
 
-  // --- drag and drop between panes ---
-  let dragData = null; // { fromLocal, entries }
-  function onDragStartRow(isLocal, entry) {
+  // --- drag and drop between panes (pointer-based; HTML5 DnD is unreliable in
+  // the WebKit webview, so we track pointer movement ourselves) ---
+  let dragGhost = $state(null); // { x, y, label } while dragging
+  let dropTarget = $state(null); // { kind, name } highlight while hovering a valid target
+  let dragState = null; // { fromLocal, entries, startX, startY, active }
+  function onRowPointerDown(isLocal, entry, ev) {
+    if (ev.button !== 0) return;
     const sel = isLocal ? localSel : remoteSel;
     const entries = (isLocal ? local.entries : remote.entries).filter((e) => sel.includes(e.name));
-    dragData = { fromLocal: isLocal, entries: entries.length && sel.includes(entry.name) ? entries : [entry] };
+    dragState = {
+      fromLocal: isLocal,
+      entries: entries.length && sel.includes(entry.name) ? entries : [entry],
+      startX: ev.clientX,
+      startY: ev.clientY,
+      active: false,
+    };
+    window.addEventListener("pointermove", onDragMove);
+    window.addEventListener("pointerup", onDragUp);
   }
-  function onDropPane(toLocal) {
-    if (!dragData || dragData.fromLocal === toLocal) { dragData = null; return; }
-    transfer(dragData.entries, !toLocal); // dropping onto remote (toLocal=false) = upload
-    dragData = null;
+  // Which pane (+ optional folder row) is under the cursor, if it's a valid drop.
+  function dropInfoAt(ds, x, y) {
+    const elt = document.elementFromPoint(x, y);
+    const kind = elt?.closest("[data-kind]")?.dataset.kind;
+    if (kind !== "local" && kind !== "remote") return null;
+    if ((kind === "remote") !== ds.fromLocal) return null; // same pane it came from
+    const rowName = elt?.closest("tr[data-name]")?.dataset.name;
+    const entries = kind === "remote" ? remote.entries : local.entries;
+    const onFolder = rowName && entries.find((e) => e.name === rowName)?.is_dir ? rowName : null;
+    return { kind, name: onFolder };
+  }
+  function onDragMove(ev) {
+    if (!dragState) return;
+    if (!dragState.active) {
+      const dx = ev.clientX - dragState.startX;
+      const dy = ev.clientY - dragState.startY;
+      if (dx * dx + dy * dy < 36) return; // 6px threshold before a drag begins
+      dragState.active = true;
+    }
+    const n = dragState.entries.length;
+    dragGhost = { x: ev.clientX, y: ev.clientY, label: n > 1 ? `${n} items` : dragState.entries[0].name };
+    dropTarget = dropInfoAt(dragState, ev.clientX, ev.clientY);
+  }
+  function onDragUp(ev) {
+    window.removeEventListener("pointermove", onDragMove);
+    window.removeEventListener("pointerup", onDragUp);
+    const ds = dragState;
+    dragState = null;
+    dragGhost = null;
+    dropTarget = null;
+    if (!ds || !ds.active || !connected) return;
+    const info = dropInfoAt(ds, ev.clientX, ev.clientY);
+    if (!info) return;
+    const toRemote = info.kind === "remote";
+    // Dropped on a folder row → drop into that folder; else the current dir.
+    const destDir = info.name
+      ? joinPath(toRemote ? remote.path : local.path, info.name)
+      : null;
+    transfer(ds.entries, toRemote, false, destDir);
+    if (destDir) status = `${ds.entries.length} item(s) → ${info.name}/`;
   }
 
   // --- connect ---
@@ -785,6 +852,12 @@
 
 <svelte:window onkeydown={onKey} />
 
+{#if dragGhost}
+  <div class="drag-ghost" style="left:{dragGhost.x + 14}px; top:{dragGhost.y + 10}px">
+    {dragGhost.label}
+  </div>
+{/if}
+
 <header class="topbar">
   <span class="brand"><span class="logodot"></span> SCP Commander</span>
   {#if connected}
@@ -795,6 +868,7 @@
     <button class="act" onclick={() => (showSync = true)}>Synchronize</button>
     <button class="act" onclick={compareDirs}>Compare</button>
     <button class="act" onclick={() => (showConsole = true)}>Console</button>
+    <button class="act" onclick={() => invoke("open_transfers_window")} title="Open transfers in a separate window">Transfers ⤢</button>
     <span class="tvsep"></span>
   {/if}
   <button class="act" class:on={prefs.show_hidden} onclick={toggleHidden} title="Show hidden files">Hidden</button>
@@ -850,8 +924,9 @@
     onNewFolder={() => (newFolder = { isLocal: true, value: "" })}
     onDelete={(entries) => requestDelete(true, entries)}
     onProperties={(e) => openProps(true, e)}
-    onDragStartRow={(e) => onDragStartRow(true, e)}
-    onDropPane={() => onDropPane(true)}
+    onRowPointerDown={(e, ev) => onRowPointerDown(true, e, ev)}
+    dropActive={dropTarget?.kind === "local"}
+    dropName={dropTarget?.kind === "local" ? dropTarget.name : null}
   />
   {#if connected}
     <Pane
@@ -885,8 +960,9 @@
       onNewFolder={() => (newFolder = { isLocal: false, value: "" })}
       onDelete={(entries) => requestDelete(false, entries)}
       onProperties={(e) => openProps(false, e)}
-      onDragStartRow={(e) => onDragStartRow(false, e)}
-      onDropPane={() => onDropPane(false)}
+      onRowPointerDown={(e, ev) => onRowPointerDown(false, e, ev)}
+      dropActive={dropTarget?.kind === "remote"}
+      dropName={dropTarget?.kind === "remote" ? dropTarget.name : null}
     />
   {:else}
     <div class="placeholder">
@@ -901,6 +977,12 @@
 <div class="statusbar">
   <span class="dot" class:on={connected}></span>
   <span class="stxt">{status}</span>
+  {#if activeXfers.length}
+    <span class="xfer-ind">
+      <span class="spinner"></span>
+      Transferring {activeXfers.length} {activeXfers.length === 1 ? "file" : "files"} — {xferPct}%
+    </span>
+  {/if}
 </div>
 
 <TransferQueue {queue} onCancel={cancelTransfer} onClear={clearFinished} />
@@ -1296,6 +1378,28 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .xfer-ind {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--accent);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
 
   /* Login modal */
   .login {
@@ -1425,6 +1529,18 @@
     font-size: 12px;
     color: var(--text-2);
     margin: 0 0 12px;
+  }
+  .drag-ghost {
+    position: fixed;
+    z-index: 100;
+    pointer-events: none;
+    padding: 3px 9px;
+    font-size: 12px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: #fff;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+    white-space: nowrap;
   }
   .viewer {
     font-family: var(--mono);

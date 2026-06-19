@@ -32,8 +32,9 @@
     onNewFolder,
     onDelete,
     onProperties,
-    onDragStartRow = () => {},
-    onDropPane = () => {},
+    onRowPointerDown = () => {},
+    dropActive = false,
+    dropName = null,
   } = $props();
 
   let pathInput = $state("");
@@ -194,7 +195,7 @@
   {/if}
 {/snippet}
 
-<div class="pane" class:focused onpointerdown={onFocus}>
+<div class="pane" class:focused class:drop-active={dropActive && !dropName} data-kind={kind} onpointerdown={onFocus}>
   <!-- Row 1: title + navigation + file actions + filter -->
   <div class="ptool">
     <span class="title" class:focus={focused}>{title}</span>
@@ -231,12 +232,7 @@
   </div>
 
   <!-- Listing -->
-  <div
-    class="rows"
-    class:busy
-    ondragover={(ev) => ev.preventDefault()}
-    ondrop={(ev) => (ev.preventDefault(), onDropPane())}
-  >
+  <div class="rows" class:busy>
     <table>
       <colgroup>
         <col />
@@ -267,12 +263,9 @@
         {#each display as e, i (e.name)}
           <tr
             class:sel={selected.includes(e.name)}
-            draggable="true"
-            ondragstart={(ev) => {
-              ev.dataTransfer.setData("text/plain", e.name);
-              ev.dataTransfer.effectAllowed = "copy";
-              onDragStartRow(e);
-            }}
+            class:drop-row={dropName === e.name}
+            data-name={e.name}
+            onpointerdown={(ev) => onRowPointerDown(e, ev)}
             onclick={(ev) => onRowClick(e, i, ev)}
             ondblclick={() => dbl(e)}
             oncontextmenu={(ev) => (ev.preventDefault(), onContext(e, i, ev))}
@@ -310,6 +303,16 @@
   }
   .pane.focused {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  }
+  .pane.drop-active {
+    border-color: var(--accent);
+    box-shadow: inset 0 0 0 1px var(--accent);
+  }
+  tbody tr.drop-row,
+  tbody tr.drop-row:hover {
+    background: color-mix(in srgb, var(--accent) 35%, transparent);
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
   }
 
   .ptool {

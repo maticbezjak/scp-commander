@@ -23,9 +23,26 @@ use std::time::UNIX_EPOCH;
 use scp_core::types::{Auth, Credentials, Entry, Error, HostKeyPolicy, JumpHost, Protocol};
 use scp_core::{connect, Transport};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use transfers::TransferManager;
+
+/// Open (or focus) the separate Transfers window — a second webview that
+/// mirrors the transfer queue, like the native app's transfer window.
+#[tauri::command]
+fn open_transfers_window(app: AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window("transfers") {
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(&app, "transfers", WebviewUrl::App("index.html#transfers".into()))
+        .title("Transfers")
+        .inner_size(580.0, 420.0)
+        .min_inner_size(420.0, 220.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
 
 /// One live server connection (a tab): its browse transport plus the per-session
 /// transfer pool and sync engine.
@@ -473,6 +490,7 @@ fn main() {
             enqueue,
             cancel_transfer,
             set_max_parallel,
+            open_transfers_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SCP Commander");

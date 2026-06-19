@@ -2,6 +2,7 @@
 const tauri = window.__TAURI__;
 export const invoke = tauri.core.invoke;
 export const listen = tauri.event.listen;
+export const emit = tauri.event.emit;
 
 export function humanSize(n) {
   const u = ["B", "KB", "MB", "GB", "TB"];
