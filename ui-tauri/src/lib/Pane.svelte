@@ -51,6 +51,22 @@
   let sortKey = $state("name"); // name | size | type | mtime
   let ascending = $state(true);
 
+  // Per-pane bookmarks (persisted in localStorage by kind).
+  let bmOpen = $state(false);
+  let bookmarks = $state(loadBookmarks());
+  function loadBookmarks() {
+    try { return JSON.parse(localStorage.getItem(`bm.${kind}`) || "[]"); } catch { return []; }
+  }
+  const isBookmarked = $derived(bookmarks.includes(path));
+  function toggleBookmark() {
+    bookmarks = isBookmarked ? bookmarks.filter((b) => b !== path) : [...bookmarks, path];
+    localStorage.setItem(`bm.${kind}`, JSON.stringify(bookmarks));
+  }
+  function goBookmark(b) {
+    bmOpen = false;
+    onNavigate(b);
+  }
+
   // Resizable column widths, persisted per pane in localStorage.
   const DEFAULTS = { size: 64, type: 92, changed: 118, owner: 48, group: 48, rights: 88 };
   function loadWidths() {
@@ -199,6 +215,7 @@
     {:else if name === "newfolder"}<path d="M1.8 4h4l1.5 1.5H14.2V12H1.8Z" /><path d="M11 7.4v3 M9.5 8.9h3" />
     {:else if name === "trash"}<path d="M3 4.5h10 M5.5 4.5V3.4h5V4.5 M4.6 4.5 5.1 13h5.8l.5-8.5" />
     {:else if name === "info"}<circle cx="8" cy="8" r="5.6" /><path d="M8 7.3v3.6 M8 5h.01" />
+    {:else if name === "bookmark"}<path d="M5 2.5h6v11l-3-2.3-3 2.3Z" />
     {/if}
   </svg>
 {/snippet}
@@ -228,6 +245,22 @@
     <button class="tb" onclick={onUp} title="Parent directory">{@render ic("up")}</button>
     <button class="tb" onclick={onHome} title="Home">{@render ic("home")}</button>
     <button class="tb" onclick={onRefresh} title="Refresh">{@render ic("refresh")}</button>
+    <span class="bm">
+      <button class="tb" class:on={isBookmarked} onclick={() => (bmOpen = !bmOpen)} title="Bookmarks">{@render ic("bookmark")}</button>
+      {#if bmOpen}
+        <button class="bm-backdrop" onclick={() => (bmOpen = false)} aria-label="Close"></button>
+        <div class="bm-menu">
+          {#each bookmarks as b}
+            <button class="bm-item" title={b} onclick={() => goBookmark(b)}>{b}</button>
+          {/each}
+          {#if !bookmarks.length}<div class="bm-empty">No bookmarks</div>{/if}
+          <div class="bm-sep"></div>
+          <button class="bm-item add" onclick={toggleBookmark}>
+            {isBookmarked ? "Remove this directory" : "Bookmark this directory"}
+          </button>
+        </div>
+      {/if}
+    </span>
     <span class="vsep"></span>
     <button class="tb" disabled={!canTransfer || selEntries.length === 0} onclick={onTransfer}
             title="{transferLabel} (F5)">{@render ic(kind === "local" ? "upload" : "download")}</button>
@@ -380,6 +413,68 @@
   .tb:hover:not(:disabled) {
     background: var(--hover);
     color: var(--text);
+  }
+  .tb.on {
+    color: var(--accent);
+  }
+  .bm {
+    position: relative;
+    display: inline-flex;
+  }
+  .bm-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 19;
+    border: none;
+    background: transparent;
+    cursor: default;
+  }
+  .bm-menu {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 20;
+    min-width: 200px;
+    max-width: 320px;
+    max-height: 320px;
+    overflow: auto;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.28);
+    padding: 4px;
+  }
+  .bm-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: none;
+    background: transparent;
+    color: var(--text);
+    font-size: 12px;
+    font-family: var(--mono);
+    padding: 4px 8px;
+    border-radius: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .bm-item:hover {
+    background: var(--hover);
+  }
+  .bm-item.add {
+    font-family: inherit;
+    color: var(--accent);
+  }
+  .bm-empty {
+    color: var(--text-3);
+    font-size: 12px;
+    padding: 4px 8px;
+  }
+  .bm-sep {
+    height: 1px;
+    background: var(--border);
+    margin: 4px 0;
   }
   .ic {
     width: 15px;

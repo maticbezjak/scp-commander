@@ -154,6 +154,7 @@
   let activeId = $state(null); // active session id, or null when none open
   const connected = $derived(activeId !== null);
   const activeLabel = $derived(tabs.find((t) => t.id === activeId)?.label ?? "");
+  const activeConn = $derived(tabs.find((t) => t.id === activeId) ?? null);
   const tabRemote = {}; // id -> { remote, remoteSel, remoteNav, remoteRecents, remoteHome }
 
   let local = $state({ path: "", entries: [] });
@@ -656,6 +657,7 @@
         label: "Duplicate…",
         action: () => (dupTarget = { entry, value: entry.name }),
       },
+      !isLocal && entry.is_dir && { label: "Calculate size", action: () => calcSize(entry) },
       {
         label: `Delete${targets.length > 1 ? ` (${targets.length})` : ""}…`,
         danger: true,
@@ -977,6 +979,22 @@
     loadRemote(dir);
   }
 
+  // Calculate a remote directory's total size.
+  async function calcSize(entry) {
+    status = `Calculating size of ${entry.name}…`;
+    try {
+      const bytes = await invoke("dir_size", { sessionId: activeId, path: fullPath(false, entry.name) });
+      status = `${entry.name}: ${humanSize(bytes)}`;
+    } catch (e) {
+      status = `Size failed: ${e}`;
+    }
+  }
+  function openTerminal() {
+    if (activeConn?.proto !== "sftp") return;
+    invoke("open_ssh_terminal", { host: activeConn.host, port: activeConn.port, user: activeConn.user })
+      .catch((e) => (status = `Terminal failed: ${e}`));
+  }
+
   // Duplicate a remote file (server-side copy).
   let dupTarget = $state(null); // { entry, value }
   async function doDuplicate() {
@@ -1149,6 +1167,9 @@
     <button class="act" onclick={() => (showSync = true)}>Synchronize</button>
     <button class="act" onclick={compareDirs}>Compare</button>
     <button class="act" onclick={() => (showConsole = true)}>Console</button>
+    {#if activeConn?.proto === "sftp"}
+      <button class="act" onclick={openTerminal} title="Open an SSH session in Terminal">Terminal</button>
+    {/if}
     <button class="act" onclick={openFind} title="Find remote files by mask">Find</button>
     <button class="act" class:on={syncBrowse} onclick={() => (syncBrowse = !syncBrowse)} title="Synchronized browsing: mirror folder changes between panes">Sync browse</button>
     <button class="act" onclick={() => invoke("open_transfers_window")} title="Open transfers in a separate window">Transfers ⤢</button>

@@ -378,6 +378,48 @@ fn edit_remote(session_id: u32, path: String, app: AppHandle, sessions: State<Se
     Ok(())
 }
 
+/// Open a Terminal running ssh to the active SFTP host.
+#[tauri::command]
+fn open_ssh_terminal(host: String, port: u16, user: String) -> Result<(), String> {
+    let target = if user.is_empty() { host.clone() } else { format!("{user}@{host}") };
+    let ssh = format!("ssh -p {port} {target}");
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("osascript")
+        .args(["-e", &format!("tell application \"Terminal\" to do script \"{ssh}\""), "-e", "tell application \"Terminal\" to activate"])
+        .spawn();
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("cmd").args(["/C", "start", "", "cmd", "/K", &ssh]).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let r = std::process::Command::new("x-terminal-emulator").args(["-e", &ssh]).spawn();
+    r.map(|_| ()).map_err(|e| e.to_string())
+}
+
+fn dir_size_walk(t: &mut dyn Transport, path: &str) -> Result<u64, Error> {
+    let mut total = 0u64;
+    for e in t.list_dir(path)? {
+        let child = if path.ends_with('/') {
+            format!("{path}{}", e.name)
+        } else {
+            format!("{path}/{}", e.name)
+        };
+        if e.is_dir && !e.is_symlink {
+            total += dir_size_walk(t, &child).unwrap_or(0);
+        } else if !e.is_dir {
+            total += e.size;
+        }
+    }
+    Ok(total)
+}
+
+/// Total size of a remote directory tree (bytes).
+#[tauri::command]
+fn dir_size(session_id: u32, path: String, sessions: State<Sessions>) -> Result<u64, String> {
+    let s = session_of(&sessions, session_id)?;
+    let mut g = s.transport.lock().unwrap();
+    let t = g.as_mut().ok_or("not connected")?;
+    dir_size_walk(t.as_mut(), &path).map_err(|e| e.to_string())
+}
+
 #[derive(Serialize)]
 pub struct FindHit {
     path: String,
@@ -556,6 +598,7 @@ fn parent_local(path: String) -> String {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(Sessions::default())
         .setup(|app| {
             // Keep idle sessions warm so the first op after a lull doesn't stall
@@ -586,6 +629,8 @@ fn main() {
             remote_chmod,
             edit_remote,
             find_remote,
+            dir_size,
+            open_ssh_terminal,
             local_mkdir,
             local_delete,
             local_rename,
