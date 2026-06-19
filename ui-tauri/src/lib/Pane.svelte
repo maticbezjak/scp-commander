@@ -35,9 +35,13 @@
     onRowPointerDown = () => {},
     dropActive = false,
     dropName = null,
+    onView = () => {}, // report the current visible row order (for keyboard nav)
+    focusPathReq = 0, // bump to request focus on the path bar (⌘L)
   } = $props();
 
   let pathInput = $state("");
+  let rowsEl; // scroll container, for scroll-into-view
+  let pathEl; // path bar input, for ⌘L focus
   $effect(() => {
     pathInput = path;
   });
@@ -141,6 +145,25 @@
   let selEntries = $derived(entries.filter((e) => selected.includes(e.name)));
   let selBytes = $derived(selEntries.filter((e) => !e.is_dir).reduce((s, e) => s + e.size, 0));
 
+  // Report the visible order upward so the keyboard handler can navigate it.
+  $effect(() => {
+    onView(display.map((e) => e.name));
+  });
+  // Keep the selected row visible during keyboard navigation.
+  $effect(() => {
+    selected;
+    queueMicrotask(() => rowsEl?.querySelector("tr.sel")?.scrollIntoView({ block: "nearest" }));
+  });
+  // ⌘L: focus the path bar.
+  let lastFocusReq = 0;
+  $effect(() => {
+    if (focusPathReq > lastFocusReq) {
+      lastFocusReq = focusPathReq;
+      pathEl?.focus();
+      pathEl?.select();
+    }
+  });
+
   function setSort(key) {
     if (sortKey === key) ascending = !ascending;
     else { sortKey = key; ascending = true; }
@@ -219,6 +242,7 @@
     {@render typeIcon({ is_dir: true })}
     <input
       class="pathbar"
+      bind:this={pathEl}
       bind:value={pathInput}
       onkeydown={(e) => e.key === "Enter" && onNavigate(pathInput)}
     />
@@ -232,7 +256,7 @@
   </div>
 
   <!-- Listing -->
-  <div class="rows" class:busy>
+  <div class="rows" class:busy bind:this={rowsEl}>
     <table>
       <colgroup>
         <col />

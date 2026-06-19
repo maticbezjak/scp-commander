@@ -139,6 +139,13 @@
   let remoteSel = $state([]);
   let localAnchor = -1;
   let remoteAnchor = -1;
+  let localCursor = -1; // keyboard "current row" index into the visible order
+  let remoteCursor = -1;
+  let localView = []; // visible row names (from Pane, after sort/filter)
+  let remoteView = [];
+  let pathFocusReq = $state(0); // bumped on ⌘L to focus the active pane's path bar
+  let maskSelect = $state(null); // { add } — the select/deselect-by-mask dialog
+  let maskValue = $state("*");
 
   // Per-pane navigation history + recent locations.
   let localNav = $state({ back: [], fwd: [] });
@@ -344,29 +351,74 @@
   }
   const remoteUp = () => loadRemote(joinPath(remote.path, ".."));
 
-  // --- selection (click / cmd-click toggle / shift-range) ---
-  // Mirror Pane's visible ordering so shift-range matches what's on screen.
-  function sortedNames(entries) {
-    return [...entries]
-      .filter((e) => prefs.show_hidden || !e.name.startsWith("."))
-      .sort((a, b) => Number(b.is_dir) - Number(a.is_dir) || a.name.localeCompare(b.name))
-      .map((e) => e.name);
+  // --- selection / cursor helpers (operate on the pane's real visible order) ---
+  const paneView = (isLocal) => (isLocal ? localView : remoteView);
+  function setSel(isLocal, names) {
+    if (isLocal) localSel = names;
+    else remoteSel = names;
+  }
+  function setAnchor(isLocal, i) {
+    if (isLocal) { localAnchor = i; localCursor = i; }
+    else { remoteAnchor = i; remoteCursor = i; }
+  }
+  function curCursor(isLocal) {
+    const c = isLocal ? localCursor : remoteCursor;
+    if (c >= 0) return c;
+    const view = paneView(isLocal);
+    const sel = isLocal ? localSel : remoteSel;
+    return sel.length ? view.indexOf(sel[sel.length - 1]) : -1;
+  }
+  // Move the keyboard cursor to row `target` (clamped); extend the range with Shift.
+  function navTo(isLocal, target, extend) {
+    const view = paneView(isLocal);
+    if (!view.length) return;
+    const idx = Math.max(0, Math.min(view.length - 1, target));
+    if (extend) {
+      const a = isLocal ? localAnchor : remoteAnchor;
+      const base = a < 0 ? idx : a;
+      if (isLocal) localAnchor = base; else remoteAnchor = base;
+      setSel(isLocal, view.slice(Math.min(base, idx), Math.max(base, idx) + 1));
+      if (isLocal) localCursor = idx; else remoteCursor = idx;
+    } else {
+      setSel(isLocal, [view[idx]]);
+      setAnchor(isLocal, idx);
+    }
   }
   function rowClick(isLocal, entry, index, ev) {
-    const names = sortedNames(isLocal ? local.entries : remote.entries);
+    const view = paneView(isLocal);
     let sel = isLocal ? localSel : remoteSel;
     if (ev.metaKey || ev.ctrlKey) {
       sel = sel.includes(entry.name) ? sel.filter((n) => n !== entry.name) : [...sel, entry.name];
-      if (isLocal) localAnchor = index; else remoteAnchor = index;
+      setAnchor(isLocal, index);
     } else if (ev.shiftKey) {
       const anchor = isLocal ? localAnchor : remoteAnchor;
       const [a, b] = anchor < 0 ? [index, index] : [Math.min(anchor, index), Math.max(anchor, index)];
-      sel = names.slice(a, b + 1);
+      sel = view.slice(a, b + 1);
+      if (isLocal) localCursor = index; else remoteCursor = index;
     } else {
       sel = [entry.name];
-      if (isLocal) localAnchor = index; else remoteAnchor = index;
+      setAnchor(isLocal, index);
     }
-    if (isLocal) localSel = sel; else remoteSel = sel;
+    setSel(isLocal, sel);
+  }
+  // Norton-style select/deselect by glob mask (* and ?).
+  function maskToRegex(mask) {
+    const esc = mask.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+    return new RegExp(`^${esc}$`, "i");
+  }
+  function applyMask(value) {
+    const add = maskSelect.add;
+    maskSelect = null;
+    const v = value.trim();
+    if (!v) return;
+    const re = maskToRegex(v);
+    const isLocal = focusLocal;
+    const view = paneView(isLocal);
+    const cur = new Set(isLocal ? localSel : remoteSel);
+    for (const n of view) {
+      if (re.test(n)) { if (add) cur.add(n); else cur.delete(n); }
+    }
+    setSel(isLocal, view.filter((n) => cur.has(n)));
   }
 
   // --- transfers (with overwrite prompt) ---
@@ -605,7 +657,7 @@
   function anyModalOpen() {
     return (
       renameTarget || newFolder || deleteTarget || propsTarget || overwrite ||
-      dupTarget || viewer || showLogin || showSync || showConsole ||
+      dupTarget || viewer || maskSelect || showLogin || showSync || showConsole ||
       showKnownHosts || showPrefs
     );
   }
@@ -614,11 +666,49 @@
     if (["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement?.tagName)) return;
     const isLocal = focusLocal;
     const remoteOk = isLocal || connected;
+    // ⌘/Ctrl shortcuts: select-all, invert, focus path bar.
+    if ((ev.metaKey || ev.ctrlKey) && !ev.altKey) {
+      const k = ev.key.toLowerCase();
+      if (k === "a") {
+        ev.preventDefault();
+        const v = paneView(isLocal);
+        setSel(isLocal, [...v]);
+        if (v.length) { if (isLocal) { localAnchor = 0; localCursor = v.length - 1; } else { remoteAnchor = 0; remoteCursor = v.length - 1; } }
+        return;
+      }
+      if (k === "i") {
+        ev.preventDefault();
+        const v = paneView(isLocal);
+        const cur = new Set(isLocal ? localSel : remoteSel);
+        setSel(isLocal, v.filter((n) => !cur.has(n)));
+        return;
+      }
+      if (k === "l") { ev.preventDefault(); pathFocusReq++; return; }
+    }
     switch (ev.key) {
       case "Tab":
         ev.preventDefault();
         focusLocal = !focusLocal;
         return;
+      case "ArrowDown": { ev.preventDefault(); const c = curCursor(isLocal); navTo(isLocal, c < 0 ? 0 : c + 1, ev.shiftKey); return; }
+      case "ArrowUp": { ev.preventDefault(); const c = curCursor(isLocal); navTo(isLocal, c < 0 ? 0 : c - 1, ev.shiftKey); return; }
+      case "Home": ev.preventDefault(); navTo(isLocal, 0, ev.shiftKey); return;
+      case "End": ev.preventDefault(); navTo(isLocal, paneView(isLocal).length - 1, ev.shiftKey); return;
+      case "PageDown": { ev.preventDefault(); const c = curCursor(isLocal); navTo(isLocal, (c < 0 ? 0 : c) + 14, ev.shiftKey); return; }
+      case "PageUp": { ev.preventDefault(); const c = curCursor(isLocal); navTo(isLocal, (c < 0 ? 0 : c) - 14, ev.shiftKey); return; }
+      case " ": {
+        ev.preventDefault();
+        const v = paneView(isLocal);
+        const c = curCursor(isLocal);
+        if (c >= 0 && v[c]) {
+          const sel = isLocal ? localSel : remoteSel;
+          const n = v[c];
+          setSel(isLocal, sel.includes(n) ? sel.filter((x) => x !== n) : [...sel, n]);
+        }
+        return;
+      }
+      case "+": ev.preventDefault(); maskSelect = { add: true }; return;
+      case "-": ev.preventDefault(); maskSelect = { add: false }; return;
       case "F5":
         if (connected) { ev.preventDefault(); transferSelected(isLocal); }
         return;
@@ -664,12 +754,9 @@
       const now = Date.now();
       typeAhead = now - typeAheadAt < 1000 ? typeAhead + ev.key.toLowerCase() : ev.key.toLowerCase();
       typeAheadAt = now;
-      const names = sortedNames(isLocal ? local.entries : remote.entries);
-      const hit = names.find((n) => n.toLowerCase().startsWith(typeAhead));
-      if (hit) {
-        if (isLocal) localSel = [hit];
-        else remoteSel = [hit];
-      }
+      const view = paneView(isLocal);
+      const idx = view.findIndex((n) => n.toLowerCase().startsWith(typeAhead));
+      if (idx >= 0) { setSel(isLocal, [view[idx]]); setAnchor(isLocal, idx); }
     }
   }
 
@@ -927,6 +1014,8 @@
     onRowPointerDown={(e, ev) => onRowPointerDown(true, e, ev)}
     dropActive={dropTarget?.kind === "local"}
     dropName={dropTarget?.kind === "local" ? dropTarget.name : null}
+    onView={(names) => (localView = names)}
+    focusPathReq={focusLocal ? pathFocusReq : 0}
   />
   {#if connected}
     <Pane
@@ -963,6 +1052,8 @@
       onRowPointerDown={(e, ev) => onRowPointerDown(false, e, ev)}
       dropActive={dropTarget?.kind === "remote"}
       dropName={dropTarget?.kind === "remote" ? dropTarget.name : null}
+      onView={(names) => (remoteView = names)}
+      focusPathReq={!focusLocal ? pathFocusReq : 0}
     />
   {:else}
     <div class="placeholder">
@@ -1107,6 +1198,19 @@
   <Modal title={viewer.name} onClose={() => (viewer = null)}>
     <pre class="viewer">{viewer.text}</pre>
     <div class="dlg-actions"><button onclick={() => (viewer = null)}>Close</button></div>
+  </Modal>
+{/if}
+
+{#if maskSelect}
+  <Modal title={maskSelect.add ? "Select by mask" : "Deselect by mask"} onClose={() => (maskSelect = null)}>
+    <form onsubmit={(e) => (e.preventDefault(), applyMask(maskValue))}>
+      <input class="dlg-input" placeholder="*.log" bind:value={maskValue} autofocus />
+      <p class="hint">Glob mask — <code>*</code> and <code>?</code> wildcards, case-insensitive.</p>
+      <div class="dlg-actions">
+        <button type="button" onclick={() => (maskSelect = null)}>Cancel</button>
+        <button type="submit">{maskSelect.add ? "Select" : "Deselect"}</button>
+      </div>
+    </form>
   </Modal>
 {/if}
 
