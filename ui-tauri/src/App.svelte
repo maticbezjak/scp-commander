@@ -194,7 +194,7 @@
     flashTimers[k] = setTimeout(() => {
       if (isLocal) localFlash = null;
       else remoteFlash = null;
-    }, 1800);
+    }, 2400);
   }
   const xferPct = $derived.by(() => {
     const done = activeXfers.reduce((s, t) => s + t.done, 0);
@@ -416,13 +416,15 @@
         break;
       case "done": {
         if (t) { t.state = "done"; t.done = t.total || t.done; }
-        // Refresh the affected pane: remote only for the active session; local
-        // is shared so always refresh on a download. Flash the arrived file.
+        // Refresh the affected pane, then flash the arrived file (flash AFTER
+        // the listing lands so the highlight lines up with the new row, and
+        // the pane scrolls it into view). Remote refresh only for the active
+        // session; local is shared so always refresh on a download.
         if (p.upload) {
-          if (p.session === activeId) { loadRemote(remote.path, false); flashArrived(false, p.name); }
+          if (p.session === activeId)
+            loadRemote(remote.path, false).then(() => flashArrived(false, p.name));
         } else {
-          loadLocal(local.path, false);
-          flashArrived(true, p.name);
+          loadLocal(local.path, false).then(() => flashArrived(true, p.name));
         }
         // Move: delete the source now that the copy landed.
         const mk = `${p.session}:${p.id}`;

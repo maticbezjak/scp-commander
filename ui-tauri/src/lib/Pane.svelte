@@ -173,6 +173,12 @@
     selected;
     queueMicrotask(() => rowsEl?.querySelector("tr.sel")?.scrollIntoView({ block: "nearest" }));
   });
+  // Scroll a just-arrived (flashing) file into view so it's visible even in a
+  // long listing — makes "the file landed here" obvious after a transfer.
+  $effect(() => {
+    if (!flashName) return;
+    queueMicrotask(() => rowsEl?.querySelector("tr.flash")?.scrollIntoView({ block: "nearest" }));
+  });
   // ⌘L: focus the path bar.
   let lastFocusReq = 0;
   $effect(() => {
@@ -398,10 +404,11 @@
      completed transfer is visibly "landed" in this pane. */
   tbody tr.flash,
   tbody tr.flash:hover {
-    animation: arrived 1.7s ease-out;
+    animation: arrived 2.2s ease-out;
   }
   @keyframes arrived {
-    0% {
+    0%,
+    30% {
       background: color-mix(in srgb, var(--ok) 60%, transparent);
     }
     100% {
