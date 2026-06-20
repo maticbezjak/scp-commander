@@ -368,20 +368,33 @@
     return () => un.then((f) => f());
   });
   async function uploadExternal(paths) {
+    const sess = activeId;
     for (const p of paths) {
       const name = p.replace(/[/\\]+$/, "").split(/[/\\]/).pop();
       if (!name) continue;
       let isDir = false;
       try { isDir = await invoke("local_is_dir", { path: p }); } catch {}
+      const remotePath = joinPath(remote.path, name);
       invoke("enqueue", {
-        sessionId: activeId,
+        sessionId: sess,
         upload: true,
         isDir,
         name,
         local: p,
-        remote: joinPath(remote.path, name),
+        remote: remotePath,
         overwrite: 0,
-      });
+      })
+        .then((id) => {
+          if (!queue.find((t) => t.id === id && t.session === sess)) {
+            queue.push({
+              id, session: sess, name, upload: true,
+              done: 0, total: 0, state: "active",
+              local: p, remote: remotePath, is_dir: isDir, overwrite: 0,
+              speed: 0, eta: null, lastAt: null, lastDone: 0,
+            });
+          }
+        })
+        .catch((err) => (status = `Could not start upload of ${name}: ${err}`));
     }
     status = `Uploading ${paths.length} dropped item(s)…`;
   }
@@ -567,8 +580,9 @@
     const remoteBase = upload ? destDir ?? remote.path : remote.path;
     const localPath = joinPath(localBase, e.name, "/");
     const remotePath = joinPath(remoteBase, e.name);
+    const sess = activeId;
     const p = invoke("enqueue", {
-      sessionId: activeId,
+      sessionId: sess,
       upload,
       isDir: e.is_dir,
       name: e.name,
@@ -576,16 +590,30 @@
       remote: remotePath,
       overwrite: policy,
     });
-    if (move) {
-      const sess = activeId;
-      p.then((id) =>
+    p.then((id) => {
+      // Show the item in the queue the moment it's accepted — don't wait for the
+      // worker's first "started" event — so a drop gives instant feedback. The
+      // backend events reconcile this same row by id (started only pushes if
+      // absent; progress/done update it in place).
+      if (!queue.find((t) => t.id === id && t.session === sess)) {
+        queue.push({
+          id, session: sess, name: e.name, upload,
+          done: 0, total: e.is_dir ? 0 : e.size || 0, state: "active",
+          local: localPath, remote: remotePath, is_dir: e.is_dir, overwrite: policy,
+          speed: 0, eta: null, lastAt: null, lastDone: 0,
+        });
+      }
+      if (move) {
         pendingMove.set(`${sess}:${id}`, {
           isLocal: upload, // source side: upload=local→remote, so source is local
           path: upload ? localPath : remotePath,
           is_dir: e.is_dir,
-        }),
-      );
-    }
+        });
+      }
+    }).catch((err) => {
+      // Surface a silent enqueue failure instead of swallowing it.
+      status = `Could not start ${upload ? "upload" : "download"} of ${e.name}: ${err}`;
+    });
     return p;
   }
   function transfer(entries, upload, move = false, destDir = null) {
@@ -608,6 +636,7 @@
       }
     }
     for (const e of entries) enqueueEntry(e, upload, 0, move, destDir);
+    status = `${upload ? "Uploading" : "Downloading"} ${entries.length} item${entries.length === 1 ? "" : "s"}…`;
   }
 
   // Compare the two panes: select entries that are missing on the other side
