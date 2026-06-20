@@ -49,6 +49,9 @@ body {
 #app {
   display: flex;
   flex-direction: column;
+  /* The panes flex-shrink to make room for the transfer panel + status bar;
+     clip anything that would otherwise spill past the bottom of the window. */
+  overflow: hidden;
 }
 
 input,

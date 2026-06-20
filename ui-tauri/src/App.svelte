@@ -181,6 +181,21 @@
 
   let queue = $state([]);
   const activeXfers = $derived(queue.filter((t) => t.state === "active"));
+  // Name of a just-completed file to briefly highlight in its destination pane,
+  // so a finished transfer is visibly "landed" there (cleared after the glow).
+  let localFlash = $state(null);
+  let remoteFlash = $state(null);
+  const flashTimers = {};
+  function flashArrived(isLocal, name) {
+    if (isLocal) localFlash = name;
+    else remoteFlash = name;
+    const k = isLocal ? "l" : "r";
+    clearTimeout(flashTimers[k]);
+    flashTimers[k] = setTimeout(() => {
+      if (isLocal) localFlash = null;
+      else remoteFlash = null;
+    }, 1800);
+  }
   const xferPct = $derived.by(() => {
     const done = activeXfers.reduce((s, t) => s + t.done, 0);
     const total = activeXfers.reduce((s, t) => s + t.total, 0);
@@ -389,9 +404,13 @@
       case "done": {
         if (t) { t.state = "done"; t.done = t.total || t.done; }
         // Refresh the affected pane: remote only for the active session; local
-        // is shared so always refresh on a download.
-        if (p.upload) { if (p.session === activeId) loadRemote(remote.path, false); }
-        else loadLocal(local.path, false);
+        // is shared so always refresh on a download. Flash the arrived file.
+        if (p.upload) {
+          if (p.session === activeId) { loadRemote(remote.path, false); flashArrived(false, p.name); }
+        } else {
+          loadLocal(local.path, false);
+          flashArrived(true, p.name);
+        }
         // Move: delete the source now that the copy landed.
         const mk = `${p.session}:${p.id}`;
         if (pendingMove.has(mk)) {
@@ -1254,6 +1273,7 @@
     onRowPointerDown={(e, ev) => onRowPointerDown(true, e, ev)}
     dropActive={dropTarget?.kind === "local"}
     dropName={dropTarget?.kind === "local" ? dropTarget.name : null}
+    flashName={localFlash}
     onView={(names) => (localView = names)}
     focusPathReq={focusLocal ? pathFocusReq : 0}
     onContextEmpty={(ev) => openContextEmpty(true, ev)}
@@ -1293,6 +1313,7 @@
       onRowPointerDown={(e, ev) => onRowPointerDown(false, e, ev)}
       dropActive={dropTarget?.kind === "remote"}
       dropName={dropTarget?.kind === "remote" ? dropTarget.name : null}
+      flashName={remoteFlash}
       onView={(names) => (remoteView = names)}
       focusPathReq={!focusLocal ? pathFocusReq : 0}
       onContextEmpty={(ev) => openContextEmpty(false, ev)}
@@ -1307,6 +1328,8 @@
   {/if}
 </div>
 
+<TransferQueue {queue} onCancel={cancelTransfer} onClear={clearFinished} onRetry={retryTransfer} onRemove={removeTransfer} />
+
 <div class="statusbar">
   <span class="dot" class:on={connected}></span>
   <span class="stxt">{status}</span>
@@ -1317,8 +1340,6 @@
     </span>
   {/if}
 </div>
-
-<TransferQueue {queue} onCancel={cancelTransfer} onClear={clearFinished} onRetry={retryTransfer} onRemove={removeTransfer} />
 
 {#if ctx}
   <ContextMenu x={ctx.x} y={ctx.y} items={ctx.items} onClose={() => (ctx = null)} />

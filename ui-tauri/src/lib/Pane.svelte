@@ -35,6 +35,8 @@
     onRowPointerDown = () => {},
     dropActive = false,
     dropName = null,
+    flashName = null, // name of a just-arrived file to briefly highlight
+
     onView = () => {}, // report the current visible row order (for keyboard nav)
     focusPathReq = 0, // bump to request focus on the path bar (⌘L)
     onContextEmpty = () => {}, // right-click on empty pane area
@@ -327,6 +329,7 @@
           <tr
             class:sel={selected.includes(e.name)}
             class:drop-row={dropName === e.name}
+            class:flash={flashName === e.name}
             data-name={e.name}
             onpointerdown={(ev) => onRowPointerDown(e, ev)}
             onclick={(ev) => onRowClick(e, i, ev)}
@@ -390,6 +393,20 @@
     background: color-mix(in srgb, var(--accent) 35%, transparent);
     outline: 1px solid var(--accent);
     outline-offset: -1px;
+  }
+  /* A file that just finished transferring glows green, then fades — so a
+     completed transfer is visibly "landed" in this pane. */
+  tbody tr.flash,
+  tbody tr.flash:hover {
+    animation: arrived 1.7s ease-out;
+  }
+  @keyframes arrived {
+    0% {
+      background: color-mix(in srgb, var(--ok) 60%, transparent);
+    }
+    100% {
+      background: transparent;
+    }
   }
 
   .ptool {

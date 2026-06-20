@@ -16,14 +16,19 @@
     return t.total > 0 ? Math.min(100, Math.round((t.done / t.total) * 100)) : 0;
   }
   function label(t) {
-    const arrow = t.upload ? "↑" : "↓";
-    if (t.state === "done") return "done";
+    if (t.state === "done") return `done · ${humanSize(t.total || t.done)}`;
     if (t.state === "failed") return `failed: ${t.error ?? ""}`;
     if (t.state === "cancelled") return "cancelled";
     const size = `${humanSize(t.done)}${t.total ? " / " + humanSize(t.total) : ""}`;
     const rate = t.speed ? ` · ${humanRate(t.speed)}` : "";
     const eta = t.eta ? ` · ${fmtEta(t.eta)} left` : "";
-    return `${arrow} ${size}${rate}${eta}`;
+    return `${size}${rate}${eta}`;
+  }
+  function glyph(t) {
+    if (t.state === "done") return "✓";
+    if (t.state === "failed") return "✕";
+    if (t.state === "cancelled") return "⊘";
+    return t.upload ? "↑" : "↓";
   }
 </script>
 
@@ -44,8 +49,10 @@
     <div class="qrows">
       {#each queue as t (t.id)}
         <div class="qrow {t.state}">
+          <span class="qg" title={t.upload ? "upload" : "download"}>{glyph(t)}</span>
           <span class="qname" title={t.name}>{t.name}</span>
           <progress max="100" value={pctOf(t)}></progress>
+          <span class="qpct">{pctOf(t)}%</span>
           <span class="qstat">{label(t)}</span>
           <span class="qacts">
             {#if t.state === "active"}
@@ -94,11 +101,23 @@
   }
   .qrow {
     display: grid;
-    grid-template-columns: 1fr 160px auto auto;
+    grid-template-columns: 16px 1fr 150px 40px auto auto;
     gap: 8px;
     align-items: center;
     font-size: 12px;
-    padding: 2px 0;
+    padding: 3px 0;
+  }
+  .qg {
+    text-align: center;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .qrow.done .qg {
+    color: var(--ok);
+  }
+  .qrow.failed .qg,
+  .qrow.cancelled .qg {
+    color: var(--danger);
   }
   .qacts {
     display: inline-flex;
@@ -109,13 +128,44 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .qpct {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.8;
+  }
   .qstat {
     opacity: 0.75;
     text-align: right;
     min-width: 120px;
+    white-space: nowrap;
   }
   .qrow.failed .qstat {
-    color: tomato;
+    color: var(--danger);
+    opacity: 1;
+  }
+  /* Themed progress bars: accent while active, green when done, red on fail. */
+  progress {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 8px;
+    border: none;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  progress::-webkit-progress-bar {
+    background: var(--panel-2);
+    border-radius: 4px;
+  }
+  progress::-webkit-progress-value {
+    background: var(--accent);
+    border-radius: 4px;
+  }
+  .qrow.done progress::-webkit-progress-value {
+    background: var(--ok);
+  }
+  .qrow.failed progress::-webkit-progress-value,
+  .qrow.cancelled progress::-webkit-progress-value {
+    background: var(--danger);
   }
   .qcancel {
     font-size: 11px;
