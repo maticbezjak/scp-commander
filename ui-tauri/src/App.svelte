@@ -719,7 +719,11 @@
     else loadRemote(remote.path);
   }
   function openContext(isLocal, entry, index, ev) {
-    rowClick(isLocal, entry, index, ev); // select the row under the cursor
+    // Right-clicking a row that's already part of a multi-selection keeps the
+    // whole selection (so Delete/Upload/etc. act on all of it); right-clicking
+    // any other row selects just that row.
+    const cur = isLocal ? localSel : remoteSel;
+    if (!cur.includes(entry.name)) rowClick(isLocal, entry, index, ev);
     const sel = isLocal ? localSel : remoteSel;
     const entries = (isLocal ? local.entries : remote.entries).filter((e) =>
       sel.includes(e.name),
