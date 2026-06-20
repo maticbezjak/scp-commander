@@ -366,6 +366,17 @@
     border-radius: 8px;
     overflow: hidden;
     background: var(--panel);
+    /* The file list is a click/drag surface, not a text document. Suppress
+       native text-selection (prefixed — the macOS WKWebView needs -webkit-),
+       otherwise a pointer-drag paints a stray selection across rows and the
+       release reads as a same-pane drop instead of a real drag. */
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  /* …but the filter and path fields are real inputs the user edits. */
+  .pane :is(input, textarea) {
+    -webkit-user-select: text;
+    user-select: text;
   }
   .pane.focused {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--border));

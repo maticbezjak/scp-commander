@@ -1034,6 +1034,14 @@
   let dragGhost = $state(null); // { x, y, label } while dragging
   let dropTarget = $state(null); // { kind, name } highlight while hovering a valid target
   let dragState = null; // { fromLocal, entries, startX, startY, active }
+  // Native-feeling cursor while dragging: "grabbing" everywhere, "copy" (the
+  // green +) when hovering a valid drop target. Toggled on <body> so it wins
+  // over per-element cursors during the gesture.
+  $effect(() => {
+    const active = !!dragGhost;
+    document.body.classList.toggle("dragging", active);
+    document.body.classList.toggle("drop-ok", active && !!dropTarget);
+  });
   function onRowPointerDown(isLocal, entry, ev) {
     if (ev.button !== 0) return;
     const sel = isLocal ? localSel : remoteSel;
@@ -1066,6 +1074,9 @@
       const dy = ev.clientY - dragState.startY;
       if (dx * dx + dy * dy < 36) return; // 6px threshold before a drag begins
       dragState.active = true;
+      // Drop any text-selection that may have formed before the drag engaged,
+      // so the drag gesture stays clean and the drop hit-test is unambiguous.
+      try { window.getSelection()?.removeAllRanges(); } catch {}
     }
     const n = dragState.entries.length;
     dragGhost = { x: ev.clientX, y: ev.clientY, label: n > 1 ? `${n} items` : dragState.entries[0].name };
@@ -2123,6 +2134,17 @@
   }
   .ow-m.hit {
     color: var(--ok);
+  }
+  /* Cursor feedback during a pointer-drag (classes toggled on <body>). */
+  :global(body.dragging),
+  :global(body.dragging *) {
+    cursor: grabbing !important;
+    -webkit-user-select: none !important;
+    user-select: none !important;
+  }
+  :global(body.drop-ok),
+  :global(body.drop-ok *) {
+    cursor: copy !important;
   }
   .drag-ghost {
     position: fixed;
