@@ -36,6 +36,7 @@
     dropActive = false,
     dropName = null,
     flashName = null, // name of a just-arrived file to briefly highlight
+    pending = [], // files mid-transfer into this dir: dimmed placeholder rows
 
     onView = () => {}, // report the current visible row order (for keyboard nav)
     focusPathReq = 0, // bump to request focus on the path bar (⌘L)
@@ -331,6 +332,17 @@
           <td class="name"><span class="updots">..</span></td>
           {#each cols as c}<td></td>{/each}
         </tr>
+        {#each pending as p (p.name)}
+          <tr class="pending" title="{p.upload ? 'Uploading' : 'Downloading'} — in progress">
+            <td class="name">{@render typeIcon(p)}<span class="nm">{p.name}</span></td>
+            <td class="ghost-cell" colspan={cols.length}>
+              <span class="ghost-bar">
+                <span class="ghost-fill" style="width:{p.total ? Math.min(100, Math.round((100 * p.done) / p.total)) : 0}%"></span>
+              </span>
+              <span class="ghost-pct">{p.upload ? "↑" : "↓"} {p.total ? Math.min(100, Math.round((100 * p.done) / p.total)) : 0}%</span>
+            </td>
+          </tr>
+        {/each}
         {#each display as e, i (e.name)}
           <tr
             class:sel={selected.includes(e.name)}
@@ -348,7 +360,7 @@
             {/each}
           </tr>
         {/each}
-        {#if !display.length}
+        {#if !display.length && !pending.length}
           <tr class="empty-row"><td class="empty-cell" colspan={cols.length + 1}>{filterText ? "No matching items" : "Empty folder"}</td></tr>
         {/if}
       </tbody>
@@ -399,6 +411,40 @@
     background: color-mix(in srgb, var(--accent) 35%, transparent);
     outline: 1px solid var(--accent);
     outline-offset: -1px;
+  }
+  /* A file mid-transfer shows as a dimmed placeholder with a live mini
+     progress bar, until the real listing replaces it on completion. */
+  tbody tr.pending td {
+    opacity: 0.6;
+    font-style: italic;
+    color: var(--text-2);
+  }
+  tbody tr.pending {
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+  }
+  .ghost-cell {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-style: normal;
+  }
+  .ghost-bar {
+    flex: 0 0 90px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--panel-2);
+    overflow: hidden;
+  }
+  .ghost-fill {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    border-radius: 3px;
+    transition: width 0.2s linear;
+  }
+  .ghost-pct {
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
   }
   /* A file that just finished transferring glows green, then fades — so a
      completed transfer is visibly "landed" in this pane. */

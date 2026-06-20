@@ -196,6 +196,34 @@
       else remoteFlash = null;
     }, 2400);
   }
+
+  // In-progress placeholders: a file being transferred shows up in its
+  // destination pane right away as a dimmed "ghost" row (with live progress),
+  // until the real listing refresh replaces it on completion. Only shown when
+  // the pane is actually displaying the transfer's destination directory.
+  function parentOf(p) {
+    const s = String(p).replace(/[/\\]+$/, "");
+    const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+    return i <= 0 ? "/" : s.slice(0, i);
+  }
+  const stripTrail = (p) => String(p).replace(/[/\\]+$/, "") || "/";
+  function pendingFor(upload) {
+    const here = stripTrail(upload ? remote.path : local.path);
+    const dest = upload ? remote : local;
+    const have = new Set((dest.entries ?? []).map((e) => e.name));
+    return queue
+      .filter(
+        (t) =>
+          t.state === "active" &&
+          t.upload === upload &&
+          (upload ? t.session === activeId : true) &&
+          stripTrail(parentOf(upload ? t.remote : t.local)) === here &&
+          !have.has(t.name),
+      )
+      .map((t) => ({ name: t.name, is_dir: t.is_dir, upload, done: t.done, total: t.total, pending: true }));
+  }
+  const remotePending = $derived(connected ? pendingFor(true) : []);
+  const localPending = $derived(pendingFor(false));
   const xferPct = $derived.by(() => {
     const done = activeXfers.reduce((s, t) => s + t.done, 0);
     const total = activeXfers.reduce((s, t) => s + t.total, 0);
@@ -1305,6 +1333,7 @@
     dropActive={dropTarget?.kind === "local"}
     dropName={dropTarget?.kind === "local" ? dropTarget.name : null}
     flashName={localFlash}
+    pending={localPending}
     onView={(names) => (localView = names)}
     focusPathReq={focusLocal ? pathFocusReq : 0}
     onContextEmpty={(ev) => openContextEmpty(true, ev)}
@@ -1345,6 +1374,7 @@
       dropActive={dropTarget?.kind === "remote"}
       dropName={dropTarget?.kind === "remote" ? dropTarget.name : null}
       flashName={remoteFlash}
+      pending={remotePending}
       onView={(names) => (remoteView = names)}
       focusPathReq={!focusLocal ? pathFocusReq : 0}
       onContextEmpty={(ev) => openContextEmpty(false, ev)}
