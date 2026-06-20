@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core event/window/webview APIs for the main and transfers windows. Custom (#[tauri::command]) commands are allowed without a capability, but the built-in event API is not: without core:event:default the frontend's listen()/emit() silently receive nothing, so transfer progress/completion, the OS file-drop event, edit auto-upload, and the separate transfers window never update.",
+  "windows": ["main", "transfers"],
+  "permissions": [
+    "core:event:default",
+    "core:window:default",
+    "core:webview:default",
+    "core:app:default"
+  ]
+}
