@@ -429,7 +429,7 @@
     font-style: normal;
   }
   .ghost-bar {
-    flex: 0 0 90px;
+    flex: 0 0 56px;
     height: 6px;
     border-radius: 3px;
     background: var(--panel-2);
@@ -440,7 +440,8 @@
     height: 100%;
     background: var(--accent);
     border-radius: 3px;
-    transition: width 0.2s linear;
+    /* No width transition: track the real progress exactly so the fill
+       reaches the end at completion instead of lagging behind. */
   }
   .ghost-pct {
     font-variant-numeric: tabular-nums;

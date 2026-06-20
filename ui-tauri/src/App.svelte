@@ -214,7 +214,9 @@
     return queue
       .filter(
         (t) =>
-          t.state === "active" &&
+          // "done" is kept until the listing refresh adds the real row, so the
+          // bar finishes at 100% rather than vanishing mid-fill.
+          (t.state === "active" || t.state === "done") &&
           t.upload === upload &&
           (upload ? t.session === activeId : true) &&
           stripTrail(parentOf(upload ? t.remote : t.local)) === here &&
