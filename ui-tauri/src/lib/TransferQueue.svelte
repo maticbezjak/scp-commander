@@ -1,9 +1,10 @@
 <script>
   import { humanSize, humanRate, fmtEta } from "./api.js";
 
-  let { queue = [], onCancel, onClear, onRetry, onRemove } = $props();
+  let { queue = [], onCancel, onClear, onRetry, onRetryAll, onRemove } = $props();
 
   let active = $derived(queue.filter((t) => t.state === "active"));
+  let failed = $derived(queue.filter((t) => t.state === "failed"));
   let agg = $derived.by(() => {
     const done = active.reduce((s, t) => s + t.done, 0);
     const total = active.reduce((s, t) => s + t.total, 0);
@@ -41,6 +42,12 @@
           {agg.count} active · {humanSize(agg.done)} / {humanSize(agg.total)} · {agg.pct}%{#if agg.rate} · {humanRate(agg.rate)}{/if}
         </span>
         <progress class="aggbar" max="100" value={agg.pct}></progress>
+      {/if}
+      <span class="qspace"></span>
+      {#if failed.length}
+        <button class="retry-all" onclick={onRetryAll} title="Resume all failed transfers">
+          ↻ Retry all ({failed.length})
+        </button>
       {/if}
       <button class="clear" onclick={onClear} disabled={!queue.some((t) => t.state !== "active")}>
         Clear finished
@@ -91,8 +98,14 @@
   .aggbar {
     width: 160px;
   }
+  .qspace {
+    flex: 1;
+  }
+  .retry-all {
+    font-size: 12px;
+    color: var(--accent);
+  }
   .clear {
-    margin-left: auto;
     font-size: 12px;
   }
   .qrows {

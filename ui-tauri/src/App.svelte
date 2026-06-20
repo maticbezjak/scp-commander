@@ -179,8 +179,40 @@
   let remoteHome = $state("/");
   let showLogin = $state(true);
 
-  let queue = $state([]);
+  // The transfer queue survives app restarts: incomplete transfers (active or
+  // failed when the app closed) come back as "failed" so they can be resumed
+  // with Retry once you're reconnected to the same site.
+  function loadPersistedQueue() {
+    try {
+      const saved = JSON.parse(localStorage.getItem("xfer-queue") || "[]");
+      return saved
+        .filter((t) => t.state === "active" || t.state === "failed")
+        .map((t) => ({
+          ...t,
+          state: "failed",
+          error: t.state === "active" ? "interrupted (app closed)" : t.error,
+          done: 0, total: t.total || 0, speed: 0, eta: null, lastAt: null, lastDone: 0,
+        }));
+    } catch {
+      return [];
+    }
+  }
+  let queue = $state(loadPersistedQueue());
   const activeXfers = $derived(queue.filter((t) => t.state === "active"));
+  // Persist a slim snapshot (no live progress, so it only writes on add/remove
+  // /state-change, not on every progress tick).
+  const queueSig = $derived(
+    JSON.stringify(
+      queue.map((t) => ({
+        id: t.id, session: t.session, name: t.name, upload: t.upload,
+        local: t.local, remote: t.remote, is_dir: t.is_dir,
+        total: t.total, overwrite: t.overwrite, state: t.state, error: t.error,
+      })),
+    ),
+  );
+  $effect(() => {
+    try { localStorage.setItem("xfer-queue", queueSig); } catch {}
+  });
   // Name of a just-completed file to briefly highlight in its destination pane,
   // so a finished transfer is visibly "landed" there (cleared after the glow).
   let localFlash = $state(null);
@@ -867,8 +899,11 @@
     queue = queue.filter((x) => !(x.session === item.session && x.id === item.id));
   }
   function retryTransfer(item) {
+    // Resume against the current session if the original is gone (e.g. after a
+    // reconnect), so a retry still works once you're back on the same site.
+    const sess = tabs.some((t) => t.id === item.session) ? item.session : activeId ?? item.session;
     invoke("enqueue", {
-      sessionId: item.session,
+      sessionId: sess,
       upload: item.upload,
       isDir: item.is_dir,
       name: item.name,
@@ -878,6 +913,9 @@
       resume: true, // continue the partial we already started
     }).catch((e) => (status = `Retry failed: ${e}`));
     removeTransfer(item);
+  }
+  function retryAllFailed() {
+    for (const t of queue.filter((x) => x.state === "failed")) retryTransfer(t);
   }
 
   let focusLocal = $state(true);
@@ -1397,7 +1435,7 @@
   {/if}
 </div>
 
-<TransferQueue {queue} onCancel={cancelTransfer} onClear={clearFinished} onRetry={retryTransfer} onRemove={removeTransfer} />
+<TransferQueue {queue} onCancel={cancelTransfer} onClear={clearFinished} onRetry={retryTransfer} onRetryAll={retryAllFailed} onRemove={removeTransfer} />
 
 <div class="statusbar">
   <span class="dot" class:on={connected}></span>

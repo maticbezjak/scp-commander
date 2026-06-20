@@ -71,7 +71,7 @@
   }
 
   // Resizable column widths, persisted per pane in localStorage.
-  const DEFAULTS = { size: 64, type: 92, changed: 118, owner: 48, group: 48, rights: 88 };
+  const DEFAULTS = { size: 84, type: 96, changed: 148, owner: 56, group: 56, rights: 92 };
   function loadWidths() {
     try {
       return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(`colw.${kind}`) || "{}") };
