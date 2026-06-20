@@ -335,11 +335,13 @@
         {#each pending as p (p.name)}
           <tr class="pending" title="{p.upload ? 'Uploading' : 'Downloading'} — in progress">
             <td class="name">{@render typeIcon(p)}<span class="nm">{p.name}</span></td>
-            <td class="ghost-cell" colspan={cols.length}>
-              <span class="ghost-bar">
-                <span class="ghost-fill" style="width:{p.total ? Math.min(100, Math.round((100 * p.done) / p.total)) : 0}%"></span>
-              </span>
-              <span class="ghost-pct">{p.upload ? "↑" : "↓"} {p.total ? Math.min(100, Math.round((100 * p.done) / p.total)) : 0}%</span>
+            <td colspan={cols.length}>
+              <div class="ghost-cell">
+                <span class="ghost-bar">
+                  <span class="ghost-fill" style="width:{p.total ? Math.min(100, Math.round((100 * p.done) / p.total)) : 0}%"></span>
+                </span>
+                <span class="ghost-pct">{p.upload ? "↑" : "↓"} {p.total ? Math.min(100, Math.round((100 * p.done) / p.total)) : 0}%</span>
+              </div>
             </td>
           </tr>
         {/each}
