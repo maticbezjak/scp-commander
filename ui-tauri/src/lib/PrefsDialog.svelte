@@ -1,7 +1,7 @@
 <script>
   import Modal from "./Modal.svelte";
 
-  let { prefs, onSave, onClose } = $props();
+  let { prefs, theme = "system", onTheme = () => {}, onSave, onClose } = $props();
 
   // Edit a local copy; commit on Save.
   let p = $state({ ...prefs });
@@ -13,6 +13,14 @@
 
 <Modal title="Preferences" {onClose}>
   <div class="prefs">
+    <label class="num">
+      Theme
+      <select value={theme} onchange={(e) => onTheme(e.target.value)}>
+        <option value="system">System</option>
+        <option value="light">Light (WinSCP-style)</option>
+        <option value="dark">Dark</option>
+      </select>
+    </label>
     <label><input type="checkbox" bind:checked={p.show_hidden} /> Show hidden files (dotfiles)</label>
     <label><input type="checkbox" bind:checked={p.show_owner_group} /> Show Owner/Group columns (remote)</label>
     <label><input type="checkbox" bind:checked={p.confirm_delete} /> Confirm before deleting</label>

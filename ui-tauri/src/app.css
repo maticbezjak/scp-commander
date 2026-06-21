@@ -3,29 +3,32 @@
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   font-size: 13px;
 
-  /* Surfaces */
-  --bg: light-dark(#f3f4f6, #15181e);
+  /* Surfaces — light values tuned to resemble WinSCP (light-grey chrome,
+     white file panes); dark values unchanged. */
+  --bg: light-dark(#eef0f3, #15181e);
   --panel: light-dark(#ffffff, #1b1f27);
-  --panel-2: light-dark(#f6f7f9, #20252e);
-  --header: light-dark(#eceef1, #232932);
+  --panel-2: light-dark(#f4f6f8, #20252e);
+  --header: light-dark(#e7eaee, #232932);
 
   /* Lines */
-  --border: light-dark(#d7dae0, #333a45);
-  --border-strong: light-dark(#bcc0c9, #475061);
+  --border: light-dark(#d2d6dd, #333a45);
+  --border-strong: light-dark(#b4b9c2, #475061);
 
   /* Text */
-  --text: light-dark(#1c2026, #e6e9ef);
-  --text-2: light-dark(#5c6270, #99a1ae);
-  --text-3: light-dark(#8b909b, #707784);
+  --text: light-dark(#1a1c21, #e6e9ef);
+  --text-2: light-dark(#565b65, #99a1ae);
+  --text-3: light-dark(#868c96, #707784);
 
   /* Accent / states */
-  --accent: light-dark(#2f6fed, #5e8cff);
-  --accent-bg: light-dark(#e6efff, #20304d);
-  --hover: light-dark(#edeff2, #262d38);
-  --sel: light-dark(#dbe8ff, #2a3b5c);
+  --accent: light-dark(#1f6fe5, #5e8cff);
+  --accent-bg: light-dark(#e3eeff, #20304d);
+  --hover: light-dark(#e9edf3, #262d38);
+  --sel: light-dark(#cfe2fb, #2a3b5c);
   --danger: light-dark(#cf3b3b, #f0706e);
   --ok: light-dark(#1f9d57, #4cc483);
   --warn: light-dark(#bd7a12, #e0a544);
+  /* Folder icon — WinSCP-style gold/yellow. */
+  --folder: light-dark(#e3a008, #e6b450);
 
   --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
 }

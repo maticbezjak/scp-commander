@@ -128,6 +128,13 @@
       invoke("set_max_parallel", { n: prefs.max_parallel });
     });
   });
+  // Theme: "system" follows the OS; "light"/"dark" force the scheme, which
+  // resolves every light-dark() color in app.css. Stored client-side.
+  let theme = $state(localStorage.getItem("theme") || "system");
+  $effect(() => {
+    document.documentElement.style.colorScheme = theme === "system" ? "light dark" : theme;
+    try { localStorage.setItem("theme", theme); } catch {}
+  });
   async function savePrefs(next) {
     prefs = next;
     showPrefs = false;
@@ -1568,7 +1575,7 @@
 {/if}
 
 {#if showPrefs}
-  <PrefsDialog {prefs} onSave={savePrefs} onClose={() => (showPrefs = false)} />
+  <PrefsDialog {prefs} {theme} onTheme={(t) => (theme = t)} onSave={savePrefs} onClose={() => (showPrefs = false)} />
 {/if}
 
 {#if dupTarget}

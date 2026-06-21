@@ -731,7 +731,7 @@
     flex: none;
   }
   .ti.dir {
-    color: var(--accent);
+    color: var(--folder);
   }
   .ti.file {
     color: var(--text-3);
