@@ -46,6 +46,39 @@
   let pathInput = $state("");
   let rowsEl; // scroll container, for scroll-into-view
   let pathEl; // path bar input, for ⌘L focus
+
+  // Row virtualization: render only the rows near the viewport so huge
+  // directories (thousands of files) stay snappy. Spacer rows preserve the
+  // scrollbar; the full `display` list still drives keyboard nav order.
+  let upRowEl; // the ".." row, used to measure exact row height
+  let scrollTop = $state(0);
+  let viewH = $state(640);
+  let rowH = $state(20);
+  const OVERSCAN = 12;
+  const vwin = $derived.by(() => {
+    const N = display.length;
+    const per = rowH || 20;
+    const first = Math.max(0, Math.floor(scrollTop / per) - OVERSCAN);
+    const vis = Math.ceil(viewH / per) + OVERSCAN * 2;
+    const last = Math.min(N, first + vis);
+    return { first, last, top: first * per, bot: Math.max(0, (N - last) * per) };
+  });
+  function remeasure() {
+    if (rowsEl?.clientHeight) viewH = rowsEl.clientHeight;
+    if (upRowEl?.offsetHeight) rowH = upRowEl.offsetHeight;
+  }
+  $effect(() => {
+    if (!rowsEl) return;
+    const ro = new ResizeObserver(() => remeasure());
+    ro.observe(rowsEl);
+    remeasure();
+    return () => ro.disconnect();
+  });
+  // Re-measure when the listing changes (row metrics can shift with columns).
+  $effect(() => {
+    display.length;
+    queueMicrotask(remeasure);
+  });
   $effect(() => {
     pathInput = path;
   });
@@ -169,16 +202,39 @@
   $effect(() => {
     onView(display.map((e) => e.name));
   });
+  // Bring a row into view. If it's currently rendered, use scrollIntoView;
+  // otherwise (virtualized off-screen — e.g. Home/End/type-ahead jumps)
+  // compute its position from its index and scroll there.
+  function keepVisible(sel, name) {
+    if (!rowsEl) return;
+    const el = rowsEl.querySelector(sel);
+    if (el) {
+      el.scrollIntoView({ block: "nearest" });
+      return;
+    }
+    if (name == null) return;
+    const idx = display.findIndex((e) => e.name === name);
+    if (idx < 0) return;
+    const per = rowH || 20;
+    const head = rowsEl.querySelector("thead")?.offsetHeight || per;
+    // display rows start below the header + ".." row + any pending rows.
+    const base = head + per + (pending?.length || 0) * per;
+    const y = base + idx * per;
+    const top = rowsEl.scrollTop;
+    const h = rowsEl.clientHeight;
+    if (y < top + head) rowsEl.scrollTop = Math.max(0, y - head);
+    else if (y + per > top + h) rowsEl.scrollTop = y + per - h;
+  }
   // Keep the selected row visible during keyboard navigation.
   $effect(() => {
     selected;
-    queueMicrotask(() => rowsEl?.querySelector("tr.sel")?.scrollIntoView({ block: "nearest" }));
+    queueMicrotask(() => keepVisible("tr.sel", selected[selected.length - 1]));
   });
   // Scroll a just-arrived (flashing) file into view so it's visible even in a
   // long listing — makes "the file landed here" obvious after a transfer.
   $effect(() => {
     if (!flashName) return;
-    queueMicrotask(() => rowsEl?.querySelector("tr.flash")?.scrollIntoView({ block: "nearest" }));
+    queueMicrotask(() => keepVisible("tr.flash", flashName));
   });
   // ⌘L: focus the path bar.
   let lastFocusReq = 0;
@@ -303,6 +359,7 @@
     class="rows"
     class:busy
     bind:this={rowsEl}
+    onscroll={(ev) => (scrollTop = ev.currentTarget.scrollTop)}
     oncontextmenu={(ev) => { if (!ev.target.closest("tr")) { ev.preventDefault(); onContextEmpty(ev); } }}
   >
     <table>
@@ -328,7 +385,7 @@
         </tr>
       </thead>
       <tbody>
-        <tr class="up" ondblclick={onUp}>
+        <tr class="up" ondblclick={onUp} bind:this={upRowEl}>
           <td class="name"><span class="updots">..</span></td>
           {#each cols as c}<td></td>{/each}
         </tr>
@@ -345,9 +402,12 @@
             </td>
           </tr>
         {/each}
-        {#each display as e, i (e.name)}
+        {#if vwin.top}<tr class="vpad" aria-hidden="true"><td colspan={cols.length + 1} style="height:{vwin.top}px"></td></tr>{/if}
+        {#each display.slice(vwin.first, vwin.last) as e, si (e.name)}
+          {@const i = vwin.first + si}
           <tr
             class:sel={selected.includes(e.name)}
+            class:alt={i % 2 === 1}
             class:drop-row={dropName === e.name}
             class:flash={flashName === e.name}
             data-name={e.name}
@@ -362,6 +422,7 @@
             {/each}
           </tr>
         {/each}
+        {#if vwin.bot}<tr class="vpad" aria-hidden="true"><td colspan={cols.length + 1} style="height:{vwin.bot}px"></td></tr>{/if}
         {#if !display.length && !pending.length}
           <tr class="empty-row"><td class="empty-cell" colspan={cols.length + 1}>{filterText ? "No matching items" : "Empty folder"}</td></tr>
         {/if}
@@ -706,11 +767,22 @@
   tbody tr {
     cursor: default;
   }
-  tbody tr:nth-child(even) {
+  /* Index-based striping (stable under row virtualization — nth-child would
+     flicker as the rendered window slides). */
+  tbody tr.alt {
     background: color-mix(in srgb, var(--panel-2) 55%, transparent);
   }
   tbody tr:hover {
     background: var(--hover);
+  }
+  /* Spacer rows that stand in for the off-screen (virtualized) rows. */
+  tbody tr.vpad,
+  tbody tr.vpad:hover {
+    background: transparent;
+  }
+  tbody tr.vpad td {
+    padding: 0;
+    border: none;
   }
   tbody tr.sel,
   tbody tr.sel:hover {
