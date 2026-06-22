@@ -485,6 +485,22 @@ fn set_max_parallel(n: u32, sessions: State<Sessions>) {
     }
 }
 
+/// Cap transfer speed across all sessions (KiB/s; 0 = unlimited).
+#[tauri::command]
+fn set_speed_limit(kbs: u64, sessions: State<Sessions>) {
+    for s in sessions.map.lock().unwrap().values() {
+        s.transfers.set_speed(kbs);
+    }
+}
+
+/// Pause/resume all transfers (in-flight transfers block at their next tick).
+#[tauri::command]
+fn set_paused(paused: bool, sessions: State<Sessions>) {
+    for s in sessions.map.lock().unwrap().values() {
+        s.transfers.set_paused(paused);
+    }
+}
+
 // --- Sync (per session) -----------------------------------------------------
 
 #[tauri::command]
@@ -655,6 +671,8 @@ fn main() {
             enqueue,
             cancel_transfer,
             set_max_parallel,
+            set_speed_limit,
+            set_paused,
             open_transfers_window,
         ])
         .run(tauri::generate_context!())

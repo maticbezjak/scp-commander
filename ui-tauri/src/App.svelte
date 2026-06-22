@@ -220,6 +220,18 @@
   $effect(() => {
     try { localStorage.setItem("xfer-queue", queueSig); } catch {}
   });
+  // Transfer controls: speed cap (KiB/s, 0 = unlimited, persisted) + pause.
+  let speedKbs = $state(Number(localStorage.getItem("speed-kbs")) || 0);
+  let paused = $state(false);
+  $effect(() => {
+    try { localStorage.setItem("speed-kbs", String(speedKbs)); } catch {}
+    invoke("set_speed_limit", { kbs: speedKbs }).catch(() => {});
+  });
+  function togglePause() {
+    paused = !paused;
+    invoke("set_paused", { paused }).catch(() => {});
+    status = paused ? "Transfers paused" : "Transfers resumed";
+  }
   // Name of a just-completed file to briefly highlight in its destination pane,
   // so a finished transfer is visibly "landed" there (cleared after the glow).
   let localFlash = $state(null);
@@ -1272,6 +1284,9 @@
           remoteNav = { back: [], fwd: [] };
           remoteRecents = [res.path];
           activeId = res.session_id;
+          // Apply current transfer controls to the freshly-created session.
+          invoke("set_speed_limit", { kbs: speedKbs }).catch(() => {});
+          invoke("set_paused", { paused }).catch(() => {});
           status = `Connected — ${res.entries.length} item(s)`;
           break;
         }
@@ -1447,7 +1462,7 @@
   {/if}
 </div>
 
-<TransferQueue {queue} onCancel={cancelTransfer} onClear={clearFinished} onRetry={retryTransfer} onRetryAll={retryAllFailed} onRemove={removeTransfer} />
+<TransferQueue {queue} {paused} {speedKbs} onTogglePause={togglePause} onSpeed={(k) => (speedKbs = k)} onCancel={cancelTransfer} onClear={clearFinished} onRetry={retryTransfer} onRetryAll={retryAllFailed} onRemove={removeTransfer} />
 
 <div class="fnbar">
   <button class="fk" disabled={!activeSelCount} onclick={actRename}><kbd>F2</kbd>Rename</button>

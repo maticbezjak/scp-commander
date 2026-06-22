@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use scp_core::ops::{self, Filter, OverwritePolicy, XferEvent};
 use scp_core::types::{Credentials, Error};
@@ -59,6 +60,10 @@ struct Inner {
     target: AtomicU64,
     /// Current number of live workers.
     workers: AtomicU64,
+    /// Transfer speed cap in KiB/s (0 = unlimited).
+    speed_kbs: AtomicU64,
+    /// When true, in-flight transfers block at their next progress tick.
+    paused: AtomicBool,
 }
 
 impl Inner {
@@ -84,6 +89,16 @@ impl TransferManager {
     pub fn set_creds(&self, creds: Credentials) {
         *self.inner.creds.lock().unwrap() = Some(creds);
         self.inner.creds_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cap transfer speed in KiB/s (0 = unlimited).
+    pub fn set_speed(&self, kbs: u64) {
+        self.inner.speed_kbs.store(kbs, Ordering::Relaxed);
+    }
+
+    /// Pause/resume: paused transfers block at their next progress tick.
+    pub fn set_paused(&self, paused: bool) {
+        self.inner.paused.store(paused, Ordering::Relaxed);
     }
 
     /// Set the desired number of concurrent transfer workers (at least 1).
@@ -243,7 +258,7 @@ fn worker(inner: Arc<Inner>, rx: SharedRx, app: AppHandle) {
             is_dir: job.is_dir,
             overwrite: job.overwrite,
         });
-        let result = run_job(t.as_mut(), &job, &app, sid);
+        let result = run_job(t.as_mut(), &job, &app, &inner);
         match result {
             Ok(_) => emit(&app, Evt::Done { session: sid, id: job.id, name: job.name.clone(), upload: job.upload }),
             Err(Error::Cancelled) => emit(&app, Evt::Cancelled { session: sid, id: job.id }),
@@ -258,19 +273,49 @@ fn worker(inner: Arc<Inner>, rx: SharedRx, app: AppHandle) {
     }
 }
 
-fn run_job(t: &mut dyn Transport, job: &Job, app: &AppHandle, sid: u32) -> scp_core::Result<u64> {
+fn run_job(t: &mut dyn Transport, job: &Job, app: &AppHandle, inner: &Arc<Inner>) -> scp_core::Result<u64> {
+    let sid = inner.sid;
     let id = job.id;
     let cancel = job.cancel.clone();
     let app = app.clone();
+    // Pause + speed-cap gate, shared by both the dir and file callbacks. While
+    // paused it blocks (still cancellable); with a speed cap it sleeps to hold
+    // the byte rate. Returns false to abort (cancelled).
+    let mut last_done: u64 = 0;
+    let gate = inner.clone();
+    let mut throttle = move |done: u64| -> bool {
+        while gate.paused.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(120));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Only react to forward byte progress, so non-byte ticks (done == 0)
+        // don't reset the rate baseline and over-throttle the next chunk.
+        if done > last_done {
+            let kbs = gate.speed_kbs.load(Ordering::Relaxed);
+            if kbs > 0 {
+                let chunk = done - last_done;
+                let micros = chunk.saturating_mul(1_000_000) / kbs.saturating_mul(1024).max(1);
+                if micros > 0 {
+                    std::thread::sleep(Duration::from_micros(micros));
+                }
+            }
+            last_done = done;
+        }
+        true
+    };
     if job.is_dir {
         let mut cb = |ev: XferEvent| -> bool {
-            if cancel.load(Ordering::Relaxed) {
-                return false;
-            }
             if let XferEvent::Bytes { done, total } = ev {
+                if !throttle(done) {
+                    return false;
+                }
                 emit(&app, Evt::Progress { session: sid, id, done, total });
+                true
+            } else {
+                throttle(0)
             }
-            true
         };
         let filter = Filter::empty();
         let policy = OverwritePolicy::from_code(job.overwrite);
@@ -281,7 +326,7 @@ fn run_job(t: &mut dyn Transport, job: &Job, app: &AppHandle, sid: u32) -> scp_c
         }
     } else {
         let mut progress = |done: u64, total: u64| {
-            if cancel.load(Ordering::Relaxed) {
+            if !throttle(done) {
                 return false;
             }
             emit(&app, Evt::Progress { session: sid, id, done, total });

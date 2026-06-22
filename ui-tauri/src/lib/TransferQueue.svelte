@@ -1,7 +1,15 @@
 <script>
   import { humanSize, humanRate, fmtEta } from "./api.js";
 
-  let { queue = [], onCancel, onClear, onRetry, onRetryAll, onRemove } = $props();
+  let { queue = [], paused = false, speedKbs = 0, onTogglePause, onSpeed, onCancel, onClear, onRetry, onRetryAll, onRemove } = $props();
+
+  const SPEEDS = [
+    { v: 0, label: "Unlimited" },
+    { v: 256, label: "256 KB/s" },
+    { v: 1024, label: "1 MB/s" },
+    { v: 5120, label: "5 MB/s" },
+    { v: 10240, label: "10 MB/s" },
+  ];
 
   let active = $derived(queue.filter((t) => t.state === "active"));
   let failed = $derived(queue.filter((t) => t.state === "failed"));
@@ -44,6 +52,12 @@
         <progress class="aggbar" max="100" value={agg.pct}></progress>
       {/if}
       <span class="qspace"></span>
+      <button class="qctl" class:on={paused} onclick={onTogglePause} title={paused ? "Resume transfers" : "Pause transfers"}>
+        {paused ? "▶ Resume" : "❚❚ Pause"}
+      </button>
+      <select class="qspeed" value={speedKbs} onchange={(e) => onSpeed(Number(e.target.value))} title="Transfer speed limit">
+        {#each SPEEDS as sp}<option value={sp.v}>{sp.label}</option>{/each}
+      </select>
       {#if failed.length}
         <button class="retry-all" onclick={onRetryAll} title="Resume all failed transfers">
           ↻ Retry all ({failed.length})
@@ -100,6 +114,18 @@
   }
   .qspace {
     flex: 1;
+  }
+  .qctl {
+    font-size: 12px;
+    padding: 3px 9px;
+  }
+  .qctl.on {
+    color: var(--warn);
+    border-color: var(--warn);
+  }
+  .qspeed {
+    font-size: 12px;
+    padding: 3px 6px;
   }
   .retry-all {
     font-size: 12px;
