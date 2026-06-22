@@ -943,6 +943,36 @@
       showKnownHosts || showPrefs || showHelp
     );
   }
+  // Shared file actions for the active pane — used by both the keyboard
+  // commander and the bottom function-key bar (one source of truth).
+  function actRename() {
+    const e = selectedEntriesIn(focusLocal)[0];
+    if (e) renameTarget = { isLocal: focusLocal, entry: e, value: e.name };
+  }
+  function actView() {
+    const e = selectedEntriesIn(focusLocal)[0];
+    if (e && !e.is_dir) viewFile(focusLocal, e);
+  }
+  function actEdit() {
+    if (focusLocal || !connected) return;
+    const e = selectedEntriesIn(false)[0];
+    if (e && !e.is_dir) editFile(e);
+  }
+  function actCopy() { if (connected) transferSelected(focusLocal); }
+  function actMove() { if (connected) moveSelected(focusLocal); }
+  function actNewFolder() { newFolder = { isLocal: focusLocal, value: "" }; }
+  function actDelete() {
+    const es = selectedEntriesIn(focusLocal);
+    if (es.length) requestDelete(focusLocal, es);
+  }
+  // Selection count in the active pane (drives the function-key bar's enabled
+  // states); the cursor file's directory-ness for the view/edit buttons.
+  const activeSelCount = $derived((focusLocal ? localSel : remoteSel).length);
+  const activeCursorIsFile = $derived.by(() => {
+    const e = selectedEntriesIn(focusLocal)[0];
+    return !!e && !e.is_dir;
+  });
+
   function onKey(ev) {
     if (anyModalOpen()) return;
     if (["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement?.tagName)) return;
@@ -991,38 +1021,13 @@
       }
       case "+": ev.preventDefault(); maskSelect = { add: true }; return;
       case "-": ev.preventDefault(); maskSelect = { add: false }; return;
-      case "F5":
-        if (connected) { ev.preventDefault(); transferSelected(isLocal); }
-        return;
-      case "F6":
-        if (connected) { ev.preventDefault(); moveSelected(isLocal); }
-        return;
-      case "F4": {
-        ev.preventDefault();
-        if (!isLocal && connected) {
-          const e = selectedEntriesIn(false)[0];
-          if (e && !e.is_dir) editFile(e);
-        }
-        return;
-      }
-      case "F2": {
-        ev.preventDefault();
-        const e = selectedEntriesIn(isLocal)[0];
-        if (e) renameTarget = { isLocal, entry: e, value: e.name };
-        return;
-      }
-      case "F3": {
-        ev.preventDefault();
-        const e = selectedEntriesIn(isLocal)[0];
-        if (e && !e.is_dir) viewFile(isLocal, e);
-        return;
-      }
-      case "Delete": {
-        ev.preventDefault();
-        const es = selectedEntriesIn(isLocal);
-        if (es.length) requestDelete(isLocal, es);
-        return;
-      }
+      case "F5": ev.preventDefault(); actCopy(); return;
+      case "F6": ev.preventDefault(); actMove(); return;
+      case "F4": ev.preventDefault(); actEdit(); return;
+      case "F2": ev.preventDefault(); actRename(); return;
+      case "F3": ev.preventDefault(); actView(); return;
+      case "F7": ev.preventDefault(); actNewFolder(); return;
+      case "Delete": ev.preventDefault(); actDelete(); return;
       case "Backspace":
         ev.preventDefault();
         if (isLocal) localUp();
@@ -1444,6 +1449,16 @@
 
 <TransferQueue {queue} onCancel={cancelTransfer} onClear={clearFinished} onRetry={retryTransfer} onRetryAll={retryAllFailed} onRemove={removeTransfer} />
 
+<div class="fnbar">
+  <button class="fk" disabled={!activeSelCount} onclick={actRename}><kbd>F2</kbd>Rename</button>
+  <button class="fk" disabled={!activeCursorIsFile} onclick={actView}><kbd>F3</kbd>View</button>
+  <button class="fk" disabled={focusLocal || !connected || !activeCursorIsFile} onclick={actEdit}><kbd>F4</kbd>Edit</button>
+  <button class="fk" disabled={!connected || !activeSelCount} onclick={actCopy}><kbd>F5</kbd>Copy</button>
+  <button class="fk" disabled={!connected || !activeSelCount} onclick={actMove}><kbd>F6</kbd>Move</button>
+  <button class="fk" disabled={!focusLocal && !connected} onclick={actNewFolder}><kbd>F7</kbd>New folder</button>
+  <button class="fk del" disabled={!activeSelCount} onclick={actDelete}><kbd>Del</kbd>Delete</button>
+</div>
+
 <div class="statusbar">
   <span class="dot" class:on={connected}></span>
   <span class="stxt">{status}</span>
@@ -1605,6 +1620,7 @@
       <span class="k">F2</span><span>Rename</span>
       <span class="k">F3</span><span>View file</span>
       <span class="k">F4</span><span>Edit remote file (auto-upload on save)</span>
+      <span class="k">F7</span><span>New folder</span>
       <span class="k">Del</span><span>Delete selection</span>
       <span class="k">Enter</span><span>Open folder</span>
       <span class="k">Backspace</span><span>Parent directory</span>
@@ -1925,6 +1941,40 @@
   }
 
   /* Status bar */
+  /* WinSCP/Norton-style function-key bar. */
+  .fnbar {
+    display: flex;
+    gap: 6px;
+    padding: 4px 10px;
+    border-top: 1px solid var(--border);
+    background: var(--header);
+  }
+  .fk {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11.5px;
+    padding: 3px 9px;
+    border-radius: 5px;
+    color: var(--text-2);
+  }
+  .fk:hover:not(:disabled) {
+    color: var(--text);
+  }
+  .fk kbd {
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 2px 4px;
+    color: var(--text-3);
+  }
+  .fk.del:hover:not(:disabled) {
+    color: var(--danger);
+    border-color: var(--danger);
+  }
   .statusbar {
     display: flex;
     align-items: center;
