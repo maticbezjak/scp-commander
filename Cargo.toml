@@ -1,9 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["core", "ui-ubuntu", "ui-tauri/src-tauri"]
-# ui-ubuntu needs GTK4 system libs (Linux) and ui-tauri pulls the webview
-# toolchain, so default builds to just the core; build the others explicitly
-# (-p scp-ubuntu / -p scp-tauri).
+members = ["core", "ui-tauri/src-tauri"]
+# ui-tauri pulls the webview toolchain, so default builds to just the core;
+# build the app explicitly (-p scp-tauri) or via `cargo tauri build`.
 default-members = ["core"]
 
 [workspace.package]

@@ -1,29 +1,31 @@
-# SCP Commander — a WinSCP-style file manager for macOS & Ubuntu
+# SCP Commander — a WinSCP-style file manager
 
-A dual-pane SFTP/FTP file manager with **native** front-ends on each platform,
-sharing one transfer core. SwiftUI on macOS, GTK4 on Ubuntu, Rust underneath.
+A cross-platform dual-pane SFTP/FTP/S3 file manager: a Tauri + Svelte desktop
+app over one shared Rust transfer core, running on macOS, Windows, and Linux.
 
 ```
-            ┌──────────────────────┐     ┌──────────────────────┐
-            │  macOS UI (SwiftUI)   │     │  Ubuntu UI (GTK4)     │
-            └──────────┬───────────┘     └──────────┬───────────┘
-                       │ C FFI (staticlib)          │ Rust rlib
-                       └─────────────┬──────────────┘
-                            ┌────────▼─────────┐
-                            │  scp-core (Rust)  │
-                            │  SFTP · FTP · S3  │
-                            └──────────────────┘
+                       ┌──────────────────────────┐
+                       │  ui-tauri (Svelte + Rust) │   macOS · Windows · Linux
+                       └────────────┬─────────────┘
+                                    │ Rust rlib
+                           ┌────────▼─────────┐
+                           │  scp-core (Rust)  │
+                           │  SFTP · FTP · S3  │
+                           └──────────────────┘
 ```
+
+> The original native front-ends (SwiftUI on macOS, GTK4 on Ubuntu, linked via a
+> C FFI) were superseded by the Tauri app and retired from `master`. They remain
+> available on the **`archive/native-apps`** branch.
 
 ## Layout
 
 | Path          | What it is                                                        |
 |---------------|-------------------------------------------------------------------|
-| `core/`       | Shared Rust core: `Transport` trait, SFTP/FTP/S3 backends, multi-file ops, C FFI. |
+| `core/`       | Shared Rust core: `Transport` trait, SFTP/FTP/S3 backends, multi-file ops, sync engine. |
 | `core/src/bin/scp-cli.rs` | Headless CLI to exercise the core without any GUI.    |
-| `ui-macos/`   | SwiftUI app (SwiftPM). Links `libscp_core.a` via `scp_core.h`.    |
-| `ui-ubuntu/`  | GTK4 app (Rust). Links `scp-core` directly.                       |
-| `scripts/`    | Packaging: `package-macos.sh` (.app + zip), `package-deb.sh` (.deb). |
+| `ui-tauri/`   | The desktop app — Svelte 5 frontend + Tauri (Rust) backend linking `scp-core`. |
+| `scripts/`    | `integration-test.sh` (Docker SFTP/FTP/S3 smoke test).            |
 
 ## Status
 
@@ -37,9 +39,9 @@ Protocols:
   native-tls.
 - **S3** — behind the `s3` cargo feature (rust-s3): ranged-GET streaming
   downloads, multipart streaming uploads (8 MiB memory bound), bucket/region/
-  endpoint fields in both UIs.
+  endpoint fields in the connect dialog.
 
-Both apps (SwiftUI + GTK4) have:
+The app has:
 
 - **overwrite protection** (Overwrite / Skip prompts; partials resume in
   both directions) and **preview-first sync** (WinSCP-style checklist)
@@ -262,11 +264,13 @@ Custom commands…** (Ubuntu); output appears in the command-result window.
 
 ## Build & run
 
-### Prerequisites (macOS)
-```sh
-brew install libssh2 openssl@3 pkg-config
-# Rust: https://rustup.rs   |   Swift 5.9+ (Xcode or Command Line Tools)
-```
+### Prerequisites
+
+- [Rust](https://rustup.rs) and Node 18+.
+- **macOS:** `brew install libssh2 openssl@3 pkg-config`
+- **Linux:** `libwebkit2gtk-4.1-dev libssh2-1-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev build-essential pkg-config`
+- **Windows:** the MSVC toolchain + NASM (for libssh2's vendored OpenSSL).
+
 `pkg-config` must find `libssh2.pc` (Homebrew installs it under
 `/opt/homebrew/lib/pkgconfig`).
 
@@ -279,53 +283,42 @@ cargo test  -p scp-core                 # unit tests (ops engine, fingerprints)
 scp-cli ls    sftp://user@host/path  password
 scp-cli get   -r sftp://user@host/dir ./local-dir  password   # recursive
 scp-cli sync  up sftp://user@host/dir ./local-dir  password   # one-way sync
-scp-cli mkdir sftp://user@host/new-dir  password
 scp-cli --agent ls sftp://user@host/    # ssh-agent auth
 scp-cli --key ~/.ssh/id_ed25519 ls sftp://user@host/  [passphrase]
 ```
 
-### macOS app
+### Desktop app (Tauri)
 ```sh
-cargo build -p scp-core --features s3   # produces target/debug/libscp_core.a
-cd ui-macos && swift run                # builds and launches the SwiftUI app
+cd ui-tauri
+npm install
+npm run tauri dev      # dev build with hot-reload
+npm run tauri build    # release installers under ../target/release/bundle/
 ```
-`Package.swift` links the staticlib from `../target/debug` (override with
-`SCP_CORE_LIB=../target/release`) plus `-lssl -lcrypto -lz -liconv` and the
-`CoreFoundation`/`Security` frameworks (the exact list comes from
-`cargo rustc -- --print native-static-libs`).
-
-### Ubuntu app
-```sh
-sudo apt install libgtk-4-dev build-essential pkg-config libssl-dev libssh2-1-dev
-cargo run -p scp-ubuntu --features scp-core/s3
-```
-Needs GTK ≥ 4.10 (Ubuntu 24.04+). The GTK app targets Linux, but it also
-compiles and runs against Homebrew's gtk4 (`brew install gtk4`) on macOS —
-handy for development; the native-feel target remains GNOME/Ubuntu.
-
-The Ubuntu app runs all core calls on a worker thread (GTK widgets are
-main-thread-only): commands go over a std mpsc channel, events come back over
-an async channel drained by `glib::spawn_future_local`.
+The Svelte 5 frontend uses `withGlobalTauri` (no `@tauri-apps/api` npm dep); the
+Tauri backend (`ui-tauri/src-tauri`) links `scp-core` directly as an rlib.
 
 ## Packaging
 
-```sh
-./scripts/package-macos.sh   # dist/ScpCommander.app (icon included) + zip
-./scripts/package-deb.sh     # dist/scp-commander_<ver>_<arch>.deb (run on Ubuntu)
-# Flatpak manifest: packaging/flatpak/net.manto.ScpCommander.yml
-```
+`cargo tauri build` (or `npm run tauri build`) produces the platform installers
+under `target/release/bundle/` — `.dmg`/`.app` (macOS), `.deb`/`.AppImage`
+(Linux), `.msi`/`.exe` (Windows). The release workflow
+(`.github/workflows/release.yml`) builds and attaches them to a GitHub Release
+on a version tag (`git tag v1.2.3 && git push --tags`).
 
 ## Integration tests
 
 `./scripts/integration-test.sh` spins up SFTP, FTP, and MinIO servers in
 Docker and drives `scp-cli` through the full operation matrix (transfers,
 recursive trees, sync + dry-run plan, find, rename, chmod, deletes) with
-round-trip diffs — 33 checks, all green. CI (.github/workflows/ci.yml) runs
-the same suite on every push, alongside the unit tests and both app builds.
+round-trip diffs. CI (.github/workflows/ci.yml) runs the same suite on every
+push, alongside the unit tests and the Tauri app build on macOS / Linux /
+Windows.
 
-## How "native" is achieved
+## Architecture
 
-There is no shared UI code. Each OS gets its own front-end written in that
-platform's idiomatic toolkit, so widgets, fonts, and window chrome are the real
-system controls. Everything hard (protocols, transfers, sync) lives once in
-`scp-core` and is reused by both.
+All protocol, transfer, and sync logic lives once in `scp-core` with no UI
+dependency, consumed by the Tauri backend and the CLI as a plain Rust rlib. The
+UI is a single Svelte codebase rendered in each platform's native webview, so
+one frontend serves macOS, Windows, and Linux. The original native front-ends
+(SwiftUI / GTK4, linked via a C FFI) are preserved on the
+`archive/native-apps` branch.

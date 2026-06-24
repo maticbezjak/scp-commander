@@ -1,11 +1,9 @@
 //! Shared transfer core for the cross-platform file manager.
 //!
-//! All protocol logic, the transfer engine, and (eventually) the sync engine
-//! live here with no UI dependency. The native front-ends consume it two ways:
-//!   * the Ubuntu GTK app links it as a normal Rust `rlib`;
-//!   * the macOS SwiftUI app links the `staticlib` and calls the C `ffi` layer.
+//! All protocol logic, the transfer engine, and the sync engine live here with
+//! no UI dependency. The Tauri app (`ui-tauri`) and the CLI link it directly as
+//! a Rust `rlib`.
 
-pub mod ffi;
 pub mod ftp;
 pub mod jump;
 pub mod ops;

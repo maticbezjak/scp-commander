@@ -1,107 +1,64 @@
 name: Release
 
 # Triggered by pushing a version tag: git tag v1.2.3 && git push --tags
+# Builds the Tauri app on each OS and attaches the installers to a GitHub
+# Release. (The legacy SwiftUI/GTK bundles were retired; see the
+# archive/native-apps branch.)
 on:
   push:
     tags:
       - "v[0-9]*"
 
 jobs:
-  # ── macOS: build .app + zip ───────────────────────────────────────────────
-  release-macos:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install brew dependencies
-        run: brew install libssh2 openssl@3 pkg-config
-
-      - name: Build release staticlib
-        run: |
-          . "$HOME/.cargo/env"
-          PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix libssh2)/lib/pkgconfig" \
-            cargo build -p scp-core --release --features s3
-        env:
-          LIBRARY_PATH: /opt/homebrew/lib
-
-      - name: Build macOS app bundle
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          SCP_CORE_LIB="$PWD/target/release/libscp_core.a" \
-            bash scripts/package-macos.sh "$VERSION"
-        env:
-          LIBRARY_PATH: /opt/homebrew/lib
-
-      - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-app
-          path: dist/SCP-Commander-*.zip
-
-  # ── Linux: build .deb ────────────────────────────────────────────────────
-  release-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install apt dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y \
-            libssh2-1-dev libssl-dev pkg-config \
-            libgtk-4-dev libglib2.0-dev \
-            fakeroot dpkg-dev
-
-      - name: Build release binaries
-        run: |
-          . "$HOME/.cargo/env"
-          cargo build --workspace --release --features scp-core/s3
-
-      - name: Build .deb package
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          bash scripts/package-deb.sh "$VERSION"
-
-      - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-deb
-          path: dist/scp-commander_*.deb
-
-  # ── Create GitHub Release and attach artifacts ───────────────────────────
-  publish:
-    needs: [release-macos, release-linux]
-    runs-on: ubuntu-latest
+  release:
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-14 # Apple Silicon
+          - platform: ubuntu-24.04
+          - platform: windows-latest
+    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download macOS artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-app
-          path: dist/
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Download Linux artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/setup-node@v4
         with:
-          name: linux-deb
-          path: dist/
+          node-version: 20
 
-      - name: Create release with artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Linux system dependencies
+        if: matrix.platform == 'ubuntu-24.04'
         run: |
-          VERSION="${GITHUB_REF_NAME}"
-          gh release create "$VERSION" \
-            --title "SCP Commander $VERSION" \
-            --generate-notes \
-            dist/SCP-Commander-*.zip \
-            dist/scp-commander_*.deb
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config \
+            libssl-dev libssh2-1-dev \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: macOS system dependencies
+        if: matrix.platform == 'macos-14'
+        run: brew install libssh2 openssl@3 pkg-config
+
+      # libssh2 builds against vendored OpenSSL on Windows (needs NASM).
+      - uses: ilammy/setup-nasm@v1
+        if: matrix.platform == 'windows-latest'
+
+      - name: Install frontend deps
+        run: npm --prefix ui-tauri ci
+
+      # Builds the frontend (beforeBuildCommand) + the app, then creates/updates
+      # the GitHub Release and uploads the platform installers.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: ui-tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: "SCP Commander ${{ github.ref_name }}"
+          releaseBody: "See the assets below to download and install."
+          releaseDraft: false
+          prerelease: false

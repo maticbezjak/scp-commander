@@ -5,12 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Shared transfer core (SFTP/FTP/S3) for the cross-platform file manager"
 
-# Two crate types:
-#   rlib      -> linked by the Rust GTK Ubuntu front-end (same workspace)
-#   staticlib -> linked by the macOS SwiftUI front-end via the C FFI in ffi.rs
+# Linked as a normal Rust rlib by the Tauri app (same workspace) and the CLI.
 [lib]
 name = "scp_core"
-crate-type = ["rlib", "staticlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 # SFTP/SCP over SSH. Uses system libssh2 + openssl via pkg-config.
