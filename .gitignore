@@ -12,3 +12,7 @@ ui-tauri/src-tauri/gen/
 # Tauri/Svelte frontend build output + deps (built in CI via `npm run build`).
 ui-tauri/dist/
 ui-tauri/node_modules/
+# Playwright run artifacts (frontend e2e tests).
+ui-tauri/test-results/
+ui-tauri/playwright-report/
+ui-tauri/blob-report/

@@ -24,6 +24,13 @@ jobs:
           node-version: 20
       - name: Build Tauri frontend
         run: npm --prefix ui-tauri ci && npm --prefix ui-tauri run build
+      # Frontend end-to-end tests: the real bundle driven in WebKit (same engine
+      # as the app's webview) with the Tauri bridge stubbed. See ui-tauri/tests.
+      - name: Frontend tests (Playwright / WebKit)
+        working-directory: ui-tauri
+        run: |
+          npx playwright install --with-deps webkit
+          npx playwright test
       - name: Build workspace (core + Tauri app, with S3)
         run: cargo build --workspace --features scp-core/s3
       - name: Unit tests

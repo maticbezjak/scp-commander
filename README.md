@@ -305,14 +305,35 @@ under `target/release/bundle/` — `.dmg`/`.app` (macOS), `.deb`/`.AppImage`
 (`.github/workflows/release.yml`) builds and attaches them to a GitHub Release
 on a version tag (`git tag v1.2.3 && git push --tags`).
 
-## Integration tests
+## Tests
 
-`./scripts/integration-test.sh` spins up SFTP, FTP, and MinIO servers in
-Docker and drives `scp-cli` through the full operation matrix (transfers,
-recursive trees, sync + dry-run plan, find, rename, chmod, deletes) with
-round-trip diffs. CI (.github/workflows/ci.yml) runs the same suite on every
-push, alongside the unit tests and the Tauri app build on macOS / Linux /
-Windows.
+**Core unit tests** — `cargo test -p scp-core --features s3` (ops engine, path
+handling, fingerprints).
+
+**Integration tests** — `./scripts/integration-test.sh` spins up SFTP, FTP, and
+MinIO servers in Docker and drives `scp-cli` through the full operation matrix
+(transfers, recursive trees, sync + dry-run plan, find, rename, chmod, deletes)
+with round-trip diffs.
+
+**Frontend end-to-end tests** — `npm --prefix ui-tauri test` runs Playwright
+against the real built bundle in WebKit (the same engine as the app's webview)
+with the Tauri bridge stubbed, so no Rust backend is needed:
+
+```sh
+cd ui-tauri
+npx playwright install webkit   # once
+npm test                        # or: npm run test:ui  (interactive)
+```
+
+`tests/harness.js` stubs `window.__TAURI__` (canned `invoke` responses, an
+invoke recorder, and `__fire()` to deliver backend events) and exposes helpers
+(`open`, `connect`, `fireXfer`, `calls`, `clickRow`, …). The specs lock in the
+behaviors that are easy to regress: selection + context menu, the transfer
+panel, in-progress placeholder rows, row virtualization, theming, the
+function-key bar, and queue controls/persistence.
+
+CI (.github/workflows/ci.yml) runs all three on every push, alongside the Tauri
+app build on macOS / Linux / Windows.
 
 ## Architecture
 
