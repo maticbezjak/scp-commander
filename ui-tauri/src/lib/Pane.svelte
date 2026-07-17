@@ -195,7 +195,11 @@
     });
   });
 
-  let selEntries = $derived(entries.filter((e) => selected.includes(e.name)));
+  // Only rows the pane is actually showing. A filter (or the hidden-files
+  // toggle) can hide selected rows, and these drive Delete/Upload/Properties —
+  // acting on files the user can't see is a footgun. Also keeps the footer's
+  // "N of M" consistent, since M is display.length.
+  let selEntries = $derived(display.filter((e) => selected.includes(e.name)));
   let selBytes = $derived(selEntries.filter((e) => !e.is_dir).reduce((s, e) => s + e.size, 0));
 
   // Report the visible order upward so the keyboard handler can navigate it.

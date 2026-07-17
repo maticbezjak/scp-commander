@@ -70,6 +70,11 @@ export async function installStub(page, opts = {}) {
           switch (cmd) {
             case "load_prefs":
               return c.prefs;
+            // The app seeds the local pane with home_local() on startup; without
+            // it local.path stays null and any path join (delete/transfer) blows
+            // up inside a swallowing try/catch.
+            case "home_local":
+              return c.localPath;
             case "list_local":
               return c.local;
             case "list_remote":

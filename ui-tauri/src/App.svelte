@@ -577,7 +577,10 @@
       remote = { path, entries };
       remoteSel = [];
       pushRecent(false, path);
-      status = `${path} — ${entries.length} item(s)`;
+      // Only announce on a real navigation. Silent refreshes (record: false —
+      // e.g. the reload after a transfer completes) must not clobber transient
+      // status like "✓ All transfers complete".
+      if (record) status = `${path} — ${entries.length} item(s)`;
     } catch (e) {
       status = `Error: ${e}`;
     } finally {
@@ -774,13 +777,16 @@
   function openContext(isLocal, entry, index, ev) {
     // Right-clicking a row that's already part of a multi-selection keeps the
     // whole selection (so Delete/Upload/etc. act on all of it); right-clicking
-    // any other row selects just that row.
+    // any other row selects just that row. Deliberately NOT rowClick(): it
+    // branches on meta/ctrl, and ctrl-click IS the standard macOS right-click
+    // gesture — routing through it would *add* the row instead of replacing.
     const cur = isLocal ? localSel : remoteSel;
-    if (!cur.includes(entry.name)) rowClick(isLocal, entry, index, ev);
+    if (!cur.includes(entry.name)) {
+      setSel(isLocal, [entry.name]);
+      setAnchor(isLocal, index);
+    }
     const sel = isLocal ? localSel : remoteSel;
-    const entries = (isLocal ? local.entries : remote.entries).filter((e) =>
-      sel.includes(e.name),
-    );
+    const entries = selectedEntriesIn(isLocal);
     const targets = entries.length && sel.includes(entry.name) ? entries : [entry];
     const items = [
       {
@@ -939,9 +945,17 @@
 
   let focusLocal = $state(true);
 
+  // Selected entries the pane is actually SHOWING, in its display order.
+  // Driving off the raw listing would let a filter hide rows that are still
+  // live targets for Delete/F5/F6 (you'd delete files you can't see), and would
+  // hand back backend order rather than what's on screen.
   function selectedEntriesIn(isLocal) {
     const sel = isLocal ? localSel : remoteSel;
-    return (isLocal ? local.entries : remote.entries).filter((e) => sel.includes(e.name));
+    const byName = new Map((isLocal ? local.entries : remote.entries).map((e) => [e.name, e]));
+    return paneView(isLocal)
+      .filter((n) => sel.includes(n))
+      .map((n) => byName.get(n))
+      .filter(Boolean);
   }
 
   // Keyboard commander: F5 copy · F6 move · F2 rename · F3 view · Del delete ·
@@ -1004,7 +1018,11 @@
         ev.preventDefault();
         const v = paneView(isLocal);
         const cur = new Set(isLocal ? localSel : remoteSel);
-        setSel(isLocal, v.filter((n) => !cur.has(n)));
+        const next = v.filter((n) => !cur.has(n));
+        setSel(isLocal, next);
+        // Re-anchor onto the new selection (⌘A does the same): otherwise a
+        // following shift-click extends from a row that's no longer selected.
+        setAnchor(isLocal, next.length ? v.indexOf(next[next.length - 1]) : -1);
         return;
       }
       if (k === "l") { ev.preventDefault(); pathFocusReq++; return; }

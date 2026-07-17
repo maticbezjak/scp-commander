@@ -87,9 +87,9 @@ test("a done event marks the row done and the status bar reports completion", as
   await fireXfer(page, progress(1, 512, 1024));
   await expect(page.locator(".queue .qrow .qpct")).toHaveText("50%");
 
-  // The completion message is written and then immediately overwritten by the
-  // destination pane's refresh (see the assertion at the end), so record every
-  // status the bar passes through rather than polling for a transient value.
+  // Record every status the bar passes through, so we can prove the completion
+  // message is the one that STICKS (the destination-pane refresh that follows
+  // must not overwrite it).
   await page.evaluate(() => {
     window.__stxt = [];
     const el = document.querySelector(".statusbar .stxt");
@@ -112,12 +112,10 @@ test("a done event marks the row done and the status bar reports completion", as
     .poll(() => page.evaluate(() => window.__stxt))
     .toContain("✓ All transfers complete");
 
-  // CURRENT BEHAVIOR (suspected bug): the "done" handler also refreshes the
-  // destination pane, and that refresh's own status ("<path> — N item(s)")
-  // lands last, so the completion message is only ever shown for an instant.
-  await expect(page.locator(".statusbar .stxt")).toHaveText("/data — 2 item(s)");
-  expect(await page.evaluate(() => window.__stxt)).toEqual([
-    "✓ All transfers complete",
-    "/data — 2 item(s)",
-  ]);
+  // REGRESSION: the "done" handler also refreshes the destination pane. That
+  // refresh is silent (record: false), so it must NOT clobber the completion
+  // message — which used to land for one tick and then be replaced by
+  // "<path> — N item(s)".
+  await expect(page.locator(".statusbar .stxt")).toHaveText("✓ All transfers complete");
+  expect(await page.evaluate(() => window.__stxt)).toEqual(["✓ All transfers complete"]);
 });

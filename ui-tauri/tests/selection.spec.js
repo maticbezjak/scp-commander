@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { open, closeLogin, clickRow, renderedNames, selectedNames, FILE } from "./harness.js";
+import { open, closeLogin, clickRow, renderedNames, selectedNames, calls, FILE } from "./harness.js";
 
 // Five plain files so the visible order is a stable a…e (dirs sort first, then
 // name ascending — no dirs here, so display index == alphabetical index).
@@ -105,4 +105,59 @@ test("right-click inside a multi-selection keeps it; right-click outside collaps
   expect(await selectedNames(page, "local")).toEqual(["e.txt"]);
   await expect(foot(page)).toContainText("1 of 5 selected");
   await expect(deleteItem(page)).toHaveText("Delete…");
+});
+
+test("REGRESSION: ctrl-right-click outside the selection replaces it, never adds", async ({ page }) => {
+  await openLocal(page);
+
+  await clickRow(page, "local", "a.txt");
+  await clickRow(page, "local", "b.txt", { modifiers: ["Meta"] });
+  expect(await selectedNames(page, "local")).toEqual(["a.txt", "b.txt"]);
+
+  // ctrl-click IS the standard macOS right-click gesture, so a right-click can
+  // legitimately arrive with ctrlKey set. It must behave like any other
+  // right-click (collapse to the row), not take rowClick's meta/ctrl "add" path.
+  await clickRow(page, "local", "d.txt", { button: "right", modifiers: ["Control"] });
+  await expect(menu(page)).toBeVisible();
+  expect(await selectedNames(page, "local")).toEqual(["d.txt"]);
+  await expect(deleteItem(page)).toHaveText("Delete…");
+});
+
+test("REGRESSION: a filter hides rows AND drops them as operation targets", async ({ page }) => {
+  await openLocal(page);
+
+  // Select everything, then filter down to a single visible row.
+  await clickRow(page, "local", "a.txt");
+  await page.keyboard.press("Meta+a");
+  await expect(foot(page)).toContainText("5 of 5 selected");
+
+  await page.locator(".pane[data-kind=local] .filter").fill("c.txt");
+  expect(await renderedNames(page, "local")).toEqual(["c.txt"]);
+
+  // The footer must not claim "5 of 1 selected" — only visible rows count…
+  await expect(foot(page)).toContainText("1 of 1 selected");
+
+  // …and, critically, Delete must act ONLY on the visible row. Previously the
+  // 4 filtered-out files were still live targets — deleting what you can't see.
+  await page.locator('.pane[data-kind=local] .tb[title="Delete"]').click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("c.txt"); // names the one visible file, not "5 items"
+  await dialog.getByRole("button", { name: "Delete", exact: true }).click();
+
+  await expect.poll(() => calls(page, "local_delete")).toHaveLength(1);
+  expect((await calls(page, "local_delete"))[0].path).toContain("c.txt");
+});
+
+test("REGRESSION: ⌘I re-anchors, so a following shift-click extends from the new selection", async ({ page }) => {
+  await openLocal(page);
+
+  await clickRow(page, "local", "a.txt");
+  await clickRow(page, "local", "b.txt", { modifiers: ["Meta"] });
+  await page.keyboard.press("Meta+i"); // -> c, d, e selected; anchor must follow
+  expect(await selectedNames(page, "local")).toEqual(["c.txt", "d.txt", "e.txt"]);
+
+  // The anchor is now the last inverted row (e.txt), so shift-clicking c.txt
+  // spans c..e. With the stale anchor (b.txt) this selected b..c instead.
+  await clickRow(page, "local", "c.txt", { modifiers: ["Shift"] });
+  expect(await selectedNames(page, "local")).toEqual(["c.txt", "d.txt", "e.txt"]);
 });
